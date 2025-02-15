@@ -17,7 +17,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install pymysql && \
     pip install "dlt[sqlalchemy]" && \
-    pip install mysqlclient
+    pip install mysqlclient && \
+    pip install python-dotenv
     
 
 # Copy your Python script into the container
