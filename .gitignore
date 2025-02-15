@@ -1,3 +1,4 @@
 .env
 mysql_source_data/*
 mysql_target_data/*
+logs/*

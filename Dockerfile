@@ -6,13 +6,14 @@ RUN apt-get update && apt-get install -y \
     default-libmysqlclient-dev \
     build-essential \
     pkg-config \
+    cron \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory
 WORKDIR /app
 
 # Copy the dependency file and install Python dependencies
-COPY source/requirements.txt .
+COPY source/ .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install pymysql && \
@@ -21,8 +22,13 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install python-dotenv
     
 
-# Copy your Python script into the container
-COPY source/dlt_pipeline.py .
-
 # Use a command that keeps the container running for manual execution
-CMD ["tail", "-f", "/dev/null"]
+# CMD ["tail", "-f", "/dev/null"]
+
+
+# Copy the entrypoint script
+COPY ../entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Set entrypoint
+ENTRYPOINT ["/entrypoint.sh"]

@@ -25,6 +25,8 @@ SOURCE_DB_HOST = os.getenv("SOURCE_DB_HOST", "127.0.0.1")
 SOURCE_DB_PORT = os.getenv("SOURCE_DB_PORT", "3306")
 SOURCE_DB_NAME = os.getenv("SOURCE_DB_NAME", "dbzains")
 
+FETCH_LIMIT = os.getenv("FETCH_LIMIT", 1000)
+
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
@@ -36,6 +38,10 @@ for t in TABLES:
     table_name = parts[0]
     column = parts[1] if len(parts) > 1 else None
     table_configs[table_name] = column
+
+def log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{timestamp} - INFO - {message}")
 
 def load_select_tables_from_database() -> None:
     """Use the sql_database source to reflect an entire database schema and load select tables from it."""
@@ -59,20 +65,22 @@ def load_select_tables_from_database() -> None:
     full_refresh_tables = [t for t, c in table_configs.items() if not c]
 
     if incremental_tables:
-        print(f"Adding tables to incremental with_resources: {list(incremental_tables.keys())}")
+        log(f"Adding tables to incremental with_resources: {list(incremental_tables.keys())}")
         source_incremental = sql_database(engine_source).with_resources(*incremental_tables.keys())
         for table, column in incremental_tables.items():
-            print(f"Setting incremental for table {table} on column {column}")
+            log(f"Setting incremental for table {table} on column {column}")
             getattr(source_incremental, table).apply_hints(incremental=dlt.sources.incremental(column))
         info = pipeline_incremental.run(source_incremental, write_disposition="merge")
-        print(info)
+        log(info)
     
     if full_refresh_tables:
-        print(f"Adding tables to full refresh with_resources: {full_refresh_tables}")
+        log(f"Adding tables to full refresh with_resources: {full_refresh_tables}")
         source_full_refresh = sql_database(engine_source).with_resources(*full_refresh_tables)
         info = pipeline_full_refresh.run(source_full_refresh, write_disposition="replace")
-        print(info)
+        log(info)
 
 
 if __name__ == "__main__":
+    log(f"### STARTING PIPELINE ###")
     load_select_tables_from_database()
+    log(f"### PIPELINE COMPLETED ###")

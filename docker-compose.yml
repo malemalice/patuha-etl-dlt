@@ -41,8 +41,11 @@ services:
     depends_on:
       - dlt_mysql_source
       - dlt_mysql_target
+    environment:
+      - CRON_SCHEDULE=${CRON_SCHEDULE:-* * * * *}  # Default: Run every 5 minutes
     volumes:
-      - ./source:/app
+      # - ./source:/app
+      - ./logs:/var/log  # Store logs outside container
     networks:
       - sym_network
 
