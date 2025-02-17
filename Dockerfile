@@ -1,6 +1,9 @@
 # Use a glibc-based Python image (Debian slim) instead of Alpine
 FROM python:3.11-slim
 
+# Set environment variable for timezone
+ENV TZ=Asia/Jakarta
+
 RUN apt-get update && apt-get install -y \
     python3-dev \
     default-libmysqlclient-dev \

@@ -2,7 +2,10 @@
 import humanize
 from typing import Any
 import os
+import json
+import time
 from dotenv import load_dotenv
+from datetime import datetime
 
 import dlt
 from dlt.common import pendulum
@@ -25,29 +28,80 @@ SOURCE_DB_HOST = os.getenv("SOURCE_DB_HOST", "127.0.0.1")
 SOURCE_DB_PORT = os.getenv("SOURCE_DB_PORT", "3306")
 SOURCE_DB_NAME = os.getenv("SOURCE_DB_NAME", "dbzains")
 
-FETCH_LIMIT = os.getenv("FETCH_LIMIT", 1000)
+FETCH_LIMIT = os.getenv("FETCH_LIMIT", 1)
+INTERVAL = int(os.getenv("INTERVAL", 60))  # Interval in seconds
+
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
-# Load table configurations from environment variables
-TABLES = os.getenv("TABLES", "").split(";")
-table_configs = {}
-for t in TABLES:
-    parts = t.split(":")
-    table_name = parts[0]
-    column = parts[1] if len(parts) > 1 else None
-    table_configs[table_name] = column
+# Load table configurations from tables.json
+TABLES_FILE = "tables.json"
+with open(TABLES_FILE, "r") as f:
+    tables_data = json.load(f)
+
+table_configs = {t["table"]: t for t in tables_data}
 
 def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} - INFO - {message}")
 
+def ensure_dlt_columns(engine_target, table_name):
+    """Check if _dlt_load_id and _dlt_id exist in the target table, add them if not."""
+    inspector = sa.inspect(engine_target)
+    columns = [col["name"] for col in inspector.get_columns(table_name)]
+    alter_statements = []
+    
+    if "_dlt_load_id" not in columns:
+        alter_statements.append("ADD COLUMN `_dlt_load_id` TEXT NOT NULL")
+    if "_dlt_id" not in columns:
+        alter_statements.append("ADD COLUMN `_dlt_id` VARCHAR(128) NOT NULL")
+    
+    if alter_statements:
+        alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
+        with engine_target.connect() as connection:
+            log(f"Altering table {table_name}: {alter_query}")
+            connection.execute(sa.text(alter_query))
+            connection.commit()
+            
+def sync_table_schema(engine_source, engine_target, table_name):
+    """Sync schema from source to target, handling new, changed, and deleted columns."""
+    inspector_source = sa.inspect(engine_source)
+    inspector_target = sa.inspect(engine_target)
+    
+    source_columns = {col["name"]: col for col in inspector_source.get_columns(table_name)}
+    target_columns = {col["name"] for col in inspector_target.get_columns(table_name)}
+    
+    alter_statements = []
+    for column_name, column_info in source_columns.items():
+        if column_name not in target_columns:
+            column_type = column_info["type"]
+            alter_statements.append(f"ADD COLUMN `{column_name}` {column_type}")
+    
+    # TODO: Handle _dlt_version column if not exits in target
+    # for column_name in target_columns:
+    #     if column_name not in source_columns and column_name not in ["_dlt_load_id", "_dlt_id"]:
+    #         alter_statements.append(f"DROP COLUMN `{column_name}`")
+    
+    if alter_statements:
+        alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
+        with engine_target.connect() as connection:
+            log(f"Syncing schema for {table_name}: {alter_query}")
+            connection.execute(sa.text(alter_query))
+            connection.commit()
+
+def get_max_timestamp(engine_source, table_name, column_name):
+    """Fetch the max timestamp from the source table."""
+    query = f"SELECT MAX({column_name}) FROM {table_name}"
+    with engine_source.connect() as connection:
+        result = connection.execute(sa.text(query)).scalar()
+    return result if result else "1970-01-01 00:00:00"
+            
 def load_select_tables_from_database() -> None:
     """Use the sql_database source to reflect an entire database schema and load select tables from it."""
     engine_source = sa.create_engine(DB_SOURCE_URL)
     engine_target = sa.create_engine(DB_TARGET_URL)
-
+    
     # Create separate pipelines for incremental and full refresh
     pipeline_incremental = dlt.pipeline(
         pipeline_name="dlt_incremental", 
@@ -61,15 +115,26 @@ def load_select_tables_from_database() -> None:
         dataset_name=TARGET_DB_NAME
     )
 
-    incremental_tables = {t: c for t, c in table_configs.items() if c}
-    full_refresh_tables = [t for t, c in table_configs.items() if not c]
+    incremental_tables = {t: config for t, config in table_configs.items() if "modifier" in config}
+    full_refresh_tables = [t for t, config in table_configs.items() if "modifier" not in config]
 
     if incremental_tables:
+        # Ensure _dlt_load_id and _dlt_id exist in target tables
+        for table in table_configs.keys():
+            ensure_dlt_columns(engine_target, table)
+            sync_table_schema(engine_source, engine_target, table)
+
         log(f"Adding tables to incremental with_resources: {list(incremental_tables.keys())}")
         source_incremental = sql_database(engine_source).with_resources(*incremental_tables.keys())
-        for table, column in incremental_tables.items():
-            log(f"Setting incremental for table {table} on column {column}")
-            getattr(source_incremental, table).apply_hints(incremental=dlt.sources.incremental(column))
+        for table, config in incremental_tables.items():
+            log(f"Setting incremental for table {table} on column {config['modifier']}")
+            max_timestamp = pendulum.instance(get_max_timestamp(engine_source, table, config["modifier"])).in_tz("Asia/Bangkok")
+            log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
+            getattr(source_incremental, table).apply_hints(
+                primary_key=config["primary_key"],
+                incremental=dlt.sources.incremental(config["modifier"],
+                initial_value=max_timestamp)
+                )
         info = pipeline_incremental.run(source_incremental, write_disposition="merge")
         log(info)
     
@@ -79,8 +144,15 @@ def load_select_tables_from_database() -> None:
         info = pipeline_full_refresh.run(source_full_refresh, write_disposition="replace")
         log(info)
 
-
 if __name__ == "__main__":
-    log(f"### STARTING PIPELINE ###")
-    load_select_tables_from_database()
-    log(f"### PIPELINE COMPLETED ###")
+    if INTERVAL > 0:
+        while True:
+            log(f"### STARTING PIPELINE ###")
+            load_select_tables_from_database()
+            log(f"### PIPELINE COMPLETED ###")
+            log(f"Sleeping for {INTERVAL} seconds...")
+            time.sleep(INTERVAL)
+    else:
+        log(f"### STARTING PIPELINE (Single Run) ###")
+        load_select_tables_from_database()
+        log(f"### PIPELINE COMPLETED ###")

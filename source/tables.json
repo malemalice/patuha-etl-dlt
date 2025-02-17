@@ -1,0 +1,26 @@
+[
+    {
+        "table": "users",
+        "modifier": "inserted_at",
+        "primary_key": "id"
+    },
+    {
+        "table": "products",
+        "modifier": "updated_at",
+        "primary_key": "id"
+    },
+    {
+        "table": "categories",
+        "primary_key": "id"
+    },
+    {
+        "table": "t_transaction",
+        "modifier": "updated_at",
+        "primary_key": "id"
+    },
+    {
+        "table": "brands",
+        "modifier": "updated_at",
+        "primary_key": "id"
+    }
+]
