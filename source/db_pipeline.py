@@ -3,6 +3,7 @@ import humanize
 from typing import Any
 import os
 import json
+import threading
 import time
 from dotenv import load_dotenv
 from datetime import datetime
@@ -11,6 +12,9 @@ import dlt
 from dlt.common import pendulum
 from dlt.sources.sql_database import sql_database
 import sqlalchemy as sa
+
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -144,7 +148,21 @@ def load_select_tables_from_database() -> None:
         info = pipeline_full_refresh.run(source_full_refresh, write_disposition="replace")
         log(info)
 
-if __name__ == "__main__":
+
+class SimpleHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"We are Groot!")
+
+def run_http_server():
+    server_address = ("", 8089)  # Serve on all interfaces, port 8089
+    httpd = HTTPServer(server_address, SimpleHandler)
+    print("Serving on port 8089...")
+    httpd.serve_forever()
+
+def run_pipeline():
     if INTERVAL > 0:
         while True:
             log(f"### STARTING PIPELINE ###")
@@ -156,3 +174,12 @@ if __name__ == "__main__":
         log(f"### STARTING PIPELINE (Single Run) ###")
         load_select_tables_from_database()
         log(f"### PIPELINE COMPLETED ###")
+
+if __name__ == "__main__":
+    # Start the HTTP server in a separate thread
+    http_thread = threading.Thread(target=run_http_server)
+    http_thread.daemon = True
+    http_thread.start()
+
+    # Start the pipeline function
+    run_pipeline()

@@ -44,6 +44,8 @@ services:
     volumes:
       - ./source:/app
       - ./logs:/var/log/app
+    ports:
+      - "8089:8089"
     networks:
       - sym_network
 
