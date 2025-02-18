@@ -28,6 +28,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Use a command that keeps the container running for manual execution
 # CMD ["tail", "-f", "/dev/null"]
 
+# Expose the port the app runs on
+EXPOSE 8000
+
 # Run the script and capture logs
 CMD sh -c "python db_pipeline.py 2>&1 | tee /var/log/app/output.log"
 
