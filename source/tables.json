@@ -1,10 +1,5 @@
 [
     {
-        "table": "users",
-        "modifier": "inserted_at",
-        "primary_key": "id"
-    },
-    {
         "table": "products",
         "modifier": "updated_at",
         "primary_key": "id"
@@ -14,13 +9,8 @@
         "primary_key": "id"
     },
     {
-        "table": "t_transaction",
-        "modifier": "updated_at",
-        "primary_key": "id"
-    },
-    {
-        "table": "brands",
-        "modifier": "updated_at",
-        "primary_key": "id"
+        "table": "fins_budget",
+        "modifier":"dtu",
+        "primary_key": "id_budget"
     }
 ]

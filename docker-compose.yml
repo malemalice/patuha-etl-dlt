@@ -37,15 +37,13 @@ services:
   dlt_runner:
     build: .  # Build from the Dockerfile in the current directory
     container_name: dlt_runner
-    restart: "no"
+    restart: always
     depends_on:
       - dlt_mysql_source
       - dlt_mysql_target
-    environment:
-      - CRON_SCHEDULE=${CRON_SCHEDULE:-* * * * *}  # Default: Run every 5 minutes
     volumes:
       - ./source:/app
-      - ./logs:/var/log  # Store logs outside container
+      - ./logs:/var/log/app
     networks:
       - sym_network
 

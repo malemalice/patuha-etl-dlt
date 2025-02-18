@@ -28,10 +28,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Use a command that keeps the container running for manual execution
 # CMD ["tail", "-f", "/dev/null"]
 
+# Run the script and capture logs
+CMD sh -c "python db_pipeline.py 2>&1 | tee /var/log/app/output.log"
 
 # Copy the entrypoint script
-COPY ../entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# COPY ../entrypoint.sh /entrypoint.sh
+# RUN chmod +x /entrypoint.sh
 
 # Set entrypoint
-ENTRYPOINT ["/entrypoint.sh"]
+# ENTRYPOINT ["/entrypoint.sh"]
