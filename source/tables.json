@@ -1,0 +1,16 @@
+[
+    {
+        "table": "products",
+        "modifier": "updated_at",
+        "primary_key": "id"
+    },
+    {
+        "table": "categories",
+        "primary_key": "id"
+    },
+    {
+        "table": "fins_budget",
+        "modifier":"dtu",
+        "primary_key": "id_budget"
+    }
+]
