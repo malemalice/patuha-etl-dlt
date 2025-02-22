@@ -132,7 +132,7 @@ def load_select_tables_from_database() -> None:
         source_incremental = sql_database(engine_source).with_resources(*incremental_tables.keys())
         for table, config in incremental_tables.items():
             log(f"Setting incremental for table {table} on column {config['modifier']}")
-            max_timestamp = pendulum.instance(get_max_timestamp(engine_source, table, config["modifier"])).in_tz("Asia/Bangkok")
+            max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
             log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
             getattr(source_incremental, table).apply_hints(
                 primary_key=config["primary_key"],
