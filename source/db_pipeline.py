@@ -99,7 +99,7 @@ def get_max_timestamp(engine_source, table_name, column_name):
     query = f"SELECT MAX({column_name}) FROM {table_name}"
     with engine_source.connect() as connection:
         result = connection.execute(sa.text(query)).scalar()
-    return result if result else "1970-01-01 00:00:00"
+    return result if result else datetime(1970, 1, 1, 0, 0, 0)
             
 def load_select_tables_from_database() -> None:
     """Use the sql_database source to reflect an entire database schema and load select tables from it."""
