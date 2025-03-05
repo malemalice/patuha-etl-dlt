@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # CMD ["tail", "-f", "/dev/null"]
 
 # Expose the port the app runs on
-EXPOSE 8000
+EXPOSE 8089
 
 # Run the script and capture logs
 CMD sh -c "python db_pipeline.py 2>&1 | tee /var/log/app/output.log"

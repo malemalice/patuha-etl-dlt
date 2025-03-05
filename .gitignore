@@ -2,4 +2,4 @@
 mysql_source_data/*
 mysql_target_data/*
 logs/*
-table.json
+tables.json
