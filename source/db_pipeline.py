@@ -22,13 +22,13 @@ load_dotenv()
 # Get database credentials from environment variables
 TARGET_DB_USER = os.getenv("TARGET_DB_USER", "symuser")
 TARGET_DB_PASS = os.getenv("TARGET_DB_PASS", "sympass")
-TARGET_DB_HOST = os.getenv("TARGET_DB_HOST", "127.0.0.1")
-TARGET_DB_PORT = os.getenv("TARGET_DB_PORT", "3307")
+TARGET_DB_HOST = os.getenv("TARGET_DB_HOST", "dlt_mysql_target")
+TARGET_DB_PORT = os.getenv("TARGET_DB_PORT", "3306")
 TARGET_DB_NAME = os.getenv("TARGET_DB_NAME", "dbzains")
 
 SOURCE_DB_USER = os.getenv("SOURCE_DB_USER", "symuser")
 SOURCE_DB_PASS = os.getenv("SOURCE_DB_PASS", "sympass")
-SOURCE_DB_HOST = os.getenv("SOURCE_DB_HOST", "127.0.0.1")
+SOURCE_DB_HOST = os.getenv("SOURCE_DB_HOST", "dlt_mysql_source")
 SOURCE_DB_PORT = os.getenv("SOURCE_DB_PORT", "3306")
 SOURCE_DB_NAME = os.getenv("SOURCE_DB_NAME", "dbzains")
 
@@ -134,11 +134,14 @@ def load_select_tables_from_database() -> None:
             log(f"Setting incremental for table {table} on column {config['modifier']}")
             max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
             log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
+            primary_keys = config["primary_key"]
+            if isinstance(primary_keys, str):  # Ensure primary_key supports lists
+                primary_keys = [primary_keys]
+
             getattr(source_incremental, table).apply_hints(
-                primary_key=config["primary_key"],
-                incremental=dlt.sources.incremental(config["modifier"],
-                initial_value=max_timestamp)
-                )
+                primary_key=primary_keys,
+                incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
+            )
         info = pipeline_incremental.run(source_incremental, write_disposition="merge")
         log(info)
     
