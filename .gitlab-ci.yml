@@ -28,17 +28,17 @@ deploy_production:
     - eval $(ssh-agent -s)
     - echo "$CNT_SYNC_DB_PROD_KEY" | tr -d '\r' | ssh-add - > /dev/null
     - mkdir -p ~/.ssh
-    - ssh-keyscan -p 2023 $CNT_SYNC_DB_PROD >> ~/.ssh/known_hosts
+    - ssh-keyscan -p 2024 $CNT_SYNC_DB_PROD >> ~/.ssh/known_hosts
   script:
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-care && git fetch --tags"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-care && git checkout $CI_COMMIT_TAG"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-care && docker compose up -d --build --force-recreate"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-infakid && git fetch --tags"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-infakid && git checkout $CI_COMMIT_TAG"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-infakid && docker compose up -d --build --force-recreate"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-zains_rz && git fetch --tags"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-zains_rz && git checkout $CI_COMMIT_TAG"
-    - ssh -p 2023 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-zains_rz && docker compose up -d --build --force-recreate"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-care && git fetch --tags"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-care && git checkout $CI_COMMIT_TAG"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-care && docker compose up -d --build --force-recreate"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-infakid && git fetch --tags"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-infakid && git checkout $CI_COMMIT_TAG"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-infakid && docker compose up -d --build --force-recreate"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-zains_rz && git fetch --tags"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-zains_rz && git checkout $CI_COMMIT_TAG"
+    - ssh -p 2024 gitlab@$CNT_SYNC_DB_PROD "cd /docker/etl/sync-db-zains_rz && docker compose up -d --build --force-recreate"
   only:
     refs:
       - tags
