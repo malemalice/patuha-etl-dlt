@@ -5,7 +5,7 @@ services:
     container_name: syncdbzains_rz
     restart: always
     volumes:
-      - ./source:/app
+      #      - ./source:/app
       - ${PATH_LOGS}:/var/log/app
     ports:
       - "${APP_PORT}:8089"
