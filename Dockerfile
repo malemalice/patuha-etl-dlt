@@ -20,7 +20,7 @@ COPY source/ .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install pymysql && \
-    pip install "dlt[sqlalchemy]" && \
+    pip install "dlt[sqlalchemy]==1.9.0" && \
     pip install mysqlclient && \
     pip install python-dotenv
     
