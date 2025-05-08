@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the dependency file and install Python dependencies
-COPY source/ .
+COPY source/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install pymysql && \
@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install mysqlclient && \
     pip install python-dotenv
     
+COPY source/ .
 
 # Use a command that keeps the container running for manual execution
 # CMD ["tail", "-f", "/dev/null"]
