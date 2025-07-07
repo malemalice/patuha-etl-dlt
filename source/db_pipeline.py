@@ -106,15 +106,9 @@ def load_select_tables_from_database() -> None:
     engine_source = sa.create_engine(DB_SOURCE_URL)
     engine_target = sa.create_engine(DB_TARGET_URL)
     
-    # Create separate pipelines for incremental and full refresh
-    pipeline_incremental = dlt.pipeline(
-        pipeline_name="dlt_incremental", 
-        destination=dlt.destinations.sqlalchemy(engine_target), 
-        dataset_name=TARGET_DB_NAME
-    )
-    
-    pipeline_full_refresh = dlt.pipeline(
-        pipeline_name="dlt_full_refresh", 
+    # Use a single pipeline instance to reduce MetaData conflicts
+    pipeline = dlt.pipeline(
+        pipeline_name="dlt_unified_pipeline", 
         destination=dlt.destinations.sqlalchemy(engine_target), 
         dataset_name=TARGET_DB_NAME
     )
@@ -122,13 +116,14 @@ def load_select_tables_from_database() -> None:
     incremental_tables = {t: config for t, config in table_configs.items() if "modifier" in config}
     full_refresh_tables = [t for t, config in table_configs.items() if "modifier" not in config]
 
-    if incremental_tables:
-        # Ensure _dlt_load_id and _dlt_id exist in target tables
-        for table in table_configs.keys():
-            ensure_dlt_columns(engine_target, table)
-            sync_table_schema(engine_source, engine_target, table)
+    # Ensure _dlt_load_id and _dlt_id exist in target tables
+    for table in table_configs.keys():
+        ensure_dlt_columns(engine_target, table)
+        sync_table_schema(engine_source, engine_target, table)
 
-        log(f"Adding tables to incremental with_resources: {list(incremental_tables.keys())}")
+    # Process incremental tables
+    if incremental_tables:
+        log(f"Processing incremental tables: {list(incremental_tables.keys())}")
         source_incremental = sql_database(engine_source).with_resources(*incremental_tables.keys())
         for table, config in incremental_tables.items():
             log(f"Setting incremental for table {table} on column {config['modifier']}")
@@ -139,14 +134,19 @@ def load_select_tables_from_database() -> None:
                 incremental=dlt.sources.incremental(config["modifier"],
                 initial_value=max_timestamp)
                 )
-        info = pipeline_incremental.run(source_incremental, write_disposition="merge")
+        info = pipeline.run(source_incremental, write_disposition="merge")
         log(info)
     
+    # Process full refresh tables
     if full_refresh_tables:
-        log(f"Adding tables to full refresh with_resources: {full_refresh_tables}")
+        log(f"Processing full refresh tables: {full_refresh_tables}")
         source_full_refresh = sql_database(engine_source).with_resources(*full_refresh_tables)
-        info = pipeline_full_refresh.run(source_full_refresh, write_disposition="replace")
+        info = pipeline.run(source_full_refresh, write_disposition="replace")
         log(info)
+
+    # Clean up resources
+    engine_source.dispose()
+    engine_target.dispose()
 
 
 class SimpleHandler(SimpleHTTPRequestHandler):
