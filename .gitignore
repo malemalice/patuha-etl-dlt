@@ -2,3 +2,5 @@
 mysql_source_data/*
 mysql_target_data/*
 logs/*
+tables.json
+docker-compose.*
