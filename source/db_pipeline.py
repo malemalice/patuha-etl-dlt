@@ -78,8 +78,6 @@ def create_engines():
         'write_timeout': WRITE_TIMEOUT,
         'autocommit': True,
         'charset': 'utf8mb4',
-        # Enable automatic reconnection
-        'reconnect': True,
         # Set SQL mode to handle data compatibility
         'init_command': "SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))",
     }
