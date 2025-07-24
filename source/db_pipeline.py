@@ -118,6 +118,8 @@ def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
         db_type: Type of database ('source' or 'target') for better error logging
         *args, **kwargs: Arguments to pass to the function
     """
+    global ENGINE_SOURCE, ENGINE_TARGET  # Declare global at the top
+    
     for attempt in range(MAX_RETRIES):
         try:
             return func(*args, **kwargs)
@@ -128,7 +130,6 @@ def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
                     log(f"Retrying {db_type} database connection in {RETRY_DELAY} seconds...")
                     time.sleep(RETRY_DELAY)
                     # Dispose and recreate engines to reset connection pool
-                    global ENGINE_SOURCE, ENGINE_TARGET
                     ENGINE_SOURCE.dispose()
                     ENGINE_TARGET.dispose()
                     ENGINE_SOURCE, ENGINE_TARGET = create_engines()
@@ -147,7 +148,6 @@ def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
                     log(f"Retrying {db_type} database connection in {RETRY_DELAY} seconds...")
                     time.sleep(RETRY_DELAY)
                     # Dispose and recreate engines to reset connection pool
-                    global ENGINE_SOURCE, ENGINE_TARGET
                     ENGINE_SOURCE.dispose()
                     ENGINE_TARGET.dispose()
                     ENGINE_SOURCE, ENGINE_TARGET = create_engines()
