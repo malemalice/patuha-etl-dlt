@@ -35,6 +35,11 @@ SOURCE_DB_NAME = os.getenv("SOURCE_DB_NAME", "dbzains")
 FETCH_LIMIT = os.getenv("FETCH_LIMIT", 1)
 INTERVAL = int(os.getenv("INTERVAL", 60))  # Interval in seconds
 
+# Connection pool configuration
+POOL_SIZE = int(os.getenv("POOL_SIZE", 20))
+MAX_OVERFLOW = int(os.getenv("MAX_OVERFLOW", 30))
+POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", 60))
+POOL_RECYCLE = int(os.getenv("POOL_RECYCLE", 3600))
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
@@ -45,6 +50,27 @@ with open(TABLES_FILE, "r") as f:
     tables_data = json.load(f)
 
 table_configs = {t["table"]: t for t in tables_data}
+
+# Create engines once with proper connection pool configuration
+def create_engines():
+    """Create SQLAlchemy engines with optimized connection pool settings."""
+    pool_settings = {
+        'pool_size': POOL_SIZE,           # Configurable base pool size
+        'max_overflow': MAX_OVERFLOW,     # Configurable overflow limit  
+        'pool_timeout': POOL_TIMEOUT,     # Configurable timeout
+        'pool_recycle': POOL_RECYCLE,     # Configurable connection recycle time
+        'pool_pre_ping': True,            # Validate connections before use
+    }
+    
+    log(f"Creating engines with pool settings: {pool_settings}")
+    
+    engine_source = sa.create_engine(DB_SOURCE_URL, **pool_settings)
+    engine_target = sa.create_engine(DB_TARGET_URL, **pool_settings)
+    
+    return engine_source, engine_target
+
+# Global engine instances
+ENGINE_SOURCE, ENGINE_TARGET = create_engines()
 
 def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -103,8 +129,13 @@ def get_max_timestamp(engine_source, table_name, column_name):
             
 def load_select_tables_from_database() -> None:
     """Use the sql_database source to reflect an entire database schema and load select tables from it."""
-    engine_source = sa.create_engine(DB_SOURCE_URL)
-    engine_target = sa.create_engine(DB_TARGET_URL)
+    # Use global engines instead of creating new ones
+    engine_source = ENGINE_SOURCE
+    engine_target = ENGINE_TARGET
+    
+    # Log connection pool status
+    log(f"Source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
+    log(f"Target pool status - Size: {engine_target.pool.size()}, Checked out: {engine_target.pool.checkedout()}")
     
     # Use a single pipeline instance to reduce MetaData conflicts
     pipeline = dlt.pipeline(
@@ -144,9 +175,9 @@ def load_select_tables_from_database() -> None:
         info = pipeline.run(source_full_refresh, write_disposition="replace")
         log(info)
 
-    # Clean up resources
-    engine_source.dispose()
-    engine_target.dispose()
+    # Log final connection pool status
+    log(f"Final source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
+    log(f"Final target pool status - Size: {engine_target.pool.size()}, Checked out: {engine_target.pool.checkedout()}")
 
 
 class SimpleHandler(SimpleHTTPRequestHandler):
@@ -166,8 +197,13 @@ def run_pipeline():
     if INTERVAL > 0:
         while True:
             log(f"### STARTING PIPELINE ###")
-            load_select_tables_from_database()
-            log(f"### PIPELINE COMPLETED ###")
+            try:
+                load_select_tables_from_database()
+                log(f"### PIPELINE COMPLETED ###")
+            except Exception as e:
+                log(f"### PIPELINE ERROR: {str(e)} ###")
+                # Wait a bit before retrying
+                time.sleep(30)
             log(f"Sleeping for {INTERVAL} seconds...")
             time.sleep(INTERVAL)
     else:
@@ -175,11 +211,23 @@ def run_pipeline():
         load_select_tables_from_database()
         log(f"### PIPELINE COMPLETED ###")
 
-if __name__ == "__main__":
-    # Start the HTTP server in a separate thread
-    http_thread = threading.Thread(target=run_http_server)
-    http_thread.daemon = True
-    http_thread.start()
+def cleanup_engines():
+    """Clean up engine resources on shutdown."""
+    if ENGINE_SOURCE:
+        ENGINE_SOURCE.dispose()
+    if ENGINE_TARGET:
+        ENGINE_TARGET.dispose()
 
-    # Start the pipeline function
-    run_pipeline()
+if __name__ == "__main__":
+    try:
+        # Start the HTTP server in a separate thread
+        http_thread = threading.Thread(target=run_http_server)
+        http_thread.daemon = True
+        http_thread.start()
+
+        # Start the pipeline function
+        run_pipeline()
+    except KeyboardInterrupt:
+        log("Shutting down pipeline...")
+    finally:
+        cleanup_engines()
