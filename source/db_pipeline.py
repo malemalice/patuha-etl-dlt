@@ -50,6 +50,10 @@ WRITE_TIMEOUT = int(os.getenv("MYSQL_WRITE_TIMEOUT", 300))  # 5 minutes
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
 RETRY_DELAY = int(os.getenv("RETRY_DELAY", 30))  # seconds
 
+# Batch processing configuration
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 8))  # Process tables in batches of 5
+BATCH_DELAY = int(os.getenv("BATCH_DELAY", 2))  # Delay between batches in seconds
+
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
@@ -136,6 +140,25 @@ def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
                 # Re-raise non-connection errors immediately
                 log(f"Non-connection error occurred on {db_type} database: {e}")
                 raise
+        except sa.exc.ProgrammingError as e:
+            if "Commands out of sync" in str(e) or "2014" in str(e):
+                log(f"MySQL 'Commands out of sync' error on {db_type} database (attempt {attempt + 1}/{MAX_RETRIES}). Error: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    log(f"Retrying {db_type} database connection in {RETRY_DELAY} seconds...")
+                    time.sleep(RETRY_DELAY)
+                    # Dispose and recreate engines to reset connection pool
+                    global ENGINE_SOURCE, ENGINE_TARGET
+                    ENGINE_SOURCE.dispose()
+                    ENGINE_TARGET.dispose()
+                    ENGINE_SOURCE, ENGINE_TARGET = create_engines()
+                    continue
+                else:
+                    log(f"Max retries reached for {db_type} database connection. Failing.")
+                    raise
+            else:
+                # Re-raise non-programming errors immediately
+                log(f"Programming error occurred on {db_type} database: {e}")
+                raise
         except Exception as e:
             log(f"Non-connection error occurred on {db_type} database: {e}")
             raise
@@ -201,6 +224,38 @@ def get_max_timestamp(engine_target, table_name, column_name):
     
     return retry_on_connection_error(_get_timestamp, f"target (get_max_timestamp for {table_name}.{column_name})")
             
+def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, write_disposition="merge"):
+    """Process a batch of tables with proper connection management."""
+    if not tables_dict:
+        return
+    
+    table_names = list(tables_dict.keys())
+    log(f"Processing batch of {len(table_names)} tables: {table_names}")
+    
+    # Create source with only this batch of tables
+    if write_disposition == "merge":
+        # Incremental tables
+        source_batch = sql_database(engine_source).with_resources(*table_names)
+        for table, config in tables_dict.items():
+            log(f"Setting incremental for table {table} on column {config['modifier']}")
+            max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
+            log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
+            getattr(source_batch, table).apply_hints(
+                primary_key=config["primary_key"],
+                incremental=dlt.sources.incremental(config["modifier"],
+                initial_value=max_timestamp)
+                )
+    else:
+        # Full refresh tables
+        source_batch = sql_database(engine_source).with_resources(*table_names)
+    
+    # Run the batch
+    info = pipeline.run(source_batch, write_disposition=write_disposition)
+    log(f"Batch completed: {info}")
+    
+    # Small delay to let connections settle
+    time.sleep(1)
+
 def load_select_tables_from_database() -> None:
     """Use the sql_database source to reflect an entire database schema and load select tables from it."""
     def _load_tables():
@@ -222,33 +277,61 @@ def load_select_tables_from_database() -> None:
         incremental_tables = {t: config for t, config in table_configs.items() if "modifier" in config}
         full_refresh_tables = [t for t, config in table_configs.items() if "modifier" not in config]
 
-        # Ensure _dlt_load_id and _dlt_id exist in target tables
-        for table in table_configs.keys():
-            ensure_dlt_columns(engine_target, table)
-            sync_table_schema(engine_source, engine_target, table)
+        log(f"Total tables to process: {len(table_configs)} (Incremental: {len(incremental_tables)}, Full refresh: {len(full_refresh_tables)})")
+        log(f"Using batch size: {BATCH_SIZE} with {BATCH_DELAY}s delay between batches")
 
-        # Process incremental tables
+        # Ensure _dlt_load_id and _dlt_id exist in target tables
+        # Process schema changes in batches too to avoid overwhelming connections
+        all_tables = list(table_configs.keys())
+        for i in range(0, len(all_tables), BATCH_SIZE):
+            batch_tables = all_tables[i:i + BATCH_SIZE]
+            log(f"Ensuring DLT columns for batch: {batch_tables}")
+            for table in batch_tables:
+                ensure_dlt_columns(engine_target, table)
+                sync_table_schema(engine_source, engine_target, table)
+            if i + BATCH_SIZE < len(all_tables):  # Don't delay after the last batch
+                time.sleep(BATCH_DELAY)
+
+        # Process incremental tables in batches
         if incremental_tables:
-            log(f"Processing incremental tables: {list(incremental_tables.keys())}")
-            source_incremental = sql_database(engine_source).with_resources(*incremental_tables.keys())
-            for table, config in incremental_tables.items():
-                log(f"Setting incremental for table {table} on column {config['modifier']}")
-                max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
-                log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
-                getattr(source_incremental, table).apply_hints(
-                    primary_key=config["primary_key"],
-                    incremental=dlt.sources.incremental(config["modifier"],
-                    initial_value=max_timestamp)
-                    )
-            info = pipeline.run(source_incremental, write_disposition="merge")
-            log(info)
+            log(f"Processing {len(incremental_tables)} incremental tables in batches of {BATCH_SIZE}")
+            incremental_items = list(incremental_tables.items())
+            
+            for i in range(0, len(incremental_items), BATCH_SIZE):
+                batch_items = incremental_items[i:i + BATCH_SIZE]
+                batch_dict = dict(batch_items)
+                
+                try:
+                    process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "merge")
+                except Exception as e:
+                    log(f"Error processing incremental batch {i//BATCH_SIZE + 1}: {e}")
+                    # Continue with next batch rather than failing completely
+                    continue
+                
+                # Delay between batches (except for the last one)
+                if i + BATCH_SIZE < len(incremental_items):
+                    log(f"Waiting {BATCH_DELAY}s before next batch...")
+                    time.sleep(BATCH_DELAY)
         
-        # Process full refresh tables
+        # Process full refresh tables in batches
         if full_refresh_tables:
-            log(f"Processing full refresh tables: {full_refresh_tables}")
-            source_full_refresh = sql_database(engine_source).with_resources(*full_refresh_tables)
-            info = pipeline.run(source_full_refresh, write_disposition="replace")
-            log(info)
+            log(f"Processing {len(full_refresh_tables)} full refresh tables in batches of {BATCH_SIZE}")
+            
+            for i in range(0, len(full_refresh_tables), BATCH_SIZE):
+                batch_tables = full_refresh_tables[i:i + BATCH_SIZE]
+                batch_dict = {table: table_configs[table] for table in batch_tables}
+                
+                try:
+                    process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "replace")
+                except Exception as e:
+                    log(f"Error processing full refresh batch {i//BATCH_SIZE + 1}: {e}")
+                    # Continue with next batch rather than failing completely
+                    continue
+                
+                # Delay between batches (except for the last one)
+                if i + BATCH_SIZE < len(full_refresh_tables):
+                    log(f"Waiting {BATCH_DELAY}s before next batch...")
+                    time.sleep(BATCH_DELAY)
 
         # Log final connection pool status
         log(f"Final source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
