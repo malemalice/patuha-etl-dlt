@@ -2,3 +2,4 @@ dlt==1.8.1
 mysql-connector-python
 pymysql
 sqlalchemy
+setuptools<81
