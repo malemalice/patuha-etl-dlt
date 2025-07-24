@@ -62,7 +62,8 @@ def create_engines():
         'pool_pre_ping': True,            # Validate connections before use
     }
     
-    log(f"Creating engines with pool settings: {pool_settings}")
+    # Use print() instead of log() since this runs during module initialization
+    print(f"Creating engines with pool settings: {pool_settings}")
     
     engine_source = sa.create_engine(DB_SOURCE_URL, **pool_settings)
     engine_target = sa.create_engine(DB_TARGET_URL, **pool_settings)
