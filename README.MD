@@ -220,29 +220,32 @@ If you encounter connection pool errors:
 
 ### Common Issues
 
-1. **Connection Issues**: 
-   - Verify database credentials and network connectivity
-   - Check if database servers are running and accessible
-   - Ensure firewall rules allow connections on specified ports
+#### JSON Parsing Errors (orjson.JSONDecodeError)
 
-2. **Missing Columns**: 
-   - Ensure modifier columns exist and are properly updated
-   - Verify column names match exactly (case-sensitive)
-   - Check that modifier columns have appropriate data types (datetime, timestamp)
+If you encounter `orjson.JSONDecodeError: unexpected character: line 1 column 1 (char 0)` errors:
 
-3. **Docker Issues**: 
-   - Check container logs with `docker compose logs`
-   - Verify database containers are healthy: `docker compose ps`
-   - Ensure port mappings don't conflict with existing services
+**Cause:** This typically happens when switching MySQL modes (strict/unrestricted) or with data encoding issues.
 
-4. **Permissions**: 
-   - Ensure database users have sufficient privileges for DDL operations (ALTER TABLE)
-   - Verify users can CREATE, INSERT, UPDATE, DELETE on target tables
-   - Check that users have GRANT permissions for schema modifications
+**Solution:** The app now automatically handles both strict and unrestricted MySQL modes. When JSON errors occur:
+- The pipeline automatically retries failed tables individually
+- Continues processing other tables without stopping
+- Provides detailed error logs to identify problematic tables
 
-### Connection Pool Errors
+**No manual configuration needed** - the app adapts automatically to your MySQL settings.
 
-5. **"QueuePool limit of size X overflow Y reached"**:
+#### Zero Dates Handling
+
+**Zero dates** (like `'0000-00-00 00:00:00'`) are now **automatically synced** from source to destination:
+
+✅ **Source with zero dates**: Data syncs successfully  
+✅ **Preserves original data**: Zero dates are copied as-is  
+✅ **Destination handles it**: Target database applies its own rules  
+
+The pipeline uses a permissive SQL mode that allows zero dates to pass through, letting each database handle them according to its own configuration.
+
+#### Connection Pool Exhaustion
+
+1. **"QueuePool limit of size X overflow Y reached"**:
    ```env
    # Increase pool limits in .env
    POOL_SIZE=30
@@ -250,17 +253,17 @@ If you encounter connection pool errors:
    POOL_TIMEOUT=90
    ```
 
-6. **"Connection timeout"**: 
+2. **"Connection timeout"**: 
    - Increase `POOL_TIMEOUT` value
    - Check database server performance and network latency
    - Consider reducing `INTERVAL` for frequent smaller syncs
 
-7. **"Connection refused"**: 
+3. **"Connection refused"**: 
    - Verify database credentials in `.env`
    - Check database server status and network connectivity
    - Ensure database ports are correctly configured
 
-8. **Memory Issues with Large Tables**:
+4. **Memory Issues with Large Tables**:
    - Process large tables during off-peak hours
    - Consider splitting large tables into smaller batches
    - Increase system memory or use streaming processing

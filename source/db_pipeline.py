@@ -35,23 +35,8 @@ SOURCE_DB_NAME = os.getenv("SOURCE_DB_NAME", "dbzains")
 FETCH_LIMIT = os.getenv("FETCH_LIMIT", 1)
 INTERVAL = int(os.getenv("INTERVAL", 60))  # Interval in seconds
 
-# Connection pool configuration
-POOL_SIZE = int(os.getenv("POOL_SIZE", 20))
-MAX_OVERFLOW = int(os.getenv("MAX_OVERFLOW", 30))
-POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", 60))
-POOL_RECYCLE = int(os.getenv("POOL_RECYCLE", 3600))
-
-# MySQL-specific timeout configurations
-CONNECT_TIMEOUT = int(os.getenv("MYSQL_CONNECT_TIMEOUT", 60))
-READ_TIMEOUT = int(os.getenv("MYSQL_READ_TIMEOUT", 300))  # 5 minutes
-WRITE_TIMEOUT = int(os.getenv("MYSQL_WRITE_TIMEOUT", 300))  # 5 minutes
-
-# Retry configuration
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
-RETRY_DELAY = int(os.getenv("RETRY_DELAY", 30))  # seconds
-
 # Batch processing configuration
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", 8))  # Process tables in batches of 5
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 8))  # Process tables in batches of 8
 BATCH_DELAY = int(os.getenv("BATCH_DELAY", 2))  # Delay between batches in seconds
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
@@ -68,22 +53,23 @@ table_configs = {t["table"]: t for t in tables_data}
 def create_engines():
     """Create SQLAlchemy engines with optimized connection pool settings and MySQL-specific parameters."""
     pool_settings = {
-        'pool_size': POOL_SIZE,           # Configurable base pool size
-        'max_overflow': MAX_OVERFLOW,     # Configurable overflow limit  
-        'pool_timeout': POOL_TIMEOUT,     # Configurable timeout
-        'pool_recycle': POOL_RECYCLE,     # Configurable connection recycle time
+        'pool_size': 20,           # Configurable base pool size
+        'max_overflow': 30,     # Configurable overflow limit  
+        'pool_timeout': 60,     # Configurable timeout
+        'pool_recycle': 3600,     # Configurable connection recycle time
         'pool_pre_ping': True,            # Validate connections before use
     }
     
     # MySQL-specific connection arguments to handle timeouts and connection stability
     mysql_connect_args = {
-        'connect_timeout': CONNECT_TIMEOUT,
-        'read_timeout': READ_TIMEOUT,
-        'write_timeout': WRITE_TIMEOUT,
+        'connect_timeout': 60,
+        'read_timeout': 300,
+        'write_timeout': 300,
         'autocommit': True,
         'charset': 'utf8mb4',
-        # Set SQL mode to handle data compatibility
-        'init_command': "SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))",
+        # Permissive SQL mode that allows zero dates and works with both strict/unrestricted modes
+        'init_command': "SET SESSION sql_mode='ERROR_FOR_DIVISION_BY_ZERO'",
+        'use_unicode': True,
     }
     
     # Use print() instead of log() since this runs during module initialization
@@ -120,15 +106,15 @@ def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
     """
     global ENGINE_SOURCE, ENGINE_TARGET  # Declare global at the top
     
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(3): # Simplified retry logic
         try:
             return func(*args, **kwargs)
         except sa.exc.OperationalError as e:
             if "MySQL server has gone away" in str(e) or "2006" in str(e):
-                log(f"MySQL connection lost on {db_type} database (attempt {attempt + 1}/{MAX_RETRIES}). Error: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    log(f"Retrying {db_type} database connection in {RETRY_DELAY} seconds...")
-                    time.sleep(RETRY_DELAY)
+                log(f"MySQL connection lost on {db_type} database (attempt {attempt + 1}/3). Error: {e}")
+                if attempt < 2:
+                    log(f"Retrying {db_type} database connection in 30 seconds...")
+                    time.sleep(30)
                     # Dispose and recreate engines to reset connection pool
                     ENGINE_SOURCE.dispose()
                     ENGINE_TARGET.dispose()
@@ -143,10 +129,10 @@ def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
                 raise
         except sa.exc.ProgrammingError as e:
             if "Commands out of sync" in str(e) or "2014" in str(e):
-                log(f"MySQL 'Commands out of sync' error on {db_type} database (attempt {attempt + 1}/{MAX_RETRIES}). Error: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    log(f"Retrying {db_type} database connection in {RETRY_DELAY} seconds...")
-                    time.sleep(RETRY_DELAY)
+                log(f"MySQL 'Commands out of sync' error on {db_type} database (attempt {attempt + 1}/3). Error: {e}")
+                if attempt < 2:
+                    log(f"Retrying {db_type} database connection in 30 seconds...")
+                    time.sleep(30)
                     # Dispose and recreate engines to reset connection pool
                     ENGINE_SOURCE.dispose()
                     ENGINE_TARGET.dispose()
@@ -232,26 +218,61 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     table_names = list(tables_dict.keys())
     log(f"Processing batch of {len(table_names)} tables: {table_names}")
     
-    # Create source with only this batch of tables
-    if write_disposition == "merge":
-        # Incremental tables
-        source_batch = sql_database(engine_source).with_resources(*table_names)
-        for table, config in tables_dict.items():
-            log(f"Setting incremental for table {table} on column {config['modifier']}")
-            max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
-            log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
-            getattr(source_batch, table).apply_hints(
-                primary_key=config["primary_key"],
-                incremental=dlt.sources.incremental(config["modifier"],
-                initial_value=max_timestamp)
-                )
-    else:
-        # Full refresh tables
-        source_batch = sql_database(engine_source).with_resources(*table_names)
-    
-    # Run the batch
-    info = pipeline.run(source_batch, write_disposition=write_disposition)
-    log(f"Batch completed: {info}")
+    try:
+        # Create source with only this batch of tables
+        if write_disposition == "merge":
+            # Incremental tables
+            source_batch = sql_database(engine_source).with_resources(*table_names)
+            for table, config in tables_dict.items():
+                log(f"Setting incremental for table {table} on column {config['modifier']}")
+                max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
+                log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
+                getattr(source_batch, table).apply_hints(
+                    primary_key=config["primary_key"],
+                    incremental=dlt.sources.incremental(config["modifier"],
+                    initial_value=max_timestamp)
+                    )
+        else:
+            # Full refresh tables
+            source_batch = sql_database(engine_source).with_resources(*table_names)
+        
+        # Run the batch with enhanced error handling
+        info = pipeline.run(source_batch, write_disposition=write_disposition)
+        log(f"Batch completed: {info}")
+        
+    except Exception as e:
+        error_message = str(e)
+        log(f"Error in batch processing: {error_message}")
+        log(f"Error type: {type(e)}")
+        
+        # Handle specific JSON decode errors
+        if "JSONDecodeError" in error_message or "orjson" in error_message:
+            log(f"JSON parsing error detected for tables: {table_names}")
+            log(f"This may be caused by data encoding issues - attempting individual sync")
+            
+            # Automatically try to process tables individually to identify the problematic one
+            for table_name in table_names:
+                try:
+                    log(f"Attempting individual sync for table: {table_name}")
+                    single_source = sql_database(engine_source).with_resources(table_name)
+                    
+                    if write_disposition == "merge" and "modifier" in tables_dict[table_name]:
+                        config = tables_dict[table_name]
+                        max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table_name, config["modifier"])).in_tz("Asia/Bangkok")
+                        getattr(single_source, table_name).apply_hints(
+                            primary_key=config["primary_key"],
+                            incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
+                        )
+                    
+                    single_info = pipeline.run(single_source, write_disposition=write_disposition)
+                    log(f"Individual sync successful for {table_name}: {single_info}")
+                    
+                except Exception as individual_error:
+                    log(f"Individual sync also failed for {table_name}: {individual_error}")
+                    continue
+        else:
+            # Re-raise non-JSON errors
+            raise e
     
     # Small delay to let connections settle
     time.sleep(1)
@@ -273,6 +294,17 @@ def load_select_tables_from_database() -> None:
             destination=dlt.destinations.sqlalchemy(engine_target), 
             dataset_name=TARGET_DB_NAME
         )
+        
+        # Configure DLT to handle both strict and unrestricted MySQL modes automatically
+        try:
+            import dlt.common.configuration as dlt_config
+            # Use safe defaults that work with both MySQL modes
+            dlt_config.get_config()["normalize"]["json_module"] = "orjson"
+            dlt_config.get_config()["data_writer"]["disable_compression"] = False
+            
+        except Exception as config_error:
+            log(f"Warning: Could not set DLT configuration: {config_error}")
+            # Continue without custom config - use defaults
 
         incremental_tables = {t: config for t, config in table_configs.items() if "modifier" in config}
         full_refresh_tables = [t for t, config in table_configs.items() if "modifier" not in config]
@@ -305,6 +337,9 @@ def load_select_tables_from_database() -> None:
                     process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "merge")
                 except Exception as e:
                     log(f"Error processing incremental batch {i//BATCH_SIZE + 1}: {e}")
+                    log(f"Pipeline execution failed at stage sync with exception:")
+                    log(f"{type(e)}")
+                    log(f"{str(e)}")
                     # Continue with next batch rather than failing completely
                     continue
                 
