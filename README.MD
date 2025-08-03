@@ -234,11 +234,24 @@ If you encounter `orjson.JSONDecodeError: unexpected character: line 1 column 1 
 
 **No manual configuration needed** - the app adapts automatically to your MySQL settings.
 
-**For troubleshooting:** Enable debug mode for detailed logging:
+**For troubleshooting:** Debug mode is **enabled by default** for easier troubleshooting:
 ```bash
-# Add to your .env file:
-DEBUG_MODE=true
+# Debug modes are enabled by default
+DEBUG_MODE=true              # General detailed logging (default: true)
+DEEP_DEBUG_JSON=true         # Deep analysis of JSON errors (default: true)
+
+# To disable detailed logging after fixing issues:
+DEBUG_MODE=false
+DEEP_DEBUG_JSON=false
 ```
+
+**Deep JSON Debugging:** With debugging enabled by default, you'll automatically see:
+- Full error stack traces
+- Sample data from problematic tables  
+- Column schema information
+- Step-by-step DLT processing details
+- Exact location where JSON parsing fails
+
 This will show detailed information about table processing and help identify specific data issues.
 
 #### Zero Dates Handling

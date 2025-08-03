@@ -40,7 +40,8 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", 8))  # Process tables in batches of 8
 BATCH_DELAY = int(os.getenv("BATCH_DELAY", 2))  # Delay between batches in seconds
 
 # Debug mode for detailed logging
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
+DEEP_DEBUG_JSON = os.getenv("DEEP_DEBUG_JSON", "true").lower() == "true"
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
@@ -231,6 +232,46 @@ def validate_table_data(engine_source, table_name):
         log(f"Table validation failed for {table_name}: {validation_error}")
         return False
 
+def debug_table_data(engine_source, table_name, sample_size=3):
+    """Debug function to inspect table data that might cause JSON issues."""
+    try:
+        with engine_source.connect() as connection:
+            # Get table schema
+            inspector = sa.inspect(engine_source)
+            columns = inspector.get_columns(table_name)
+            column_names = [col['name'] for col in columns]
+            
+            log(f"DEBUG: Table {table_name} columns: {column_names}")
+            
+            # Get sample data
+            sample_query = f"SELECT * FROM {table_name} LIMIT {sample_size}"
+            result = connection.execute(sa.text(sample_query))
+            rows = result.fetchall()
+            
+            log(f"DEBUG: Table {table_name} sample data:")
+            for i, row in enumerate(rows):
+                # Convert row to dict for logging
+                row_dict = dict(zip(column_names, row))
+                log(f"DEBUG: Row {i+1}: {row_dict}")
+                
+                # Check for potential problematic values
+                for col_name, value in row_dict.items():
+                    if value is None:
+                        continue
+                    if isinstance(value, str):
+                        if len(value) > 1000:
+                            log(f"DEBUG: Large text in {col_name}: {len(value)} chars")
+                        if '\x00' in value:
+                            log(f"DEBUG: NULL bytes found in {col_name}")
+                        if not value.strip():
+                            log(f"DEBUG: Empty/whitespace string in {col_name}")
+            
+            return True
+            
+    except Exception as debug_error:
+        log(f"DEBUG: Failed to inspect table {table_name}: {debug_error}")
+        return False
+
 def get_max_timestamp(engine_target, table_name, column_name):
     """Fetch the max timestamp from the target table."""
     def _get_timestamp():
@@ -312,16 +353,82 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                         log(f"About to run individual sync for {table_name}")
                     
                     # Try individual sync with same write disposition
-                    single_info = pipeline.run(single_source, write_disposition=write_disposition)
-                    log(f"Individual sync successful for {table_name}: {single_info}")
+                    try:
+                        log(f"Starting individual DLT pipeline run for {table_name}")
+                        single_info = pipeline.run(single_source, write_disposition=write_disposition)
+                        log(f"Individual sync successful for {table_name}: {single_info}")
+                    except Exception as pipeline_error:
+                        log(f"Pipeline run failed for {table_name}: {pipeline_error}")
+                        log(f"Pipeline error type: {type(pipeline_error).__name__}")
+                        
+                        # If it's a JSON error, capture more details
+                        if "JSONDecodeError" in str(pipeline_error) or "orjson" in str(pipeline_error):
+                            log(f"JSON error during pipeline run for {table_name}")
+                            # Check if there are any intermediate files or data we can inspect
+                            try:
+                                import dlt.common.storages as dlt_storages
+                                log(f"Attempting to inspect DLT pipeline state...")
+                            except Exception as inspect_error:
+                                log(f"Could not inspect DLT state: {inspect_error}")
+                        
+                        # Re-raise the error to be handled by the outer exception handler
+                        raise pipeline_error
                     
                 except Exception as individual_error:
                     individual_error_msg = str(individual_error)
                     log(f"Individual sync also failed for {table_name}: {individual_error_msg}")
                     log(f"Individual error type: {type(individual_error).__name__}")
                     
-                    # If it's still a JSON error, skip this table entirely 
+                    # If it's still a JSON error, do deep debugging
                     if "JSONDecodeError" in individual_error_msg or "orjson" in individual_error_msg:
+                        if DEEP_DEBUG_JSON:
+                            log(f"=== DEEP DEBUG FOR JSON ERROR IN TABLE: {table_name} ===")
+                            
+                            # Get full error traceback
+                            import traceback
+                            log(f"Full error traceback:")
+                            log(traceback.format_exc())
+                            
+                            # Debug the table data
+                            log(f"Debugging table data for {table_name}:")
+                            debug_table_data(engine_source, table_name)
+                            
+                            # Try to identify the exact stage where JSON error occurs
+                            log(f"Attempting to identify JSON error location...")
+                            try:
+                                # Test basic table read
+                                with engine_source.connect() as conn:
+                                    test_query = f"SELECT COUNT(*) FROM {table_name}"
+                                    count = conn.execute(sa.text(test_query)).scalar()
+                                    log(f"Basic count query works: {count} rows")
+                                    
+                                    # Test sample data read
+                                    sample_query = f"SELECT * FROM {table_name} LIMIT 1"
+                                    result = conn.execute(sa.text(sample_query))
+                                    sample_row = result.fetchone()
+                                    log(f"Basic sample query works: got {len(sample_row) if sample_row else 0} columns")
+                                    
+                            except Exception as basic_test_error:
+                                log(f"Basic table queries failed: {basic_test_error}")
+                            
+                            # Try to test DLT source creation without running pipeline
+                            try:
+                                log(f"Testing DLT source creation for {table_name}...")
+                                test_source = sql_database(engine_source).with_resources(table_name)
+                                log(f"DLT source creation successful for {table_name}")
+                                
+                                # Try to get table resource info
+                                table_resource = getattr(test_source, table_name)
+                                log(f"Table resource accessed successfully for {table_name}")
+                                
+                            except Exception as dlt_source_error:
+                                log(f"DLT source creation failed for {table_name}: {dlt_source_error}")
+                                log(f"DLT source error type: {type(dlt_source_error).__name__}")
+                            
+                            log(f"=== END DEEP DEBUG FOR {table_name} ===")
+                        else:
+                            log(f"JSON error in {table_name} - enable DEEP_DEBUG_JSON=true for detailed analysis")
+                        
                         log(f"Persistent JSON error for table {table_name} - skipping this table for now")
                         log(f"Consider checking data integrity in table {table_name}")
                         continue
