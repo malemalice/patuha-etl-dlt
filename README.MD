@@ -227,11 +227,19 @@ If you encounter `orjson.JSONDecodeError: unexpected character: line 1 column 1 
 **Cause:** This typically happens when switching MySQL modes (strict/unrestricted) or with data encoding issues.
 
 **Solution:** The app now automatically handles both strict and unrestricted MySQL modes. When JSON errors occur:
-- The pipeline automatically retries failed tables individually
+- The pipeline automatically retries failed tables individually  
+- Uses the same sync method (incremental/full refresh) as originally configured
 - Continues processing other tables without stopping
 - Provides detailed error logs to identify problematic tables
 
 **No manual configuration needed** - the app adapts automatically to your MySQL settings.
+
+**For troubleshooting:** Enable debug mode for detailed logging:
+```bash
+# Add to your .env file:
+DEBUG_MODE=true
+```
+This will show detailed information about table processing and help identify specific data issues.
 
 #### Zero Dates Handling
 

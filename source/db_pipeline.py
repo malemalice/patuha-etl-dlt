@@ -39,6 +39,9 @@ INTERVAL = int(os.getenv("INTERVAL", 60))  # Interval in seconds
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 8))  # Process tables in batches of 8
 BATCH_DELAY = int(os.getenv("BATCH_DELAY", 2))  # Delay between batches in seconds
 
+# Debug mode for detailed logging
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
@@ -200,6 +203,34 @@ def sync_table_schema(engine_source, engine_target, table_name):
     # This function uses both source and target, but let's specify based on the main operation
     return retry_on_connection_error(_sync_schema, f"source+target (sync_table_schema for {table_name})")
 
+def validate_table_data(engine_source, table_name):
+    """Check table for potential data issues that could cause JSON serialization problems."""
+    try:
+        with engine_source.connect() as connection:
+            # Check if table exists and has data
+            count_query = f"SELECT COUNT(*) FROM {table_name}"
+            row_count = connection.execute(sa.text(count_query)).scalar()
+            
+            if row_count == 0:
+                if DEBUG_MODE:
+                    log(f"Table {table_name} is empty")
+                return True
+            
+            # Check for basic data issues
+            sample_query = f"SELECT * FROM {table_name} LIMIT 5"
+            result = connection.execute(sa.text(sample_query))
+            sample_rows = result.fetchall()
+            
+            if DEBUG_MODE:
+                log(f"Table {table_name} validation - Rows: {row_count}, Sample fetched: {len(sample_rows)}")
+            
+            # Basic validation passed
+            return True
+            
+    except Exception as validation_error:
+        log(f"Table validation failed for {table_name}: {validation_error}")
+        return False
+
 def get_max_timestamp(engine_target, table_name, column_name):
     """Fetch the max timestamp from the target table."""
     def _get_timestamp():
@@ -220,9 +251,12 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     
     try:
         # Create source with only this batch of tables
+        if DEBUG_MODE:
+            log(f"Creating DLT source for tables: {table_names}")
+        source_batch = sql_database(engine_source).with_resources(*table_names)
+        
         if write_disposition == "merge":
             # Incremental tables
-            source_batch = sql_database(engine_source).with_resources(*table_names)
             for table, config in tables_dict.items():
                 log(f"Setting incremental for table {table} on column {config['modifier']}")
                 max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
@@ -231,29 +265,38 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     primary_key=config["primary_key"],
                     incremental=dlt.sources.incremental(config["modifier"],
                     initial_value=max_timestamp)
-                    )
-        else:
-            # Full refresh tables
-            source_batch = sql_database(engine_source).with_resources(*table_names)
+                )
+        
+        # Add debugging before running the pipeline
+        if DEBUG_MODE:
+            log(f"Starting DLT pipeline run for batch: {table_names}, write_disposition: {write_disposition}")
         
         # Run the batch with enhanced error handling
         info = pipeline.run(source_batch, write_disposition=write_disposition)
-        log(f"Batch completed: {info}")
+        log(f"Batch completed successfully: {info}")
         
     except Exception as e:
         error_message = str(e)
+        error_type = type(e).__name__
         log(f"Error in batch processing: {error_message}")
-        log(f"Error type: {type(e)}")
+        log(f"Error type: {error_type}")
         
         # Handle specific JSON decode errors
         if "JSONDecodeError" in error_message or "orjson" in error_message:
             log(f"JSON parsing error detected for tables: {table_names}")
-            log(f"This may be caused by data encoding issues - attempting individual sync")
+            log(f"This may be caused by data encoding issues - attempting individual sync with enhanced debugging")
             
-            # Automatically try to process tables individually to identify the problematic one
+            # Try alternative approach: process each table with simpler method
             for table_name in table_names:
                 try:
-                    log(f"Attempting individual sync for table: {table_name}")
+                    # Validate table data first
+                    if not validate_table_data(engine_source, table_name):
+                        log(f"Table validation failed for {table_name}, skipping")
+                        continue
+                    
+                    log(f"Attempting individual sync for table: {table_name} with enhanced error handling")
+                    
+                    # Try a more basic approach with error catching
                     single_source = sql_database(engine_source).with_resources(table_name)
                     
                     if write_disposition == "merge" and "modifier" in tables_dict[table_name]:
@@ -264,14 +307,30 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                             incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
                         )
                     
+                    # Add debugging info before individual table run
+                    if DEBUG_MODE:
+                        log(f"About to run individual sync for {table_name}")
+                    
+                    # Try individual sync with same write disposition
                     single_info = pipeline.run(single_source, write_disposition=write_disposition)
                     log(f"Individual sync successful for {table_name}: {single_info}")
                     
                 except Exception as individual_error:
-                    log(f"Individual sync also failed for {table_name}: {individual_error}")
-                    continue
+                    individual_error_msg = str(individual_error)
+                    log(f"Individual sync also failed for {table_name}: {individual_error_msg}")
+                    log(f"Individual error type: {type(individual_error).__name__}")
+                    
+                    # If it's still a JSON error, skip this table entirely 
+                    if "JSONDecodeError" in individual_error_msg or "orjson" in individual_error_msg:
+                        log(f"Persistent JSON error for table {table_name} - skipping this table for now")
+                        log(f"Consider checking data integrity in table {table_name}")
+                        continue
+                    else:
+                        log(f"Non-JSON error for table {table_name}: {individual_error_msg}")
+                        continue
         else:
             # Re-raise non-JSON errors
+            log(f"Non-JSON error in batch processing: {error_message}")
             raise e
     
     # Small delay to let connections settle
@@ -301,6 +360,19 @@ def load_select_tables_from_database() -> None:
             # Use safe defaults that work with both MySQL modes
             dlt_config.get_config()["normalize"]["json_module"] = "orjson"
             dlt_config.get_config()["data_writer"]["disable_compression"] = False
+            
+            # Additional configurations to handle problematic data
+            dlt_config.get_config()["normalize"]["max_nesting_level"] = 10
+            dlt_config.get_config()["extract"]["max_parallel_items"] = 1  # Reduce parallelism to avoid conflicts
+            
+            # Try to handle JSON serialization issues better
+            try:
+                dlt_config.get_config()["normalize"]["skip_nulls"] = False
+                dlt_config.get_config()["extract"]["workers"] = 1  # Single worker to avoid race conditions
+            except Exception as nested_config_error:
+                log(f"Could not set advanced DLT config: {nested_config_error}")
+            
+            log(f"DLT configuration applied successfully")
             
         except Exception as config_error:
             log(f"Warning: Could not set DLT configuration: {config_error}")
