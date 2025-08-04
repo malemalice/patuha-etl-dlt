@@ -741,7 +741,7 @@ def load_select_tables_from_database() -> None:
         
         # Use a single pipeline instance to reduce MetaData conflicts
         pipeline = dlt.pipeline(
-            pipeline_name="dlt_unified_pipeline_v1_0_14", 
+            pipeline_name="dlt_unified_pipeline_v1_0_15", 
             destination=dlt.destinations.sqlalchemy(engine_target), 
             dataset_name=TARGET_DB_NAME
         )
