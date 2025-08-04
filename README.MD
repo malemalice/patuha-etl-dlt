@@ -262,11 +262,29 @@ AUTO_SANITIZE_DATA=false
 
 **Example Debug Output:**
 ```
-DEBUG: *** FOUND PROBLEMATIC ROW 3 in corez_transaksi_publish_thisyear ***
-DEBUG: Problem column 'description' = 'Payment\x00with\x00null\x00bytes'
-DEBUG: Value type: str, Error: unexpected character: line 1 column 15 (char 14)
+*** IMMEDIATE JSON ERROR DETECTED FOR corez_transaksi_publish_thisyear ***
+Full pipeline error: Pipeline execution failed at stage sync... CAUSED BY: orjson.JSONDecodeError: unexpected character: line 1 column 1 (char 0)
+
+IMMEDIATE ANALYSIS - Found problematic data:
+  Problem: description = 'Payment\x00with\x00null\x00bytes'
+  Error: unexpected character: line 1 column 15 (char 14)
+  Problem: notes = 'Data\x00\x00with\x00multiple\x00nulls'
+  Error: unexpected character: line 1 column 5 (char 4)
+
+=== COMPREHENSIVE JSON ERROR ANALYSIS FOR TABLE: corez_transaksi_publish_thisyear ===
+*** FOUND PROBLEMATIC DATA IN corez_transaksi_publish_thisyear ***
+Number of problematic columns: 2
+Problem 1: Column 'description' = 'Payment\x00with\x00null\x00bytes'
+  Data type: str
+  JSON Error: unexpected character: line 1 column 15 (char 14)
+  Raw bytes: 'Payment\x00with\x00null\x00bytes'
+Problem 2: Column 'notes' = 'Data\x00\x00with\x00multiple\x00nulls'
+  Data type: str  
+  JSON Error: unexpected character: line 1 column 5 (char 4)
+  Raw bytes: 'Data\x00\x00with\x00multiple\x00nulls'
+
 DEBUG: Removing NULL bytes from column description
-DEBUG: Row 3 successfully sanitized
+DEBUG: Removing NULL bytes from column notes
 Individual sync with sanitization successful for corez_transaksi_publish_thisyear
 ```
 

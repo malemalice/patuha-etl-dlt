@@ -493,8 +493,39 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                         log(f"Pipeline run failed for {table_name}: {pipeline_error}")
                         log(f"Pipeline error type: {type(pipeline_error).__name__}")
                         
+                        # Immediately check for JSON errors and debug
+                        pipeline_error_str = str(pipeline_error)
+                        full_pipeline_error = pipeline_error_str
+                        if hasattr(pipeline_error, '__cause__') and pipeline_error.__cause__:
+                            full_pipeline_error += " CAUSED BY: " + str(pipeline_error.__cause__)
+                        if hasattr(pipeline_error, '__context__') and pipeline_error.__context__:
+                            full_pipeline_error += " CONTEXT: " + str(pipeline_error.__context__)
+                        
+                        # Check if this is a JSON error right away
+                        is_immediate_json_error = any(keyword in full_pipeline_error.lower() for keyword in [
+                            'jsondecodeerror', 'orjson', 'json decode', 'unexpected character',
+                            'line 1 column 1', 'char 0', 'invalid json', 'json parse',
+                            'decode error', 'serialization', 'dumps', 'loads'
+                        ])
+                        
+                        if is_immediate_json_error:
+                            log(f"*** IMMEDIATE JSON ERROR DETECTED FOR {table_name} ***")
+                            log(f"Full pipeline error: {full_pipeline_error}")
+                            
+                            # Do immediate debugging before trying sanitization
+                            log(f"Analyzing data immediately to find JSON issue...")
+                            try:
+                                problematic_data = debug_problematic_rows(engine_source, table_name, limit=20)
+                                if problematic_data:
+                                    log(f"IMMEDIATE ANALYSIS - Found problematic data:")
+                                    for prob_col in problematic_data[:3]:  # Show first 3 problems
+                                        log(f"  Problem: {prob_col['column']} = {prob_col['value']}")
+                                        log(f"  Error: {prob_col['error']}")
+                            except Exception as immediate_debug_error:
+                                log(f"Immediate debugging failed: {immediate_debug_error}")
+                        
                         # If it's a JSON error, try with sanitization
-                        if "JSONDecodeError" in str(pipeline_error) or "orjson" in str(pipeline_error):
+                        if "JSONDecodeError" in str(pipeline_error) or "orjson" in str(pipeline_error) or is_immediate_json_error:
                             if AUTO_SANITIZE_DATA:
                                 log(f"JSON error during pipeline run for {table_name}, trying with data sanitization...")
                                 
@@ -533,66 +564,146 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     log(f"Individual sync also failed for {table_name}: {individual_error_msg}")
                     log(f"Individual error type: {type(individual_error).__name__}")
                     
+                    # Check for JSON errors in nested exceptions too
+                    full_error_chain = str(individual_error)
+                    if hasattr(individual_error, '__cause__') and individual_error.__cause__:
+                        full_error_chain += " CAUSED BY: " + str(individual_error.__cause__)
+                    if hasattr(individual_error, '__context__') and individual_error.__context__:
+                        full_error_chain += " CONTEXT: " + str(individual_error.__context__)
+                    
+                    # Enhanced JSON error detection
+                    is_json_error = any(keyword in full_error_chain.lower() for keyword in [
+                        'jsondecodeerror', 'orjson', 'json decode', 'unexpected character',
+                        'line 1 column 1', 'char 0', 'invalid json', 'json parse',
+                        'decode error', 'serialization', 'dumps', 'loads'
+                    ])
+                    
                     # If it's still a JSON error, do deep debugging
-                    if "JSONDecodeError" in individual_error_msg or "orjson" in individual_error_msg:
-                        if DEEP_DEBUG_JSON:
-                            log(f"=== DEEP DEBUG FOR JSON ERROR IN TABLE: {table_name} ===")
-                            
-                            # Get full error traceback
-                            import traceback
-                            log(f"Full error traceback:")
-                            log(traceback.format_exc())
-                            
-                            # Use the enhanced row-by-row debugging
-                            log(f"Analyzing problematic rows and columns for {table_name}:")
-                            problematic_data = debug_problematic_rows(engine_source, table_name, limit=50)
+                    if is_json_error:
+                        log(f"=== COMPREHENSIVE JSON ERROR ANALYSIS FOR TABLE: {table_name} ===")
+                        log(f"Full error chain: {full_error_chain}")
+                        
+                        # Always do deep debugging for JSON errors, regardless of DEEP_DEBUG_JSON setting
+                        # since we need to identify the root cause
+                        
+                        # Get full error traceback
+                        import traceback
+                        log(f"Complete error traceback:")
+                        log(traceback.format_exc())
+                        
+                        # Use the enhanced row-by-row debugging
+                        log(f"=== ANALYZING PROBLEMATIC ROWS AND COLUMNS FOR {table_name} ===")
+                        try:
+                            problematic_data = debug_problematic_rows(engine_source, table_name, limit=100)
                             
                             if problematic_data:
-                                log(f"Found {len(problematic_data)} problematic columns in first problematic row")
-                                for prob_col in problematic_data[:5]:  # Show first 5 problematic columns
-                                    log(f"Problematic column: {prob_col['column']} = {prob_col['value']}")
-                                    log(f"Error: {prob_col['error']}")
+                                log(f"*** FOUND PROBLEMATIC DATA IN {table_name} ***")
+                                log(f"Number of problematic columns: {len(problematic_data)}")
+                                for i, prob_col in enumerate(problematic_data):
+                                    log(f"Problem {i+1}: Column '{prob_col['column']}' = {prob_col['value']}")
+                                    log(f"  Data type: {prob_col['type']}")
+                                    log(f"  JSON Error: {prob_col['error']}")
+                                    log(f"  Raw bytes: {repr(prob_col['value'])}")
                             else:
-                                log(f"No obvious problematic data found in sample rows")
+                                log(f"No problematic data found in first 100 rows of {table_name}")
+                                log(f"Issue may be in data beyond the first 100 rows or in DLT processing")
+                                
+                                # Fallback: try a simple sample to see what we can find
+                                log(f"Trying fallback analysis...")
+                                try:
+                                    with engine_source.connect() as conn:
+                                        sample_query = f"SELECT * FROM {table_name} LIMIT 5"
+                                        result = conn.execute(sa.text(sample_query))
+                                        rows = result.fetchall()
+                                        if rows:
+                                            log(f"Sample data from {table_name}:")
+                                            columns = [desc[0] for desc in result.description]
+                                            for i, row in enumerate(rows[:2]):  # Show first 2 rows
+                                                row_dict = dict(zip(columns, row))
+                                                log(f"  Row {i+1}: {row_dict}")
+                                                
+                                                # Check each value for JSON serializability
+                                                for col_name, value in row_dict.items():
+                                                    try:
+                                                        import orjson
+                                                        orjson.dumps(value)
+                                                    except Exception as json_test_error:
+                                                        log(f"  *** Column {col_name} fails JSON encoding: {json_test_error}")
+                                                        log(f"  *** Problematic value: {repr(value)}")
+                                except Exception as fallback_error:
+                                    log(f"Fallback analysis also failed: {fallback_error}")
+                                    
+                        except Exception as debug_error:
+                            log(f"Failed to debug problematic rows: {debug_error}")
                             
-                            # Try to identify the exact stage where JSON error occurs
-                            log(f"Testing basic database operations for {table_name}...")
+                            # Emergency fallback - at least show us the basic table info
+                            log(f"EMERGENCY FALLBACK - Basic table info for {table_name}:")
                             try:
-                                # Test basic table read
                                 with engine_source.connect() as conn:
-                                    test_query = f"SELECT COUNT(*) FROM {table_name}"
-                                    count = conn.execute(sa.text(test_query)).scalar()
-                                    log(f"Basic count query works: {count} rows")
+                                    count_query = f"SELECT COUNT(*) FROM {table_name}"
+                                    count = conn.execute(sa.text(count_query)).scalar()
+                                    log(f"  Row count: {count}")
                                     
-                                    # Test sample data read
-                                    sample_query = f"SELECT * FROM {table_name} LIMIT 1"
-                                    result = conn.execute(sa.text(sample_query))
-                                    sample_row = result.fetchone()
-                                    log(f"Basic sample query works: got {len(sample_row) if sample_row else 0} columns")
-                                    
-                            except Exception as basic_test_error:
-                                log(f"Basic table queries failed: {basic_test_error}")
-                            
-                            # Try to test DLT source creation without running pipeline
-                            try:
-                                log(f"Testing DLT source creation for {table_name}...")
-                                test_source = sql_database(engine_source).with_resources(table_name)
-                                log(f"DLT source creation successful for {table_name}")
+                                    # Show column types
+                                    inspector = sa.inspect(engine_source)
+                                    columns = inspector.get_columns(table_name)
+                                    log(f"  Columns ({len(columns)} total):")
+                                    for col in columns[:10]:  # Show first 10 columns
+                                        log(f"    {col['name']}: {col['type']}")
+                            except Exception as emergency_error:
+                                log(f"Even emergency fallback failed: {emergency_error}")
+                        
+                        # Test basic database operations
+                        log(f"=== TESTING BASIC DATABASE OPERATIONS FOR {table_name} ===")
+                        try:
+                            with engine_source.connect() as conn:
+                                # Test count
+                                test_query = f"SELECT COUNT(*) FROM {table_name}"
+                                count = conn.execute(sa.text(test_query)).scalar()
+                                log(f"Row count: {count}")
                                 
-                                # Try to get table resource info
-                                table_resource = getattr(test_source, table_name)
-                                log(f"Table resource accessed successfully for {table_name}")
+                                # Test schema
+                                inspector = sa.inspect(engine_source)
+                                columns = inspector.get_columns(table_name)
+                                log(f"Table schema: {len(columns)} columns")
+                                for col in columns:
+                                    log(f"  {col['name']}: {col['type']}")
                                 
-                            except Exception as dlt_source_error:
-                                log(f"DLT source creation failed for {table_name}: {dlt_source_error}")
-                                log(f"DLT source error type: {type(dlt_source_error).__name__}")
+                        except Exception as basic_test_error:
+                            log(f"Basic table operations failed: {basic_test_error}")
+                        
+                        # Test DLT source creation
+                        log(f"=== TESTING DLT SOURCE CREATION FOR {table_name} ===")
+                        try:
+                            test_source = sql_database(engine_source).with_resources(table_name)
+                            log(f"DLT source creation: SUCCESS")
                             
-                            log(f"=== END DEEP DEBUG FOR {table_name} ===")
-                        else:
-                            log(f"JSON error in {table_name} - enable DEEP_DEBUG_JSON=true for detailed analysis")
+                            # Try to iterate over a few records
+                            table_resource = getattr(test_source, table_name)
+                            log(f"Table resource access: SUCCESS")
+                            
+                            # Try to extract just a few records to see where it fails
+                            log(f"Testing data extraction...")
+                            record_count = 0
+                            for record in table_resource:
+                                record_count += 1
+                                if record_count <= 3:
+                                    log(f"Record {record_count}: {type(record)} with {len(record) if hasattr(record, '__len__') else 'unknown'} items")
+                                if record_count >= 5:
+                                    break
+                            log(f"Successfully extracted {record_count} records from DLT source")
+                            
+                        except Exception as dlt_test_error:
+                            log(f"DLT source operations failed: {dlt_test_error}")
+                            log(f"DLT error type: {type(dlt_test_error).__name__}")
+                            import traceback
+                            log(f"DLT error traceback:")
+                            log(traceback.format_exc())
+                        
+                        log(f"=== END COMPREHENSIVE ANALYSIS FOR {table_name} ===")
                         
                         log(f"Persistent JSON error for table {table_name} - skipping this table for now")
-                        log(f"Consider checking data integrity in table {table_name}")
+                        log(f"Based on analysis above, check the specific problematic columns/values")
                         continue
                     else:
                         log(f"Non-JSON error for table {table_name}: {individual_error_msg}")
