@@ -254,6 +254,7 @@ AUTO_SANITIZE_DATA=false
 - **Automatic data sanitization** - Attempts to fix common data issues automatically
 
 **Automatic Data Sanitization:** When JSON errors occur, the pipeline automatically:
+- ✅ **Converts Decimal objects** to float (MySQL DECIMAL columns → JSON compatible numbers)
 - ✅ **Removes NULL bytes** (`\x00`) from string fields
 - ✅ **Converts invalid dates** (`0000-00-00`) to NULL
 - ✅ **Handles NaN/Infinity** values in numeric fields  
@@ -262,30 +263,20 @@ AUTO_SANITIZE_DATA=false
 
 **Example Debug Output:**
 ```
-*** IMMEDIATE JSON ERROR DETECTED FOR corez_transaksi_publish_thisyear ***
-Full pipeline error: Pipeline execution failed at stage sync... CAUSED BY: orjson.JSONDecodeError: unexpected character: line 1 column 1 (char 0)
-
+*** IMMEDIATE JSON ERROR DETECTED FOR corez_akad_qurban ***
 IMMEDIATE ANALYSIS - Found problematic data:
-  Problem: description = 'Payment\x00with\x00null\x00bytes'
-  Error: unexpected character: line 1 column 15 (char 14)
-  Problem: notes = 'Data\x00\x00with\x00multiple\x00nulls'
-  Error: unexpected character: line 1 column 5 (char 4)
+  Problem: transaksi = Decimal('4000000.00')
+  Error: Type is not JSON serializable: decimal.Decimal
 
-=== COMPREHENSIVE JSON ERROR ANALYSIS FOR TABLE: corez_transaksi_publish_thisyear ===
-*** FOUND PROBLEMATIC DATA IN corez_transaksi_publish_thisyear ***
-Number of problematic columns: 2
-Problem 1: Column 'description' = 'Payment\x00with\x00null\x00bytes'
-  Data type: str
-  JSON Error: unexpected character: line 1 column 15 (char 14)
-  Raw bytes: 'Payment\x00with\x00null\x00bytes'
-Problem 2: Column 'notes' = 'Data\x00\x00with\x00multiple\x00nulls'
-  Data type: str  
-  JSON Error: unexpected character: line 1 column 5 (char 4)
-  Raw bytes: 'Data\x00\x00with\x00multiple\x00nulls'
+=== COMPREHENSIVE JSON ERROR ANALYSIS FOR TABLE: corez_akad_qurban ===
+*** FOUND PROBLEMATIC DATA IN corez_akad_qurban ***
+Problem 1: Column 'transaksi' = Decimal('4000000.00')
+  Data type: Decimal
+  JSON Error: Type is not JSON serializable: decimal.Decimal
+  Raw bytes: "Decimal('4000000.00')"
 
-DEBUG: Removing NULL bytes from column description
-DEBUG: Removing NULL bytes from column notes
-Individual sync with sanitization successful for corez_transaksi_publish_thisyear
+DEBUG: Converting Decimal to float in column transaksi: 4000000.00
+Individual sync with sanitization successful for corez_akad_qurban
 ```
 
 This will show detailed information about table processing and help identify specific data issues.

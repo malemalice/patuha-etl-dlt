@@ -239,6 +239,18 @@ def sanitize_data_value(value, column_name="unknown"):
         if value is None:
             return None
             
+        # Handle Decimal objects (common with MySQL DECIMAL columns)
+        if hasattr(value, '__class__') and value.__class__.__name__ == 'Decimal':
+            log(f"DEBUG: Converting Decimal to float in column {column_name}: {value}")
+            try:
+                # Convert Decimal to float for JSON compatibility
+                from decimal import Decimal
+                if isinstance(value, Decimal):
+                    return float(value)
+            except (ValueError, OverflowError) as decimal_error:
+                log(f"DEBUG: Failed to convert Decimal to float in column {column_name}: {decimal_error}, converting to string")
+                return str(value)
+        
         # Handle string values
         if isinstance(value, str):
             # Remove NULL bytes that cause JSON errors
@@ -729,7 +741,7 @@ def load_select_tables_from_database() -> None:
         
         # Use a single pipeline instance to reduce MetaData conflicts
         pipeline = dlt.pipeline(
-            pipeline_name="dlt_unified_pipeline", 
+            pipeline_name="dlt_unified_pipeline_v1_0_14", 
             destination=dlt.destinations.sqlalchemy(engine_target), 
             dataset_name=TARGET_DB_NAME
         )
