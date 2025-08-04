@@ -42,6 +42,7 @@ BATCH_DELAY = int(os.getenv("BATCH_DELAY", 2))  # Delay between batches in secon
 # Debug mode for detailed logging
 DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 DEEP_DEBUG_JSON = os.getenv("DEEP_DEBUG_JSON", "true").lower() == "true"
+AUTO_SANITIZE_DATA = os.getenv("AUTO_SANITIZE_DATA", "true").lower() == "true"
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
@@ -232,8 +233,60 @@ def validate_table_data(engine_source, table_name):
         log(f"Table validation failed for {table_name}: {validation_error}")
         return False
 
-def debug_table_data(engine_source, table_name, sample_size=3):
-    """Debug function to inspect table data that might cause JSON issues."""
+def sanitize_data_value(value, column_name="unknown"):
+    """Sanitize data values that might cause JSON serialization issues."""
+    try:
+        if value is None:
+            return None
+            
+        # Handle string values
+        if isinstance(value, str):
+            # Remove NULL bytes that cause JSON errors
+            if '\x00' in value:
+                log(f"DEBUG: Removing NULL bytes from column {column_name}")
+                value = value.replace('\x00', '')
+            
+            # Handle invalid dates/datetimes
+            if column_name.lower().endswith(('_at', '_date', 'date', 'time')) or 'date' in column_name.lower():
+                if value in ('0000-00-00', '0000-00-00 00:00:00', '0000-00-00 00:00:00.000000'):
+                    log(f"DEBUG: Converting invalid date '{value}' to NULL in column {column_name}")
+                    return None
+                if value.startswith('0000-00-00'):
+                    log(f"DEBUG: Converting invalid date '{value}' to NULL in column {column_name}")
+                    return None
+            
+            # Handle very large strings (>1MB) that might cause memory issues
+            if len(value) > 1048576:  # 1MB
+                log(f"DEBUG: Truncating very large string in column {column_name}: {len(value)} chars")
+                return value[:1048576] + "...[TRUNCATED]"
+                
+        # Handle datetime objects with invalid values
+        elif hasattr(value, 'year') and value.year == 0:
+            log(f"DEBUG: Converting datetime with year 0 to NULL in column {column_name}")
+            return None
+            
+        # Handle decimal/numeric edge cases
+        elif isinstance(value, (int, float)):
+            import math
+            if math.isnan(value) or math.isinf(value):
+                log(f"DEBUG: Converting NaN/Inf value to NULL in column {column_name}")
+                return None
+                
+        # Test if value can be JSON serialized
+        import orjson
+        orjson.dumps(value)
+        return value
+        
+    except Exception as sanitize_error:
+        log(f"DEBUG: Failed to sanitize value in column {column_name}: {sanitize_error}, converting to string")
+        try:
+            return str(value) if value is not None else None
+        except:
+            log(f"DEBUG: Could not convert value to string in column {column_name}, setting to NULL")
+            return None
+
+def debug_problematic_rows(engine_source, table_name, limit=10):
+    """Debug specific rows that cause JSON serialization issues."""
     try:
         with engine_source.connect() as connection:
             # Get table schema
@@ -241,36 +294,115 @@ def debug_table_data(engine_source, table_name, sample_size=3):
             columns = inspector.get_columns(table_name)
             column_names = [col['name'] for col in columns]
             
-            log(f"DEBUG: Table {table_name} columns: {column_names}")
+            log(f"DEBUG: Testing rows individually for table {table_name}")
             
-            # Get sample data
-            sample_query = f"SELECT * FROM {table_name} LIMIT {sample_size}"
-            result = connection.execute(sa.text(sample_query))
-            rows = result.fetchall()
+            # Get sample data row by row
+            for row_num in range(min(limit, 50)):  # Test up to 50 rows
+                try:
+                    sample_query = f"SELECT * FROM {table_name} LIMIT 1 OFFSET {row_num}"
+                    result = connection.execute(sa.text(sample_query))
+                    row = result.fetchone()
+                    
+                    if not row:
+                        break
+                        
+                    # Convert row to dict
+                    row_dict = dict(zip(column_names, row))
+                    
+                    # Test each column individually
+                    problematic_columns = []
+                    for col_name, value in row_dict.items():
+                        try:
+                            import orjson
+                            orjson.dumps(value)
+                        except Exception as col_error:
+                            problematic_columns.append({
+                                'column': col_name,
+                                'value': repr(value),
+                                'error': str(col_error),
+                                'type': type(value).__name__
+                            })
+                    
+                    if problematic_columns:
+                        log(f"DEBUG: *** FOUND PROBLEMATIC ROW {row_num + 1} in {table_name} ***")
+                        for prob_col in problematic_columns:
+                            log(f"DEBUG: Problem column '{prob_col['column']}' = {prob_col['value']}")
+                            log(f"DEBUG: Value type: {prob_col['type']}, Error: {prob_col['error']}")
+                        
+                        # Try sanitizing the problematic row
+                        log(f"DEBUG: Attempting to sanitize row {row_num + 1}")
+                        sanitized_row = {}
+                        for col_name, value in row_dict.items():
+                            sanitized_row[col_name] = sanitize_data_value(value, col_name)
+                        
+                        # Test if sanitized row can be JSON encoded
+                        try:
+                            import orjson
+                            orjson.dumps(sanitized_row)
+                            log(f"DEBUG: Row {row_num + 1} successfully sanitized")
+                        except Exception as sanitize_test_error:
+                            log(f"DEBUG: Row {row_num + 1} still problematic after sanitization: {sanitize_test_error}")
+                        
+                        return problematic_columns  # Return details of first problematic row
+                        
+                except Exception as row_error:
+                    log(f"DEBUG: Error testing row {row_num + 1}: {row_error}")
+                    continue
             
-            log(f"DEBUG: Table {table_name} sample data:")
-            for i, row in enumerate(rows):
-                # Convert row to dict for logging
-                row_dict = dict(zip(column_names, row))
-                log(f"DEBUG: Row {i+1}: {row_dict}")
-                
-                # Check for potential problematic values
-                for col_name, value in row_dict.items():
-                    if value is None:
-                        continue
-                    if isinstance(value, str):
-                        if len(value) > 1000:
-                            log(f"DEBUG: Large text in {col_name}: {len(value)} chars")
-                        if '\x00' in value:
-                            log(f"DEBUG: NULL bytes found in {col_name}")
-                        if not value.strip():
-                            log(f"DEBUG: Empty/whitespace string in {col_name}")
-            
-            return True
+            log(f"DEBUG: No obviously problematic rows found in first {limit} rows of {table_name}")
+            return None
             
     except Exception as debug_error:
-        log(f"DEBUG: Failed to inspect table {table_name}: {debug_error}")
+        log(f"DEBUG: Failed to debug problematic rows for {table_name}: {debug_error}")
+        return None
+
+def debug_table_data(engine_source, table_name, sample_size=3):
+    """Debug function to inspect table data that might cause JSON issues."""
+    try:
+        # First try the detailed row-by-row debugging
+        problematic_data = debug_problematic_rows(engine_source, table_name, limit=20)
+        
+        if problematic_data:
+            log(f"DEBUG: Found specific problematic data in {table_name}")
+            return False  # Indicate problems found
+        
+        # If no obvious problems, do basic validation
+        with engine_source.connect() as connection:
+            # Check if table exists and has data
+            count_query = f"SELECT COUNT(*) FROM {table_name}"
+            row_count = connection.execute(sa.text(count_query)).scalar()
+            
+            if row_count == 0:
+                if DEBUG_MODE:
+                    log(f"Table {table_name} is empty")
+                return True
+            
+            # Check for basic data issues
+            sample_query = f"SELECT * FROM {table_name} LIMIT {sample_size}"
+            result = connection.execute(sa.text(sample_query))
+            sample_rows = result.fetchall()
+            
+            if DEBUG_MODE:
+                log(f"Table {table_name} validation - Rows: {row_count}, Sample fetched: {len(sample_rows)}")
+            
+            # Basic validation passed
+            return True
+            
+    except Exception as validation_error:
+        log(f"Table validation failed for {table_name}: {validation_error}")
         return False
+
+@dlt.transformer
+def sanitize_table_data(items):
+    """DLT transformer to sanitize data before JSON serialization."""
+    for item in items:
+        if isinstance(item, dict):
+            sanitized_item = {}
+            for key, value in item.items():
+                sanitized_item[key] = sanitize_data_value(value, key)
+            yield sanitized_item
+        else:
+            yield item
 
 def get_max_timestamp(engine_target, table_name, column_name):
     """Fetch the max timestamp from the target table."""
@@ -361,15 +493,37 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                         log(f"Pipeline run failed for {table_name}: {pipeline_error}")
                         log(f"Pipeline error type: {type(pipeline_error).__name__}")
                         
-                        # If it's a JSON error, capture more details
+                        # If it's a JSON error, try with sanitization
                         if "JSONDecodeError" in str(pipeline_error) or "orjson" in str(pipeline_error):
-                            log(f"JSON error during pipeline run for {table_name}")
-                            # Check if there are any intermediate files or data we can inspect
-                            try:
-                                import dlt.common.storages as dlt_storages
-                                log(f"Attempting to inspect DLT pipeline state...")
-                            except Exception as inspect_error:
-                                log(f"Could not inspect DLT state: {inspect_error}")
+                            if AUTO_SANITIZE_DATA:
+                                log(f"JSON error during pipeline run for {table_name}, trying with data sanitization...")
+                                
+                                try:
+                                    # Create a new source with sanitization transformer
+                                    sanitized_source = sql_database(engine_source).with_resources(table_name)
+                                    
+                                    # Apply sanitization transformer
+                                    sanitized_resource = getattr(sanitized_source, table_name) | sanitize_table_data
+                                    
+                                    if write_disposition == "merge" and "modifier" in tables_dict[table_name]:
+                                        config = tables_dict[table_name]
+                                        max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table_name, config["modifier"])).in_tz("Asia/Bangkok")
+                                        sanitized_resource.apply_hints(
+                                            primary_key=config["primary_key"],
+                                            incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
+                                        )
+                                    
+                                    # Try running with sanitized data
+                                    log(f"Running {table_name} with data sanitization...")
+                                    sanitized_info = pipeline.run(sanitized_source, write_disposition=write_disposition)
+                                    log(f"Individual sync with sanitization successful for {table_name}: {sanitized_info}")
+                                    continue  # Success with sanitization, move to next table
+                                    
+                                except Exception as sanitized_error:
+                                    log(f"Even sanitized sync failed for {table_name}: {sanitized_error}")
+                                    # Continue to deep debugging below
+                            else:
+                                log(f"JSON error during pipeline run for {table_name} - auto sanitization disabled")
                         
                         # Re-raise the error to be handled by the outer exception handler
                         raise pipeline_error
@@ -389,12 +543,20 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                             log(f"Full error traceback:")
                             log(traceback.format_exc())
                             
-                            # Debug the table data
-                            log(f"Debugging table data for {table_name}:")
-                            debug_table_data(engine_source, table_name)
+                            # Use the enhanced row-by-row debugging
+                            log(f"Analyzing problematic rows and columns for {table_name}:")
+                            problematic_data = debug_problematic_rows(engine_source, table_name, limit=50)
+                            
+                            if problematic_data:
+                                log(f"Found {len(problematic_data)} problematic columns in first problematic row")
+                                for prob_col in problematic_data[:5]:  # Show first 5 problematic columns
+                                    log(f"Problematic column: {prob_col['column']} = {prob_col['value']}")
+                                    log(f"Error: {prob_col['error']}")
+                            else:
+                                log(f"No obvious problematic data found in sample rows")
                             
                             # Try to identify the exact stage where JSON error occurs
-                            log(f"Attempting to identify JSON error location...")
+                            log(f"Testing basic database operations for {table_name}...")
                             try:
                                 # Test basic table read
                                 with engine_source.connect() as conn:

@@ -239,18 +239,36 @@ If you encounter `orjson.JSONDecodeError: unexpected character: line 1 column 1 
 # Debug modes are enabled by default
 DEBUG_MODE=true              # General detailed logging (default: true)
 DEEP_DEBUG_JSON=true         # Deep analysis of JSON errors (default: true)
+AUTO_SANITIZE_DATA=true      # Automatic data sanitization (default: true)
 
 # To disable detailed logging after fixing issues:
 DEBUG_MODE=false
 DEEP_DEBUG_JSON=false
+AUTO_SANITIZE_DATA=false
 ```
 
-**Deep JSON Debugging:** With debugging enabled by default, you'll automatically see:
-- Full error stack traces
-- Sample data from problematic tables  
-- Column schema information
-- Step-by-step DLT processing details
-- Exact location where JSON parsing fails
+**Enhanced JSON Error Debugging:** With debugging enabled by default, you'll automatically see:
+- **Row-by-row analysis** - Identifies exactly which row causes JSON errors
+- **Column-by-column analysis** - Shows specific problematic values and data types
+- **Full error stack traces** - Pinpoints where in the pipeline JSON parsing fails
+- **Automatic data sanitization** - Attempts to fix common data issues automatically
+
+**Automatic Data Sanitization:** When JSON errors occur, the pipeline automatically:
+- ✅ **Removes NULL bytes** (`\x00`) from string fields
+- ✅ **Converts invalid dates** (`0000-00-00`) to NULL
+- ✅ **Handles NaN/Infinity** values in numeric fields  
+- ✅ **Truncates very large strings** (>1MB) to prevent memory issues
+- ✅ **Sanitizes problematic characters** that break JSON encoding
+
+**Example Debug Output:**
+```
+DEBUG: *** FOUND PROBLEMATIC ROW 3 in corez_transaksi_publish_thisyear ***
+DEBUG: Problem column 'description' = 'Payment\x00with\x00null\x00bytes'
+DEBUG: Value type: str, Error: unexpected character: line 1 column 15 (char 14)
+DEBUG: Removing NULL bytes from column description
+DEBUG: Row 3 successfully sanitized
+Individual sync with sanitization successful for corez_transaksi_publish_thisyear
+```
 
 This will show detailed information about table processing and help identify specific data issues.
 
