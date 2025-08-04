@@ -368,6 +368,215 @@ def debug_problematic_rows(engine_source, table_name, limit=10):
         log(f"DEBUG: Failed to debug problematic rows for {table_name}: {debug_error}")
         return None
 
+
+def debug_json_parse_error(engine_source, table_name, limit=10):
+    """Enhanced debugging specifically for 'line 1 column 1 (char 0)' JSON parse errors."""
+    log(f"=== ENHANCED JSON PARSE ERROR DEBUGGING FOR {table_name} ===")
+    
+    try:
+        with engine_source.connect() as connection:
+            # Get table schema
+            inspector = sa.inspect(engine_source)
+            columns = inspector.get_columns(table_name)
+            column_names = [col['name'] for col in columns]
+            
+            log(f"PARSE DEBUG: Analyzing {len(column_names)} columns in {table_name}")
+            
+            # Test sample rows for JSON parse issues
+            for row_num in range(min(limit, 20)):
+                try:
+                    sample_query = f"SELECT * FROM {table_name} LIMIT 1 OFFSET {row_num}"
+                    result = connection.execute(sa.text(sample_query))
+                    row = result.fetchone()
+                    
+                    if not row:
+                        break
+                        
+                    # Convert row to dict  
+                    row_dict = dict(zip(column_names, row))
+                    
+                    log(f"PARSE DEBUG: --- Testing Row {row_num + 1} ---")
+                    
+                    # Check each value for potential JSON parse issues
+                    for col_name, value in row_dict.items():
+                        # Test the raw value for common JSON parse error causes
+                        debug_value_for_json_parse_error(col_name, value, row_num + 1)
+                        
+                        # If value is a string, test if it looks like JSON that might be parsed
+                        if isinstance(value, str) and value.strip():
+                            if value.strip().startswith(('{', '[', '"')) or value.strip() in ('null', 'true', 'false'):
+                                log(f"PARSE DEBUG: Column '{col_name}' contains JSON-like string: {repr(value[:100])}")
+                                # Test if this string can be JSON parsed
+                                try:
+                                    import json
+                                    json.loads(value)
+                                    log(f"PARSE DEBUG: ✓ JSON-like string in '{col_name}' is valid JSON")
+                                except json.JSONDecodeError as json_err:
+                                    log(f"PARSE DEBUG: ✗ JSON-like string in '{col_name}' is INVALID JSON: {json_err}")
+                                    debug_value_hex_representation(col_name, value, "Invalid JSON string")
+                                    
+                except Exception as row_error:
+                    log(f"PARSE DEBUG: Error testing row {row_num + 1}: {row_error}")
+                    continue
+                    
+    except Exception as parse_debug_error:
+        log(f"PARSE DEBUG: Failed to run enhanced JSON parse debugging: {parse_debug_error}")
+
+
+def debug_value_for_json_parse_error(col_name, value, row_num):
+    """Debug a specific value for JSON parse error potential."""
+    try:
+        # Check for None/NULL
+        if value is None:
+            log(f"PARSE DEBUG: Row {row_num}, Column '{col_name}' = None (NULL)")
+            return
+            
+        # Check for empty strings
+        if isinstance(value, str):
+            if value == "":
+                log(f"PARSE DEBUG: ⚠️  Row {row_num}, Column '{col_name}' = EMPTY STRING")
+                log(f"PARSE DEBUG: ⚠️  Empty strings cause 'line 1 column 1 (char 0)' when JSON parsed!")
+                return
+                
+            if value.isspace():
+                log(f"PARSE DEBUG: ⚠️  Row {row_num}, Column '{col_name}' = WHITESPACE ONLY")
+                debug_value_hex_representation(col_name, value, "Whitespace-only string")
+                return
+                
+            # Check for non-printable characters at start
+            if value and ord(value[0]) < 32:
+                log(f"PARSE DEBUG: ⚠️  Row {row_num}, Column '{col_name}' starts with non-printable character!")
+                debug_value_hex_representation(col_name, value, "Non-printable start character")
+                return
+                
+            # Check for NULL bytes
+            if '\x00' in value:
+                log(f"PARSE DEBUG: ⚠️  Row {row_num}, Column '{col_name}' contains NULL bytes!")
+                debug_value_hex_representation(col_name, value, "Contains NULL bytes")
+                return
+                
+        # Check for binary data
+        if isinstance(value, bytes):
+            log(f"PARSE DEBUG: ⚠️  Row {row_num}, Column '{col_name}' is binary data ({len(value)} bytes)")
+            if len(value) == 0:
+                log(f"PARSE DEBUG: ⚠️  Binary data is EMPTY - would cause JSON parse error!")
+            debug_value_hex_representation(col_name, value, "Binary data")
+            return
+            
+        # Test if value can be JSON serialized (encoding test)
+        try:
+            import orjson
+            orjson.dumps(value)
+        except Exception as encode_error:
+            log(f"PARSE DEBUG: ⚠️  Row {row_num}, Column '{col_name}' cannot be JSON encoded: {encode_error}")
+            debug_value_hex_representation(col_name, value, f"JSON encode error: {encode_error}")
+            
+    except Exception as debug_error:
+        log(f"PARSE DEBUG: Error debugging value in column '{col_name}': {debug_error}")
+
+
+def debug_value_hex_representation(col_name, value, reason):
+    """Show hex representation of problematic values."""
+    try:
+        if value is None:
+            log(f"PARSE DEBUG: HEX for '{col_name}': None")
+            return
+            
+        if isinstance(value, str):
+            hex_repr = ' '.join(f'{ord(c):02x}' for c in value[:50])  # First 50 chars
+            log(f"PARSE DEBUG: HEX for '{col_name}' ({reason}): {hex_repr}")
+            log(f"PARSE DEBUG: RAW for '{col_name}': {repr(value[:100])}")
+            log(f"PARSE DEBUG: LENGTH: {len(value)} characters")
+            
+        elif isinstance(value, bytes):
+            hex_repr = ' '.join(f'{b:02x}' for b in value[:50])  # First 50 bytes
+            log(f"PARSE DEBUG: HEX for '{col_name}' ({reason}): {hex_repr}")
+            log(f"PARSE DEBUG: RAW for '{col_name}': {repr(value[:100])}")
+            log(f"PARSE DEBUG: LENGTH: {len(value)} bytes")
+            
+        else:
+            log(f"PARSE DEBUG: VALUE for '{col_name}' ({reason}): {repr(value)} (type: {type(value).__name__})")
+            
+    except Exception as hex_error:
+        log(f"PARSE DEBUG: Failed to show hex representation for '{col_name}': {hex_error}")
+
+
+def debug_json_operation(operation_name, value, context=""):
+    """Debug JSON operations that might cause 'line 1 column 1 (char 0)' errors."""
+    try:
+        log(f"JSON DEBUG: About to perform {operation_name}")
+        log(f"JSON DEBUG: Context: {context}")
+        log(f"JSON DEBUG: Value type: {type(value).__name__}")
+        
+        if value is None:
+            log(f"JSON DEBUG: ⚠️  Value is None - this will cause JSON parse errors!")
+            return
+            
+        if isinstance(value, str):
+            log(f"JSON DEBUG: String length: {len(value)}")
+            if len(value) == 0:
+                log(f"JSON DEBUG: ⚠️  EMPTY STRING - this causes 'line 1 column 1 (char 0)' error!")
+                debug_value_hex_representation("JSON_INPUT", value, "Empty string for JSON operation")
+                return
+                
+            if len(value) <= 100:
+                log(f"JSON DEBUG: String value: {repr(value)}")
+            else:
+                log(f"JSON DEBUG: String value (first 100 chars): {repr(value[:100])}")
+                
+            # Check for whitespace-only strings
+            if value.isspace():
+                log(f"JSON DEBUG: ⚠️  WHITESPACE-ONLY STRING - this causes JSON parse errors!")
+                debug_value_hex_representation("JSON_INPUT", value, "Whitespace-only string for JSON operation")
+                return
+                
+        elif isinstance(value, bytes):
+            log(f"JSON DEBUG: Bytes length: {len(value)}")
+            if len(value) == 0:
+                log(f"JSON DEBUG: ⚠️  EMPTY BYTES - this causes JSON parse errors!")
+                return
+            log(f"JSON DEBUG: Bytes value (first 50): {repr(value[:50])}")
+            
+        else:
+            log(f"JSON DEBUG: Non-string value: {repr(value)}")
+            
+    except Exception as debug_error:
+        log(f"JSON DEBUG: Error during JSON operation debugging: {debug_error}")
+
+
+def safe_json_loads(json_string, context="", default=None):
+    """Safely load JSON with enhanced debugging for 'line 1 column 1 (char 0)' errors."""
+    try:
+        # Pre-operation debugging
+        debug_json_operation("json.loads()", json_string, context)
+        
+        # Perform the actual JSON loading
+        import json
+        result = json.loads(json_string)
+        log(f"JSON DEBUG: ✓ Successfully parsed JSON for context: {context}")
+        return result
+        
+    except json.JSONDecodeError as json_err:
+        log(f"JSON DEBUG: ✗ JSONDecodeError in context '{context}': {json_err}")
+        
+        # Special handling for the specific error we're debugging
+        if "line 1 column 1" in str(json_err) and "char 0" in str(json_err):
+            log(f"JSON DEBUG: *** CAUGHT THE 'line 1 column 1 (char 0)' ERROR! ***")
+            log(f"JSON DEBUG: This error occurred while trying to parse JSON in context: {context}")
+            debug_value_hex_representation("FAILED_JSON_INPUT", json_string, "Caused line 1 column 1 (char 0) error")
+        
+        if default is not None:
+            log(f"JSON DEBUG: Returning default value: {default}")
+            return default
+        else:
+            raise
+            
+    except Exception as other_error:
+        log(f"JSON DEBUG: ✗ Unexpected error during JSON parsing in context '{context}': {other_error}")
+        debug_value_hex_representation("ERROR_JSON_INPUT", json_string, f"Caused unexpected error: {other_error}")
+        raise
+
+
 def debug_table_data(engine_source, table_name, sample_size=3):
     """Debug function to inspect table data that might cause JSON issues."""
     try:
@@ -524,6 +733,17 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                             log(f"*** IMMEDIATE JSON ERROR DETECTED FOR {table_name} ***")
                             log(f"Full pipeline error: {full_pipeline_error}")
                             
+                            # Special debugging for "line 1 column 1 (char 0)" errors
+                            if "line 1 column 1" in full_pipeline_error.lower() and "char 0" in full_pipeline_error.lower():
+                                log(f"*** DETECTED 'line 1 column 1 (char 0)' ERROR - This suggests empty/None value being JSON parsed ***")
+                                log(f"This error typically occurs when trying to parse an empty string, None, or invalid data as JSON")
+                                
+                                # Enhanced debugging for this specific error
+                                try:
+                                    debug_json_parse_error(engine_source, table_name, limit=10)
+                                except Exception as parse_debug_error:
+                                    log(f"Enhanced JSON parse debugging failed: {parse_debug_error}")
+                            
                             # Do immediate debugging before trying sanitization
                             log(f"Analyzing data immediately to find JSON issue...")
                             try:
@@ -594,6 +814,17 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     if is_json_error:
                         log(f"=== COMPREHENSIVE JSON ERROR ANALYSIS FOR TABLE: {table_name} ===")
                         log(f"Full error chain: {full_error_chain}")
+                        
+                        # Special debugging for "line 1 column 1 (char 0)" errors
+                        if "line 1 column 1" in full_error_chain.lower() and "char 0" in full_error_chain.lower():
+                            log(f"*** COMPREHENSIVE ANALYSIS: DETECTED 'line 1 column 1 (char 0)' ERROR ***")
+                            log(f"This error typically occurs when trying to parse an empty string, None, or invalid data as JSON")
+                            
+                            # Enhanced debugging for this specific error
+                            try:
+                                debug_json_parse_error(engine_source, table_name, limit=15)
+                            except Exception as parse_debug_error:
+                                log(f"Enhanced JSON parse debugging failed in comprehensive analysis: {parse_debug_error}")
                         
                         # Always do deep debugging for JSON errors, regardless of DEEP_DEBUG_JSON setting
                         # since we need to identify the root cause
@@ -741,7 +972,7 @@ def load_select_tables_from_database() -> None:
         
         # Use a single pipeline instance to reduce MetaData conflicts
         pipeline = dlt.pipeline(
-            pipeline_name="dlt_unified_pipeline_v1_0_15", 
+            pipeline_name="dlt_unified_pipeline_v1_0_16", 
             destination=dlt.destinations.sqlalchemy(engine_target), 
             dataset_name=TARGET_DB_NAME
         )
