@@ -73,7 +73,8 @@ def create_engines():
         'autocommit': True,
         'charset': 'utf8mb4',
         # Permissive SQL mode that allows zero dates and works with both strict/unrestricted modes
-        'init_command': "SET SESSION sql_mode='ERROR_FOR_DIVISION_BY_ZERO'",
+        # 'init_command': "SET SESSION sql_mode='ERROR_FOR_DIVISION_BY_ZERO'",
+        'init_command': "SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))",
         'use_unicode': True,
     }
     
@@ -972,7 +973,7 @@ def load_select_tables_from_database() -> None:
         
         # Use a single pipeline instance to reduce MetaData conflicts
         pipeline = dlt.pipeline(
-            pipeline_name="dlt_unified_pipeline_v1_0_16", 
+            pipeline_name="dlt_unified_pipeline_v1_0_17", 
             destination=dlt.destinations.sqlalchemy(engine_target), 
             dataset_name=TARGET_DB_NAME
         )
