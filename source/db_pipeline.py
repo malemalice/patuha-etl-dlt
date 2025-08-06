@@ -254,6 +254,16 @@ def sanitize_data_value(value, column_name="unknown"):
         
         # Handle string values
         if isinstance(value, str):
+            # Handle empty strings that cause JSON parse errors
+            if value == "":
+                log(f"DEBUG: Converting empty string to NULL in column {column_name}")
+                return None
+                
+            # Handle whitespace-only strings that can cause issues
+            if value.strip() == "":
+                log(f"DEBUG: Converting whitespace-only string to NULL in column {column_name}")
+                return None
+            
             # Remove NULL bytes that cause JSON errors
             if '\x00' in value:
                 log(f"DEBUG: Removing NULL bytes from column {column_name}")
