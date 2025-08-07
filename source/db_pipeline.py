@@ -345,13 +345,7 @@ def debug_problematic_rows(engine_source, table_name, limit=10):
                             })
                     
                     if problematic_columns:
-                        log(f"DEBUG: *** FOUND PROBLEMATIC ROW {row_num + 1} in {table_name} ***")
-                        for prob_col in problematic_columns:
-                            log(f"DEBUG: Problem column '{prob_col['column']}' = {prob_col['value']}")
-                            log(f"DEBUG: Value type: {prob_col['type']}, Error: {prob_col['error']}")
-                        
-                        # Try sanitizing the problematic row
-                        log(f"DEBUG: Attempting to sanitize row {row_num + 1}")
+                        # Try sanitizing the problematic row first
                         sanitized_row = {}
                         for col_name, value in row_dict.items():
                             sanitized_row[col_name] = sanitize_data_value(value, col_name)
@@ -360,11 +354,16 @@ def debug_problematic_rows(engine_source, table_name, limit=10):
                         try:
                             import orjson
                             orjson.dumps(sanitized_row)
-                            log(f"DEBUG: Row {row_num + 1} successfully sanitized")
+                            # Sanitization worked - don't show diagnostic messages
+                            continue
                         except Exception as sanitize_test_error:
+                            # Only show diagnostic messages if sanitization failed
+                            log(f"DEBUG: *** UNSOLVED PROBLEMATIC ROW {row_num + 1} in {table_name} ***")
+                            for prob_col in problematic_columns:
+                                log(f"DEBUG: Problem column '{prob_col['column']}' = {prob_col['value']}")
+                                log(f"DEBUG: Value type: {prob_col['type']}, Error: {prob_col['error']}")
                             log(f"DEBUG: Row {row_num + 1} still problematic after sanitization: {sanitize_test_error}")
-                        
-                        return problematic_columns  # Return details of first problematic row
+                            return problematic_columns  # Return details of first truly problematic row
                         
                 except Exception as row_error:
                     log(f"DEBUG: Error testing row {row_num + 1}: {row_error}")
@@ -849,10 +848,10 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                             problematic_data = debug_problematic_rows(engine_source, table_name, limit=100)
                             
                             if problematic_data:
-                                log(f"*** FOUND PROBLEMATIC DATA IN {table_name} ***")
-                                log(f"Number of problematic columns: {len(problematic_data)}")
+                                log(f"*** FOUND UNSOLVED PROBLEMATIC DATA IN {table_name} ***")
+                                log(f"Number of problematic columns after sanitization: {len(problematic_data)}")
                                 for i, prob_col in enumerate(problematic_data):
-                                    log(f"Problem {i+1}: Column '{prob_col['column']}' = {prob_col['value']}")
+                                    log(f"Unsolved Problem {i+1}: Column '{prob_col['column']}' = {prob_col['value']}")
                                     log(f"  Data type: {prob_col['type']}")
                                     log(f"  JSON Error: {prob_col['error']}")
                                     log(f"  Raw bytes: {repr(prob_col['value'])}")
