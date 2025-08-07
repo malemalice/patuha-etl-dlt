@@ -241,13 +241,11 @@ def sanitize_data_value(value, column_name="unknown"):
             return None
             
         # Handle Decimal objects (common with MySQL DECIMAL columns)
-        if hasattr(value, '__class__') and value.__class__.__name__ == 'Decimal':
+        from decimal import Decimal
+        if isinstance(value, Decimal):
             log(f"DEBUG: Converting Decimal to float in column {column_name}: {value}")
             try:
-                # Convert Decimal to float for JSON compatibility
-                from decimal import Decimal
-                if isinstance(value, Decimal):
-                    return float(value)
+                return float(value)
             except (ValueError, OverflowError) as decimal_error:
                 log(f"DEBUG: Failed to convert Decimal to float in column {column_name}: {decimal_error}, converting to string")
                 return str(value)
