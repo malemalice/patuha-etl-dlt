@@ -683,6 +683,37 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
         log(f"Error in batch processing: {error_message}")
         log(f"Error type: {error_type}")
         
+        # Check for DLT state corruption errors specifically
+        if any(keyword in error_message.lower() for keyword in [
+            'unexpected character: line 1 column 1 (char 0)',
+            'incorrect padding',
+            'jsondecodeerror',
+            'decompress_state',
+            'load_pipeline_state_from_destination'
+        ]):
+            log(f"🔧 DLT state corruption detected in batch processing!")
+            log(f"This is likely caused by corrupted pipeline state, not your data.")
+            log(f"Attempting to recover by creating a fresh pipeline...")
+            
+            try:
+                # Create a completely fresh pipeline with a new name
+                import uuid
+                recovery_pipeline_name = f"dlt_recovery_pipeline_{uuid.uuid4().hex[:8]}"
+                log(f"Creating recovery pipeline: {recovery_pipeline_name}")
+                
+                recovery_pipeline = create_fresh_pipeline(engine_target, recovery_pipeline_name)
+                
+                # Try the batch again with the fresh pipeline
+                log(f"Retrying batch with recovery pipeline: {table_names}")
+                recovery_info = recovery_pipeline.run(source_batch, write_disposition=write_disposition)
+                log(f"🎉 Recovery successful! Batch completed with fresh pipeline: {recovery_info}")
+                return  # Success with recovery
+                
+            except Exception as recovery_error:
+                log(f"Recovery attempt failed: {recovery_error}")
+                log(f"Will fall back to individual table processing...")
+                # Continue to the individual table processing below
+        
         # Handle specific JSON decode errors
         if "JSONDecodeError" in error_message or "orjson" in error_message:
             log(f"JSON parsing error detected for tables: {table_names}")
@@ -978,12 +1009,9 @@ def load_select_tables_from_database() -> None:
         log(f"Source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
         log(f"Target pool status - Size: {engine_target.pool.size()}, Checked out: {engine_target.pool.checkedout()}")
         
-        # Use a single pipeline instance to reduce MetaData conflicts
-        pipeline = dlt.pipeline(
-            pipeline_name="dlt_unified_pipeline_v1_0_18", 
-            destination=dlt.destinations.sqlalchemy(engine_target), 
-            dataset_name=TARGET_DB_NAME
-        )
+        # Use a single pipeline instance with state corruption handling
+        pipeline_name = "dlt_unified_pipeline_v1_0_18"
+        pipeline = create_fresh_pipeline(engine_target, pipeline_name)
         
         # Configure DLT to handle both strict and unrestricted MySQL modes automatically
         try:
@@ -1077,6 +1105,160 @@ def load_select_tables_from_database() -> None:
 
     return retry_on_connection_error(_load_tables, "source+target (main data loading)")
 
+def cleanup_corrupted_dlt_state(engine_target, pipeline_name):
+    """Clean up corrupted DLT pipeline state tables."""
+    try:
+        log(f"Checking for corrupted DLT state for pipeline: {pipeline_name}")
+        
+        # DLT state tables that might contain corrupted data
+        state_tables = [
+            f"_dlt_pipeline_state",
+            f"_dlt_loads", 
+            f"_dlt_version"
+        ]
+        
+        with engine_target.connect() as connection:
+            inspector = sa.inspect(engine_target)
+            existing_tables = inspector.get_table_names()
+            
+            for state_table in state_tables:
+                if state_table in existing_tables:
+                    log(f"Found DLT state table: {state_table}")
+                    
+                    # Check if the state table has corrupted data
+                    try:
+                        if state_table == "_dlt_pipeline_state":
+                            # Check for corrupted pipeline state specifically
+                            check_query = f"SELECT pipeline_name, state FROM {state_table} WHERE pipeline_name = '{pipeline_name}'"
+                            result = connection.execute(sa.text(check_query))
+                            state_rows = result.fetchall()
+                            
+                            for row in state_rows:
+                                pipeline_name_val, state_val = row
+                                log(f"Found state for pipeline: {pipeline_name_val}")
+                                
+                                # Try to validate the state data
+                                if state_val is None or state_val == '' or state_val.strip() == '':
+                                    log(f"⚠️  Empty or NULL state detected for pipeline {pipeline_name_val} - this causes JSON decode errors!")
+                                    
+                                    # Delete the corrupted state
+                                    delete_query = f"DELETE FROM {state_table} WHERE pipeline_name = '{pipeline_name}'"
+                                    connection.execute(sa.text(delete_query))
+                                    connection.commit()
+                                    log(f"✅ Deleted corrupted state for pipeline: {pipeline_name_val}")
+                                    return True
+                                
+                                # Try to decode the state to check if it's valid
+                                try:
+                                    import base64
+                                    # Test base64 decoding
+                                    base64.b64decode(state_val, validate=True)
+                                    log(f"✅ State appears valid for pipeline: {pipeline_name_val}")
+                                except Exception as decode_error:
+                                    log(f"⚠️  Invalid base64 state detected for pipeline {pipeline_name_val}: {decode_error}")
+                                    
+                                    # Delete the corrupted state
+                                    delete_query = f"DELETE FROM {state_table} WHERE pipeline_name = '{pipeline_name}'"
+                                    connection.execute(sa.text(delete_query))
+                                    connection.commit()
+                                    log(f"✅ Deleted corrupted state for pipeline: {pipeline_name_val}")
+                                    return True
+                        else:
+                            # For other state tables, just check if they exist and are accessible
+                            count_query = f"SELECT COUNT(*) FROM {state_table}"
+                            count = connection.execute(sa.text(count_query)).scalar()
+                            log(f"State table {state_table} has {count} rows")
+                            
+                    except Exception as table_error:
+                        log(f"Error checking state table {state_table}: {table_error}")
+                        
+                        # If we can't even read the table, it might be corrupted
+                        if "doesn't exist" not in str(table_error).lower():
+                            log(f"⚠️  State table {state_table} appears corrupted, attempting to drop and recreate")
+                            try:
+                                drop_query = f"DROP TABLE IF EXISTS {state_table}"
+                                connection.execute(sa.text(drop_query))
+                                connection.commit()
+                                log(f"✅ Dropped corrupted state table: {state_table}")
+                                return True
+                            except Exception as drop_error:
+                                log(f"Failed to drop corrupted state table {state_table}: {drop_error}")
+                else:
+                    log(f"DLT state table {state_table} does not exist yet")
+            
+        log(f"DLT state validation completed for pipeline: {pipeline_name}")
+        return False  # No corruption found
+        
+    except Exception as cleanup_error:
+        log(f"Error during DLT state cleanup: {cleanup_error}")
+        return False
+
+def create_fresh_pipeline(engine_target, pipeline_name):
+    """Create a fresh DLT pipeline instance, handling any existing state corruption."""
+    try:
+        log(f"Creating fresh DLT pipeline: {pipeline_name}")
+        
+        # First, clean up any corrupted state
+        state_was_corrupted = cleanup_corrupted_dlt_state(engine_target, pipeline_name)
+        
+        if state_was_corrupted:
+            log(f"Corrupted state was cleaned up, creating fresh pipeline")
+        
+        # Create the pipeline with error handling
+        pipeline = dlt.pipeline(
+            pipeline_name=pipeline_name,
+            destination=dlt.destinations.sqlalchemy(engine_target),
+            dataset_name=TARGET_DB_NAME,
+            dev_mode=False  # Ensure we're not in dev mode which can cause state issues
+        )
+        
+        log(f"✅ Fresh pipeline created successfully: {pipeline_name}")
+        return pipeline
+        
+    except Exception as pipeline_error:
+        log(f"Error creating fresh pipeline: {pipeline_error}")
+        
+        # If pipeline creation fails due to state issues, try more aggressive cleanup
+        log(f"Attempting aggressive state cleanup...")
+        try:
+            with engine_target.connect() as connection:
+                # Drop all DLT state tables for this pipeline
+                state_cleanup_queries = [
+                    f"DROP TABLE IF EXISTS _dlt_pipeline_state",
+                    f"DROP TABLE IF EXISTS _dlt_loads", 
+                    f"DROP TABLE IF EXISTS _dlt_version",
+                    f"DROP TABLE IF EXISTS {TARGET_DB_NAME}_dlt_pipeline_state",
+                    f"DROP TABLE IF EXISTS {TARGET_DB_NAME}_dlt_loads",
+                    f"DROP TABLE IF EXISTS {TARGET_DB_NAME}_dlt_version"
+                ]
+                
+                for cleanup_query in state_cleanup_queries:
+                    try:
+                        connection.execute(sa.text(cleanup_query))
+                        connection.commit()
+                        log(f"Executed cleanup: {cleanup_query}")
+                    except Exception as cleanup_query_error:
+                        # Ignore errors for tables that don't exist
+                        if "doesn't exist" not in str(cleanup_query_error).lower():
+                            log(f"Cleanup query failed (non-critical): {cleanup_query_error}")
+                
+                log(f"Aggressive state cleanup completed")
+                
+                # Try creating pipeline again
+                pipeline = dlt.pipeline(
+                    pipeline_name=pipeline_name,
+                    destination=dlt.destinations.sqlalchemy(engine_target),
+                    dataset_name=TARGET_DB_NAME,
+                    dev_mode=False
+                )
+                
+                log(f"✅ Pipeline created successfully after aggressive cleanup: {pipeline_name}")
+                return pipeline
+                
+        except Exception as aggressive_cleanup_error:
+            log(f"Aggressive cleanup also failed: {aggressive_cleanup_error}")
+            raise
+
 
 class SimpleHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -1116,7 +1298,66 @@ def cleanup_engines():
     if ENGINE_TARGET:
         ENGINE_TARGET.dispose()
 
+def manual_dlt_state_cleanup():
+    """Manually clean up all DLT state tables - use this if you're getting persistent state corruption."""
+    try:
+        log("🧹 Manual DLT state cleanup initiated...")
+        
+        with ENGINE_TARGET.connect() as connection:
+            # Get all tables in the target database
+            inspector = sa.inspect(ENGINE_TARGET)
+            all_tables = inspector.get_table_names()
+            
+            # Find all DLT-related tables
+            dlt_tables = [table for table in all_tables if table.startswith('_dlt_') or 'dlt' in table.lower()]
+            
+            log(f"Found {len(dlt_tables)} DLT-related tables: {dlt_tables}")
+            
+            # Drop all DLT state tables
+            for dlt_table in dlt_tables:
+                try:
+                    drop_query = f"DROP TABLE IF EXISTS `{dlt_table}`"
+                    connection.execute(sa.text(drop_query))
+                    connection.commit()
+                    log(f"✅ Dropped DLT table: {dlt_table}")
+                except Exception as drop_error:
+                    log(f"⚠️  Failed to drop table {dlt_table}: {drop_error}")
+            
+            # Also clean up any dataset-specific DLT tables
+            dataset_dlt_tables = [table for table in all_tables if table.startswith(f'{TARGET_DB_NAME}_dlt_')]
+            for dataset_table in dataset_dlt_tables:
+                try:
+                    drop_query = f"DROP TABLE IF EXISTS `{dataset_table}`"
+                    connection.execute(sa.text(drop_query))
+                    connection.commit()
+                    log(f"✅ Dropped dataset DLT table: {dataset_table}")
+                except Exception as drop_error:
+                    log(f"⚠️  Failed to drop dataset table {dataset_table}: {drop_error}")
+            
+            log("🎉 Manual DLT state cleanup completed!")
+            log("You can now restart the pipeline - it will create fresh state tables.")
+            
+    except Exception as cleanup_error:
+        log(f"❌ Manual DLT state cleanup failed: {cleanup_error}")
+        raise
+
 if __name__ == "__main__":
+    import sys
+    
+    # Check for command line arguments
+    if len(sys.argv) > 1 and sys.argv[1] == "cleanup":
+        # Manual cleanup mode
+        log("🧹 Running manual DLT state cleanup...")
+        try:
+            manual_dlt_state_cleanup()
+            log("✅ Cleanup completed successfully!")
+            log("You can now restart the pipeline normally.")
+        except Exception as cleanup_error:
+            log(f"❌ Cleanup failed: {cleanup_error}")
+        finally:
+            cleanup_engines()
+        sys.exit(0)
+    
     try:
         # Start the HTTP server in a separate thread
         http_thread = threading.Thread(target=run_http_server)
