@@ -44,6 +44,9 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
 DEEP_DEBUG_JSON = os.getenv("DEEP_DEBUG_JSON", "true").lower() == "true"
 AUTO_SANITIZE_DATA = os.getenv("AUTO_SANITIZE_DATA", "true").lower() == "true"
 
+# Column name preservation configuration
+PRESERVE_COLUMN_NAMES = os.getenv("PRESERVE_COLUMN_NAMES", "true").lower() == "true"
+
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
@@ -1204,10 +1207,26 @@ def create_fresh_pipeline(engine_target, pipeline_name):
         if state_was_corrupted:
             log(f"Corrupted state was cleaned up, creating fresh pipeline")
         
+        # Create destination with optional column name preservation
+        if PRESERVE_COLUMN_NAMES:
+            log(f"🔧 Configuring DLT destination with column name preservation")
+            log(f"   This will prevent DLT from converting 'ViaInput' to 'via_input'")
+            destination = dlt.destinations.sqlalchemy(
+                engine_target,
+                # Preserve exact column names without conversion
+                table_name=lambda table: table,
+                column_name=lambda column: column,
+                # Additional options to prevent normalization
+                normalize_column_name=False
+            )
+        else:
+            log(f"⚠️  Using default DLT destination configuration (column names may be normalized)")
+            destination = dlt.destinations.sqlalchemy(engine_target)
+        
         # Create the pipeline with error handling
         pipeline = dlt.pipeline(
             pipeline_name=pipeline_name,
-            destination=dlt.destinations.sqlalchemy(engine_target),
+            destination=destination,
             dataset_name=TARGET_DB_NAME,
             dev_mode=False  # Ensure we're not in dev mode which can cause state issues
         )
@@ -1244,10 +1263,24 @@ def create_fresh_pipeline(engine_target, pipeline_name):
                 
                 log(f"Aggressive state cleanup completed")
                 
-                # Try creating pipeline again
+                # Try creating pipeline again with optional column name preservation
+                if PRESERVE_COLUMN_NAMES:
+                    log(f"🔧 Configuring recovery DLT destination with column name preservation")
+                    destination = dlt.destinations.sqlalchemy(
+                        engine_target,
+                        # Preserve exact column names without conversion
+                        table_name=lambda table: table,
+                        column_name=lambda column: column,
+                        # Additional options to prevent normalization
+                        normalize_column_name=False
+                    )
+                else:
+                    log(f"⚠️  Using default recovery DLT destination configuration")
+                    destination = dlt.destinations.sqlalchemy(engine_target)
+                
                 pipeline = dlt.pipeline(
                     pipeline_name=pipeline_name,
-                    destination=dlt.destinations.sqlalchemy(engine_target),
+                    destination=destination,
                     dataset_name=TARGET_DB_NAME,
                     dev_mode=False
                 )
