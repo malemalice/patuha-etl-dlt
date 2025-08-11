@@ -1344,29 +1344,16 @@ def create_fresh_pipeline(engine_target, pipeline_name):
             log(f"🔧 Configuring DLT destination with comprehensive column name preservation")
             log(f"   This will prevent DLT from converting 'ViaInput' to 'via_input'")
             
-            # Create a custom destination class that preserves column names
-            class ColumnPreservingDestination(dlt.destinations.sqlalchemy.SqlAlchemyDestination):
-                def _get_table_name(self, table_name: str) -> str:
-                    """Preserve exact table names."""
-                    return table_name
-                
-                def _get_column_name(self, column_name: str) -> str:
-                    """Preserve exact column names without any conversion."""
-                    return column_name
-                
-                def _normalize_identifier(self, identifier: str) -> str:
-                    """Prevent any identifier normalization."""
-                    return identifier
-            
-            destination = ColumnPreservingDestination(
+            # Create destination with column name preservation using DLT's built-in options
+            log(f"   Using DLT's built-in column name preservation features")
+            destination = dlt.destinations.sqlalchemy(
                 engine_target,
-                # Additional SQLAlchemy-specific options
+                # Preserve exact table names without conversion
                 table_name=lambda table: table,
+                # Preserve exact column names without conversion
                 column_name=lambda column: column,
-                # Disable all normalization
-                normalize_column_name=False,
-                # Force case sensitivity
-                case_sensitive=True
+                # Disable column name normalization
+                normalize_column_name=False
             )
             
             log(f"   ✅ Custom destination created with column name preservation")
@@ -1418,29 +1405,16 @@ def create_fresh_pipeline(engine_target, pipeline_name):
                 if PRESERVE_COLUMN_NAMES:
                     log(f"🔧 Configuring recovery DLT destination with comprehensive column name preservation")
                     
-                    # Create a custom destination class that preserves column names
-                    class ColumnPreservingDestination(dlt.destinations.sqlalchemy.SqlAlchemyDestination):
-                        def _get_table_name(self, table_name: str) -> str:
-                            """Preserve exact table names."""
-                            return table_name
-                        
-                        def _get_column_name(self, column_name: str) -> str:
-                            """Preserve exact column names without any conversion."""
-                            return column_name
-                        
-                        def _normalize_identifier(self, identifier: str) -> str:
-                            """Prevent any identifier normalization."""
-                            return identifier
-                    
-                    destination = ColumnPreservingDestination(
+                    # Create recovery destination with column name preservation using DLT's built-in options
+                    log(f"   Using DLT's built-in column name preservation features for recovery")
+                    destination = dlt.destinations.sqlalchemy(
                         engine_target,
-                        # Additional SQLAlchemy-specific options
+                        # Preserve exact table names without conversion
                         table_name=lambda table: table,
+                        # Preserve exact column names without conversion
                         column_name=lambda column: column,
-                        # Disable all normalization
-                        normalize_column_name=False,
-                        # Force case sensitivity
-                        case_sensitive=True
+                        # Disable column name normalization
+                        normalize_column_name=False
                     )
                     
                     log(f"   ✅ Recovery custom destination created with column name preservation")
