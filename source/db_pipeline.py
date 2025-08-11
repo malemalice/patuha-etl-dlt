@@ -636,6 +636,20 @@ def sanitize_table_data(items):
         else:
             yield item
 
+@dlt.transformer
+def preserve_column_names(items):
+    """DLT transformer to ensure column names are preserved exactly as they appear in source."""
+    for item in items:
+        if isinstance(item, dict):
+            # Create new dict with exact same keys (no normalization)
+            preserved_item = {}
+            for key, value in item.items():
+                # Ensure the key is exactly as it appears in source
+                preserved_item[key] = value
+            yield preserved_item
+        else:
+            yield item
+
 def get_max_timestamp(engine_target, table_name, column_name):
     """Fetch the max timestamp from the target table."""
     def _get_timestamp():
@@ -645,6 +659,76 @@ def get_max_timestamp(engine_target, table_name, column_name):
         return result if result else datetime(1970, 1, 1, 0, 0, 0)
     
     return retry_on_connection_error(_get_timestamp, f"target (get_max_timestamp for {table_name}.{column_name})")
+
+def ensure_column_name_consistency(engine_source, engine_target, table_name):
+    """Ensure column names are consistent between source and target, especially for case-sensitive columns."""
+    def _ensure_consistency():
+        inspector_source = sa.inspect(engine_source)
+        inspector_target = sa.inspect(engine_target)
+        
+        source_columns = {col["name"]: col for col in inspector_source.get_columns(table_name)}
+        target_columns = {col["name"]: col for col in inspector_target.get_columns(table_name)}
+        
+        alter_statements = []
+        
+        for source_col_name, source_col_info in source_columns.items():
+            # Check if column exists with exact name
+            if source_col_name not in target_columns:
+                # Check if it exists with different case
+                target_col_lower = {name.lower(): name for name in target_columns.keys()}
+                if source_col_name.lower() in target_col_lower:
+                    actual_target_name = target_col_lower[source_col_name.lower()]
+                    if actual_target_name != source_col_name:
+                        log(f"⚠️  Column case mismatch in {table_name}: source='{source_col_name}' vs target='{actual_target_name}'")
+                        
+                        # If we're preserving column names, we need to rename the target column
+                        if PRESERVE_COLUMN_NAMES:
+                            log(f"🔧 Renaming target column '{actual_target_name}' to '{source_col_name}' to match source")
+                            alter_statements.append(f"CHANGE COLUMN `{actual_target_name}` `{source_col_name}` {source_col_info['type']}")
+                else:
+                    # Column doesn't exist at all
+                    log(f"➕ Adding missing column '{source_col_name}' to target table {table_name}")
+                    alter_statements.append(f"ADD COLUMN `{source_col_name}` {source_col_info['type']}")
+        
+        if alter_statements:
+            alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
+            with engine_target.connect() as connection:
+                log(f"🔧 Executing schema changes for {table_name}: {alter_query}")
+                connection.execute(sa.text(alter_query))
+                connection.commit()
+                log(f"✅ Schema changes completed for {table_name}")
+        
+        return True
+    
+    return retry_on_connection_error(_ensure_consistency, f"source+target (ensure_column_consistency for {table_name})")
+
+def debug_dlt_column_handling(table_name, sample_data):
+    """Debug function to show exactly how DLT is handling column names."""
+    if not DEBUG_MODE or not PRESERVE_COLUMN_NAMES:
+        return
+    
+    log(f"🔍 DEBUG: Column name handling analysis for {table_name}")
+    
+    if sample_data and isinstance(sample_data, dict):
+        columns = list(sample_data.keys())
+        log(f"   📋 Source columns: {columns}")
+        
+        # Check for specific problematic columns
+        for col in columns:
+            if col == 'ViaInput':
+                log(f"   ✅ Found 'ViaInput' column - should be preserved")
+            elif col.lower() == 'via_input':
+                log(f"   ⚠️  Found lowercase variant '{col}' - this may cause issues")
+            elif 'via' in col.lower() and 'input' in col.lower():
+                log(f"   🔍 Found potential 'via_input' variant: '{col}'")
+        
+        # Show column name transformations
+        for col in columns:
+            normalized = col.lower().replace(' ', '_')
+            if normalized != col.lower():
+                log(f"   🔄 Column '{col}' would normalize to '{normalized}'")
+    else:
+        log(f"   ⚠️  No sample data available for column analysis")
             
 def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, write_disposition="merge"):
     """Process a batch of tables with proper connection management."""
@@ -659,6 +743,43 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
         if DEBUG_MODE:
             log(f"Creating DLT source for tables: {table_names}")
         source_batch = sql_database(engine_source).with_resources(*table_names)
+        
+        # Apply column name preservation transformer if enabled
+        if PRESERVE_COLUMN_NAMES:
+            log(f"🔧 Applying column name preservation transformer to all tables")
+            for table_name in table_names:
+                table_resource = getattr(source_batch, table_name)
+                
+                # Debug: Show what columns we're working with
+                try:
+                    # Get a sample record to see column names
+                    sample_records = list(table_resource.head(1))
+                    if sample_records:
+                        sample_record = sample_records[0]
+                        if isinstance(sample_record, dict):
+                            columns = list(sample_record.keys())
+                            log(f"   📋 Table {table_name} columns: {columns}")
+                            # Check for ViaInput specifically
+                            if 'ViaInput' in columns:
+                                log(f"   ✅ Found 'ViaInput' column in {table_name}")
+                            elif 'via_input' in [col.lower() for col in columns]:
+                                log(f"   ⚠️  Found lowercase 'via_input' variant in {table_name}")
+                        else:
+                            log(f"   📋 Table {table_name} record type: {type(sample_record)}")
+                except Exception as debug_error:
+                    log(f"   ⚠️  Could not debug columns for {table_name}: {debug_error}")
+                
+                # Additional detailed column analysis if we have sample data
+                try:
+                    if 'sample_record' in locals() and sample_record:
+                        debug_dlt_column_handling(table_name, sample_record)
+                except Exception as debug_error:
+                    log(f"   ⚠️  Could not run detailed column analysis for {table_name}: {debug_error}")
+                
+                # Apply the transformer to preserve column names
+                table_resource = table_resource | preserve_column_names
+                # Reassign the modified resource
+                setattr(source_batch, table_name, table_resource)
         
         if write_disposition == "merge":
             # Incremental tables
@@ -677,6 +798,11 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             log(f"Starting DLT pipeline run for batch: {table_names}, write_disposition: {write_disposition}")
         
         # Run the batch with enhanced error handling
+        if DEBUG_MODE and PRESERVE_COLUMN_NAMES:
+            log(f"🔍 Debug mode: About to run pipeline with column name preservation")
+            log(f"   Tables: {table_names}")
+            log(f"   Write disposition: {write_disposition}")
+        
         info = pipeline.run(source_batch, write_disposition=write_disposition)
         log(f"Batch completed successfully: {info}")
         
@@ -1055,6 +1181,12 @@ def load_select_tables_from_database() -> None:
             for table in batch_tables:
                 ensure_dlt_columns(engine_target, table)
                 sync_table_schema(engine_source, engine_target, table)
+                
+                # Additional column name consistency check if preservation is enabled
+                if PRESERVE_COLUMN_NAMES:
+                    log(f"🔧 Ensuring column name consistency for {table}")
+                    ensure_column_name_consistency(engine_source, engine_target, table)
+                
             if i + BATCH_SIZE < len(all_tables):  # Don't delay after the last batch
                 time.sleep(BATCH_DELAY)
 
@@ -1207,18 +1339,37 @@ def create_fresh_pipeline(engine_target, pipeline_name):
         if state_was_corrupted:
             log(f"Corrupted state was cleaned up, creating fresh pipeline")
         
-        # Create destination with optional column name preservation
+        # Create destination with comprehensive column name preservation
         if PRESERVE_COLUMN_NAMES:
-            log(f"🔧 Configuring DLT destination with column name preservation")
+            log(f"🔧 Configuring DLT destination with comprehensive column name preservation")
             log(f"   This will prevent DLT from converting 'ViaInput' to 'via_input'")
-            destination = dlt.destinations.sqlalchemy(
+            
+            # Create a custom destination class that preserves column names
+            class ColumnPreservingDestination(dlt.destinations.sqlalchemy.SqlAlchemyDestination):
+                def _get_table_name(self, table_name: str) -> str:
+                    """Preserve exact table names."""
+                    return table_name
+                
+                def _get_column_name(self, column_name: str) -> str:
+                    """Preserve exact column names without any conversion."""
+                    return column_name
+                
+                def _normalize_identifier(self, identifier: str) -> str:
+                    """Prevent any identifier normalization."""
+                    return identifier
+            
+            destination = ColumnPreservingDestination(
                 engine_target,
-                # Preserve exact column names without conversion
+                # Additional SQLAlchemy-specific options
                 table_name=lambda table: table,
                 column_name=lambda column: column,
-                # Additional options to prevent normalization
-                normalize_column_name=False
+                # Disable all normalization
+                normalize_column_name=False,
+                # Force case sensitivity
+                case_sensitive=True
             )
+            
+            log(f"   ✅ Custom destination created with column name preservation")
         else:
             log(f"⚠️  Using default DLT destination configuration (column names may be normalized)")
             destination = dlt.destinations.sqlalchemy(engine_target)
@@ -1263,17 +1414,36 @@ def create_fresh_pipeline(engine_target, pipeline_name):
                 
                 log(f"Aggressive state cleanup completed")
                 
-                # Try creating pipeline again with optional column name preservation
+                # Try creating pipeline again with comprehensive column name preservation
                 if PRESERVE_COLUMN_NAMES:
-                    log(f"🔧 Configuring recovery DLT destination with column name preservation")
-                    destination = dlt.destinations.sqlalchemy(
+                    log(f"🔧 Configuring recovery DLT destination with comprehensive column name preservation")
+                    
+                    # Create a custom destination class that preserves column names
+                    class ColumnPreservingDestination(dlt.destinations.sqlalchemy.SqlAlchemyDestination):
+                        def _get_table_name(self, table_name: str) -> str:
+                            """Preserve exact table names."""
+                            return table_name
+                        
+                        def _get_column_name(self, column_name: str) -> str:
+                            """Preserve exact column names without any conversion."""
+                            return column_name
+                        
+                        def _normalize_identifier(self, identifier: str) -> str:
+                            """Prevent any identifier normalization."""
+                            return identifier
+                    
+                    destination = ColumnPreservingDestination(
                         engine_target,
-                        # Preserve exact column names without conversion
+                        # Additional SQLAlchemy-specific options
                         table_name=lambda table: table,
                         column_name=lambda column: column,
-                        # Additional options to prevent normalization
-                        normalize_column_name=False
+                        # Disable all normalization
+                        normalize_column_name=False,
+                        # Force case sensitivity
+                        case_sensitive=True
                     )
+                    
+                    log(f"   ✅ Recovery custom destination created with column name preservation")
                 else:
                     log(f"⚠️  Using default recovery DLT destination configuration")
                     destination = dlt.destinations.sqlalchemy(engine_target)
