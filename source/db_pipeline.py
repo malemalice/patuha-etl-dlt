@@ -2300,9 +2300,7 @@ def create_merge_optimized_pipeline(engine_target, pipeline_name):
             dataset_name=TARGET_DB_NAME,
             dev_mode=False,
             # Add pipeline-level optimizations
-            progress="log",  # Log progress for better monitoring
-            # Optimize for incremental operations
-            incremental_key=lambda table: table_configs.get(table, {}).get('modifier', 'updated_at')
+            progress="log"  # Log progress for better monitoring
         )
         
         log(f"✅ Merge-optimized pipeline created successfully: {pipeline_name}")
@@ -2644,9 +2642,7 @@ def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schem
             dataset_name=TARGET_DB_NAME,
             dev_mode=False,
             # Add pipeline-level optimizations
-            progress="log",  # Log progress for better monitoring
-            # Optimize for incremental operations
-            incremental_key=lambda table: table_configs.get(table, {}).get('modifier', 'updated_at')
+            progress="log"  # Log progress for better monitoring
         )
         
         log(f"✅ Isolated staging pipeline created successfully: {pipeline_name}")
