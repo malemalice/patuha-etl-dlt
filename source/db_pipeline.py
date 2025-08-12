@@ -97,8 +97,7 @@ def validate_table_configurations():
     
     log(f"✅ Table configuration validation completed for {len(table_configs)} tables")
 
-# Validate configurations at startup
-validate_table_configurations()
+# Validate configurations at startup (moved to after log function and engines are defined)
 
 # Global transaction semaphore to limit concurrent transactions
 transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
@@ -204,6 +203,9 @@ ENGINE_SOURCE, ENGINE_TARGET = create_engines()
 def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} - INFO - {message}")
+
+# Validate table configurations at startup (after log function and engines are defined)
+validate_table_configurations()
 
 def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
     """Enhanced retry function with lock timeout handling, deadlock detection, and exponential backoff.
