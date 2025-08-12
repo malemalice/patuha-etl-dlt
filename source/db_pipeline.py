@@ -6,6 +6,7 @@ import json
 import threading
 import time
 import random
+import uuid
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -48,6 +49,29 @@ AUTO_SANITIZE_DATA = os.getenv("AUTO_SANITIZE_DATA", "true").lower() == "true"
 # Column name preservation configuration
 PRESERVE_COLUMN_NAMES = os.getenv("PRESERVE_COLUMN_NAMES", "true").lower() == "true"
 
+def generate_unique_staging_prefix(base_name="dlt_staging"):
+    """Generate a truly unique staging schema prefix to prevent collisions between services.
+    
+    Args:
+        base_name: Base name for the staging prefix
+    
+    Returns:
+        str: Unique prefix with timestamp, process ID, and random suffix
+    """
+    # Get current timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Get process ID for additional uniqueness
+    process_id = os.getpid()
+    
+    # Generate random suffix
+    random_suffix = uuid.uuid4().hex[:4]
+    
+    # Create unique prefix
+    unique_prefix = f"{base_name}_{timestamp}_{process_id}_{random_suffix}"
+    
+    return unique_prefix
+
 # Lock timeout and retry configuration
 LOCK_TIMEOUT_RETRIES = int(os.getenv("LOCK_TIMEOUT_RETRIES", "5"))  # Max retries for lock timeouts
 LOCK_TIMEOUT_BASE_DELAY = int(os.getenv("LOCK_TIMEOUT_BASE_DELAY", "10"))  # Base delay in seconds
@@ -78,32 +102,6 @@ with open(TABLES_FILE, "r") as f:
     tables_data = json.load(f)
 
 table_configs = {t["table"]: t for t in tables_data}
-
-def generate_unique_staging_prefix(base_name="dlt_staging"):
-    """Generate a truly unique staging schema prefix to prevent collisions between services.
-    
-    Args:
-        base_name: Base name for the staging prefix
-    
-    Returns:
-        str: Unique prefix with timestamp, process ID, and random suffix
-    """
-    import os
-    import uuid
-    
-    # Get current timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Get process ID for additional uniqueness
-    process_id = os.getpid()
-    
-    # Generate random suffix
-    random_suffix = uuid.uuid4().hex[:4]
-    
-    # Create unique prefix
-    unique_prefix = f"{base_name}_{timestamp}_{process_id}_{random_suffix}"
-    
-    return unique_prefix
 
 # Global transaction semaphore to limit concurrent transactions
 transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
@@ -235,9 +233,6 @@ def create_engines():
 
 # Initialize global engines
 ENGINE_SOURCE, ENGINE_TARGET = create_engines()
-
-# Validate table configurations at startup (after log function and engines are defined)
-validate_table_configurations()
 
 def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
     """Enhanced retry function with lock timeout handling, deadlock detection, and exponential backoff.
@@ -2098,6 +2093,9 @@ def run_http_server():
     httpd.serve_forever()
 
 def run_pipeline():
+    # Validate table configurations at startup (after all functions are defined)
+    validate_table_configurations()
+    
     if INTERVAL > 0:
         while True:
             log(f"### STARTING PIPELINE ###")
