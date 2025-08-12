@@ -66,7 +66,7 @@ CONNECTION_LOSS_RETRIES = int(os.getenv("CONNECTION_LOSS_RETRIES", "3"))  # Max 
 
 # Staging table isolation configuration
 STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower() == "true"  # Enable staging table isolation
-STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", f"dlt_staging_{datetime.now().strftime('%Y%m%d_%H%M%S')}")  # Dynamic base prefix for staging schemas
+STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", generate_unique_staging_prefix())  # Dynamic base prefix for staging schemas
 STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
@@ -117,22 +117,26 @@ transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
 ENGINE_SOURCE = None
 ENGINE_TARGET = None
 
-def format_primary_key(primary_key: Union[str, List[str]]) -> Union[str, List[str]]:
-    """
-    Format primary key for DLT hints.
-    
-    Args:
-        primary_key: Either a string (single key) or list of strings (composite key)
-    
-    Returns:
-        Formatted primary key for DLT (string for single keys, list for composite keys)
-    """
+def log_primary_key_info(table_name, primary_key):
+    """Log information about the primary key configuration for debugging."""
     if isinstance(primary_key, list):
-        # For composite keys, return as list (DLT expects list for composite keys)
+        log(f"📋 Table '{table_name}' configured with composite primary key: {primary_key}")
+    else:
+        log(f"📋 Table '{table_name}' configured with single primary key: {primary_key}")
+
+def format_primary_key(primary_key):
+    """Format primary key for DLT hints, handling both string and list formats."""
+    if isinstance(primary_key, str):
+        # If it's a comma-separated string, split it
+        if ',' in primary_key:
+            return primary_key.split(',')
+        else:
+            return primary_key
+    elif isinstance(primary_key, list):
         return primary_key
     else:
-        # For single keys, return as-is
-        return primary_key
+        # Fallback to string representation
+        return str(primary_key)
 
 def validate_primary_key_config(primary_key: Union[str, List[str]]) -> bool:
     """
@@ -864,110 +868,57 @@ def sanitize_table_data(items):
             yield item
 
 def force_table_clear(engine_target, table_name):
-    """Force clear a table completely to prevent DLT from generating complex DELETE statements.
-    
-    This function ensures the table is completely empty before DLT processing,
-    preventing DLT from generating expensive EXISTS-based DELETE queries.
-    
-    Args:
-        engine_target: Target database engine
-        table_name: Name of the table to clear
-    
-    Returns:
-        bool: True if clear was successful
-    """
+    """Force clear a table using aggressive methods to prevent lock timeouts."""
     def _clear_table(connection):
-        log(f"🧹 Force clearing table {table_name} to prevent complex DELETE operations")
+        log(f"🧹 Force clearing table {table_name} to prevent lock timeouts...")
         
-        # First try TRUNCATE (fastest and safest)
         try:
+            # First try TRUNCATE (fastest, minimal locking)
             log(f"Attempting TRUNCATE for {table_name}")
             connection.execute(sa.text(f"TRUNCATE TABLE {table_name}"))
             log(f"✅ TRUNCATE successful for {table_name}")
             return True
         except Exception as truncate_error:
             log(f"⚠️  TRUNCATE failed for {table_name}: {truncate_error}")
+            log(f"Falling back to aggressive DELETE...")
             
-            # If TRUNCATE fails, try DROP and CREATE
+            # Fallback to DELETE with very small batches to minimize lock time
             try:
-                log(f"Attempting DROP and CREATE for {table_name}")
+                # Get table row count
+                count_result = connection.execute(sa.text(f"SELECT COUNT(*) FROM {table_name}"))
+                total_rows = count_result.scalar()
                 
-                # Get table structure
-                inspector = sa.inspect(engine_target)
-                columns = inspector.get_columns(table_name)
-                indexes = inspector.get_indexes(table_name)
+                if total_rows == 0:
+                    log(f"Table {table_name} is already empty")
+                    return True
                 
-                # Build CREATE TABLE statement
-                column_defs = []
-                for col in columns:
-                    col_type = str(col['type'])
-                    nullable = "NULL" if col.get('nullable', True) else "NOT NULL"
-                    default = ""
-                    if col.get('default') is not None:
-                        default = f" DEFAULT {col['default']}"
-                    column_defs.append(f"`{col['name']}` {col_type} {nullable}{default}")
+                log(f"Table {table_name} has {total_rows} rows, deleting in small batches...")
                 
-                # Drop the table
-                connection.execute(sa.text(f"DROP TABLE IF EXISTS {table_name}"))
+                # Use very small batches to minimize lock duration
+                batch_size = 1000  # Smaller than the default 10000
+                deleted_rows = 0
                 
-                # Recreate the table
-                create_sql = f"CREATE TABLE {table_name} (\n  " + ",\n  ".join(column_defs) + "\n)"
-                connection.execute(sa.text(create_sql))
+                while deleted_rows < total_rows:
+                    delete_query = f"DELETE FROM {table_name} LIMIT {batch_size}"
+                    result = connection.execute(sa.text(delete_query))
+                    batch_deleted = result.rowcount
+                    
+                    if batch_deleted == 0:
+                        break
+                    
+                    deleted_rows += batch_deleted
+                    log(f"Deleted {deleted_rows}/{total_rows} rows from {table_name}")
+                    
+                    # Very short delay between batches
+                    time.sleep(0.05)  # 50ms delay
                 
-                # Recreate indexes
-                for index in indexes:
-                    if not index['unique']:
-                        index_sql = f"CREATE INDEX {index['name']} ON {table_name} ({', '.join(index['column_names'])})"
-                        connection.execute(sa.text(index_sql))
-                    else:
-                        unique_sql = f"CREATE UNIQUE INDEX {index['name']} ON {table_name} ({', '.join(index['column_names'])})"
-                        connection.execute(sa.text(unique_sql))
-                
-                log(f"✅ DROP and CREATE successful for {table_name}")
+                log(f"✅ Force DELETE completed for {table_name}: {deleted_rows} rows deleted")
                 return True
                 
-            except Exception as drop_create_error:
-                log(f"❌ DROP and CREATE also failed for {table_name}: {drop_create_error}")
+            except Exception as delete_error:
+                log(f"❌ Force DELETE also failed for {table_name}: {delete_error}")
+                raise
                 
-                # Last resort: DELETE with batching
-                try:
-                    log(f"Attempting DELETE with batching as last resort for {table_name}")
-                    
-                    # Get row count
-                    count_result = connection.execute(sa.text(f"SELECT COUNT(*) FROM {table_name}"))
-                    total_rows = count_result.scalar()
-                    
-                    if total_rows == 0:
-                        log(f"Table {table_name} is already empty")
-                        return True
-                    
-                    log(f"Table {table_name} has {total_rows} rows, deleting in small batches...")
-                    
-                    # Use very small batches to avoid timeouts
-                    batch_size = 1000
-                    deleted_rows = 0
-                    
-                    while deleted_rows < total_rows:
-                        delete_query = f"DELETE FROM {table_name} LIMIT {batch_size}"
-                        result = connection.execute(sa.text(delete_query))
-                        batch_deleted = result.rowcount
-                        
-                        if batch_deleted == 0:
-                            break
-                        
-                        deleted_rows += batch_deleted
-                        log(f"Deleted {deleted_rows}/{total_rows} rows from {table_name}")
-                        
-                        # Longer delay between batches to reduce pressure
-                        time.sleep(0.5)
-                    
-                    log(f"✅ DELETE cleanup completed for {table_name}: {deleted_rows} rows deleted")
-                    return True
-                    
-                except Exception as delete_error:
-                    log(f"❌ All cleanup methods failed for {table_name}: {delete_error}")
-                    raise
-    
     return execute_with_transaction_management(
         engine_target,
         f"force_table_clear for {table_name}",
@@ -1073,7 +1024,7 @@ def get_max_timestamp(engine_target, table_name, column_name):
 
 
             
-def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, write_disposition="merge"):
+def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, write_disposition="merge", staging_schema_name=None):
     """Process a batch of tables with proper connection management and lock timeout handling."""
     if not tables_dict:
         return
@@ -1081,14 +1032,17 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     table_names = list(tables_dict.keys())
     log(f"Processing batch of {len(table_names)} tables: {table_names}")
     
+    # Verify staging isolation is working before processing
+    if staging_schema_name and STAGING_ISOLATION_ENABLED:
+        periodic_staging_verification(engine_target, staging_schema_name, f"batch_processing_{table_names[0]}")
+    
     # Pre-cleanup tables for replace operations to avoid lock timeouts during DLT processing
     if write_disposition == "replace":
         log(f"🔒 Pre-cleaning tables for replace operation to prevent lock timeouts...")
         for table_name in table_names:
             try:
                 log(f"Pre-cleaning table: {table_name}")
-                # Use force_table_clear for replace operations to prevent DLT from generating complex DELETE statements
-                force_table_clear(engine_target, table_name)
+                safe_table_cleanup(engine_target, table_name, write_disposition)
                 log(f"✅ Pre-cleanup completed for {table_name}")
             except Exception as cleanup_error:
                 log(f"⚠️  Pre-cleanup failed for {table_name}: {cleanup_error}")
@@ -1218,12 +1172,23 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
         ]):
             log(f"🔒 Lock timeout/deadlock detected in batch processing!")
             log(f"This is likely caused by concurrent access or long-running transactions.")
-            log(f"Attempting to recover with individual table processing...")
+            log(f"Attempting to recover with individual table processing using isolated staging...")
             
             # Try processing tables individually to isolate the problem
             for table_name in table_names:
                 try:
                     log(f"Attempting individual processing for table: {table_name}")
+                    
+                    # Create a NEW pipeline with isolated staging for this individual table
+                    # This ensures we don't inherit the lock timeout issues from the batch pipeline
+                    individual_pipeline_name = f"dlt_individual_{table_name}_{int(time.time())}"
+                    
+                    if staging_schema_name and STAGING_ISOLATION_ENABLED:
+                        log(f"🔧 Creating isolated staging pipeline for individual table: {table_name}")
+                        individual_pipeline = create_isolated_staging_pipeline(engine_target, individual_pipeline_name, staging_schema_name)
+                    else:
+                        log(f"⚠️  Using fallback pipeline for individual table: {table_name}")
+                        individual_pipeline = create_fresh_pipeline(engine_target, individual_pipeline_name)
                     
                     # Create single table source
                     single_source = sql_database(engine_source).with_resources(table_name)
@@ -1247,9 +1212,16 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     if write_disposition == "replace":
                         force_table_clear(engine_target, table_name)
                     
-                    # Process individual table
-                    single_info = pipeline.run(single_source, write_disposition=write_disposition)
+                    # Process individual table with the new isolated pipeline
+                    single_info = individual_pipeline.run(single_source, write_disposition=write_disposition)
                     log(f"✅ Individual processing successful for {table_name}: {single_info}")
+                    
+                    # Clean up the individual pipeline after successful processing
+                    try:
+                        del individual_pipeline
+                        log(f"🧹 Cleaned up individual pipeline for {table_name}")
+                    except Exception as cleanup_error:
+                        log(f"⚠️  Could not clean up individual pipeline for {table_name}: {cleanup_error}")
                     
                 except Exception as individual_error:
                     individual_error_str = str(individual_error)
@@ -1260,6 +1232,8 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                         'lock wait timeout exceeded', '1205', 'deadlock found', '1213'
                     ]):
                         log(f"🔒 Lock timeout persists for {table_name}, skipping...")
+                        log(f"   This suggests the issue is deeper than staging table conflicts")
+                        log(f"   Consider checking for long-running transactions or database locks")
                         continue
                     else:
                         log(f"Different error for {table_name}, continuing...")
@@ -1597,6 +1571,9 @@ def load_select_tables_from_database() -> None:
         log(f"   Staging Schema Prefix: {STAGING_SCHEMA_PREFIX}")
         log(f"   Staging Retention Hours: {STAGING_SCHEMA_RETENTION_HOURS}")
         
+        if STAGING_ISOLATION_ENABLED:
+            log(f"🔒 Collision Prevention: Using unique prefix '{STAGING_SCHEMA_PREFIX}' to prevent staging table conflicts")
+        
         # Log connection pool status
         log(f"Source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
         log(f"Target pool status - Size: {engine_target.pool.size()}, Checked out: {engine_target.pool.checkedout()}")
@@ -1648,6 +1625,17 @@ def load_select_tables_from_database() -> None:
         
         if staging_schema_name and STAGING_ISOLATION_ENABLED:
             pipeline = create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schema_name)
+            
+            # Verify that DLT is actually using our isolated staging schema
+            try:
+                log(f"🔍 Verifying staging schema isolation is working...")
+                if verify_staging_schema_usage(engine_target, staging_schema_name):
+                    log(f"✅ Staging isolation verification successful!")
+                else:
+                    log(f"❌ Staging isolation verification failed - DLT may not be using isolated staging!")
+                    log(f"   This could explain why you're still seeing lock timeouts!")
+            except Exception as verify_error:
+                log(f"⚠️  Could not verify staging schema usage: {verify_error}")
         else:
             pipeline = create_merge_optimized_pipeline(engine_target, pipeline_name)
         
@@ -1733,7 +1721,7 @@ def load_select_tables_from_database() -> None:
                 batch_dict = dict(batch_items)
                 
                 try:
-                    process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "merge")
+                    process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "merge", staging_schema_name)
                 except Exception as e:
                     log(f"Error processing incremental batch {i//BATCH_SIZE + 1}: {e}")
                     log(f"Pipeline execution failed at stage sync with exception:")
@@ -1756,7 +1744,7 @@ def load_select_tables_from_database() -> None:
                 batch_dict = {table: table_configs[table] for table in batch_tables}
                 
                 try:
-                    process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "replace")
+                    process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "replace", staging_schema_name)
                 except Exception as e:
                     log(f"Error processing full refresh batch {i//BATCH_SIZE + 1}: {e}")
                     # Continue with next batch rather than failing completely
@@ -2661,6 +2649,98 @@ def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schem
         log(f"Falling back to regular pipeline creation...")
         # Fall back to regular pipeline creation
         return create_fresh_pipeline(engine_target, pipeline_name)
+
+def generate_unique_staging_prefix(base_name="dlt_staging"):
+    """Generate a truly unique staging schema prefix to prevent collisions between services.
+    
+    Args:
+        base_name: Base name for the staging prefix
+    
+    Returns:
+        str: Unique prefix with timestamp, process ID, and random suffix
+    """
+    import os
+    import uuid
+    
+    # Get current timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Get process ID for additional uniqueness
+    process_id = os.getpid()
+    
+    # Generate random suffix
+    random_suffix = uuid.uuid4().hex[:4]
+    
+    # Create unique prefix
+    unique_prefix = f"{base_name}_{timestamp}_{process_id}_{random_suffix}"
+    
+    return unique_prefix
+
+def verify_staging_schema_usage(engine_target, expected_staging_schema):
+    """Verify that DLT is actually using our isolated staging schema.
+    
+    Args:
+        engine_target: Target database engine
+        expected_staging_schema: The staging schema we expect DLT to use
+    
+    Returns:
+        bool: True if DLT is using our isolated staging schema
+    """
+    def _verify_usage(connection):
+        log(f"🔍 Verifying DLT staging schema usage...")
+        
+        # Check if our expected staging schema exists
+        schema_check_query = f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '{expected_staging_schema}'"
+        result = connection.execute(sa.text(schema_check_query))
+        if not result.fetchone():
+            log(f"❌ Expected staging schema '{expected_staging_schema}' does not exist!")
+            return False
+        
+        # Check for any tables in the default staging schema (this indicates DLT is not using isolation)
+        default_staging_check = f"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'zains_rz_staging'"
+        result = connection.execute(sa.text(default_staging_check))
+        default_staging_tables = result.scalar()
+        
+        if default_staging_tables > 0:
+            log(f"⚠️  WARNING: Found {default_staging_tables} tables in default staging schema 'zains_rz_staging'")
+            log(f"   This suggests DLT is NOT using our isolated staging approach!")
+            log(f"   Expected: {expected_staging_schema}")
+            log(f"   Actual: zains_rz_staging")
+            return False
+        
+        # Check for tables in our isolated staging schema
+        isolated_staging_check = f"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{expected_staging_schema}'"
+        result = connection.execute(sa.text(isolated_staging_check))
+        isolated_staging_tables = result.scalar()
+        
+        log(f"✅ DLT is using isolated staging schema '{expected_staging_schema}'")
+        log(f"   Tables in isolated schema: {isolated_staging_tables}")
+        log(f"   Tables in default schema: 0")
+        
+        return True
+    
+    return execute_with_transaction_management(
+        engine_target,
+        f"verify_staging_schema_usage for {expected_staging_schema}",
+        _verify_usage
+    )
+
+def periodic_staging_verification(engine_target, expected_staging_schema, operation_name):
+    """Periodically verify that DLT is still using our isolated staging schema.
+    
+    Args:
+        engine_target: Target database engine
+        expected_staging_schema: The staging schema we expect DLT to use
+        operation_name: Name of the operation being verified
+    """
+    try:
+        log(f"🔍 Periodic staging verification for {operation_name}...")
+        if verify_staging_schema_usage(engine_target, expected_staging_schema):
+            log(f"✅ Staging isolation still working for {operation_name}")
+        else:
+            log(f"❌ Staging isolation broken for {operation_name} - this may cause lock timeouts!")
+    except Exception as verify_error:
+        log(f"⚠️  Could not verify staging schema usage for {operation_name}: {verify_error}")
 
 if __name__ == "__main__":
     import sys
