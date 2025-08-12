@@ -2409,7 +2409,6 @@ def create_unique_staging_schema(engine_target, base_prefix="zains_rz_staging"):
     def _create_schema(connection):
         # Generate unique schema name with timestamp and random suffix
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        import uuid
         random_suffix = uuid.uuid4().hex[:6]
         schema_name = f"{base_prefix}_{timestamp}_{random_suffix}"
         
@@ -2431,8 +2430,7 @@ def create_unique_staging_schema(engine_target, base_prefix="zains_rz_staging"):
     return execute_with_transaction_management(
         engine_target,
         "create_unique_staging_schema",
-        _create_schema,
-        base_prefix
+        _create_schema
     )
 
 def cleanup_old_staging_schemas(engine_target, base_prefix="zains_rz_staging", retention_hours=24):
@@ -2510,9 +2508,7 @@ def cleanup_old_staging_schemas(engine_target, base_prefix="zains_rz_staging", r
     return execute_with_transaction_management(
         engine_target,
         "cleanup_old_staging_schemas",
-        _cleanup_schema,
-        base_prefix,
-        retention_hours
+        _cleanup_schemas
     )
 
 def get_staging_schema_status(engine_target, base_prefix="zains_rz_staging"):
@@ -2572,8 +2568,7 @@ def get_staging_schema_status(engine_target, base_prefix="zains_rz_staging"):
     return execute_with_transaction_management(
         engine_target,
         "get_staging_schema_status",
-        _get_status,
-        base_prefix
+        _get_status
     )
 
 class IsolatedStagingDestination:
@@ -2588,7 +2583,6 @@ class IsolatedStagingDestination:
         if preserve_column_names:
             self.base_destination = dlt.destinations.sqlalchemy(
                 engine_target,
-                table_name=lambda table: table,
                 column_name=lambda column: column,
                 normalize_column_name=False,
                 # Override staging schema
