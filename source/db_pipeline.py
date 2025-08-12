@@ -2577,10 +2577,10 @@ class IsolatedStagingDestination:
         self.staging_schema_name = staging_schema_name
         self.preserve_column_names = preserve_column_names
         
-        # Create the base destination with proper error handling
+        # Create the destination factory with proper error handling
         try:
             if preserve_column_names:
-                self.base_destination = dlt.destinations.sqlalchemy(
+                destination_factory = dlt.destinations.sqlalchemy(
                     engine_target,
                     column_name=lambda column: column,
                     normalize_column_name=False,
@@ -2591,24 +2591,55 @@ class IsolatedStagingDestination:
                     max_batch_size=MERGE_MAX_BATCH_SIZE
                 )
             else:
-                self.base_destination = dlt.destinations.sqlalchemy(
+                destination_factory = dlt.destinations.sqlalchemy(
                     engine_target,
                     staging_schema=staging_schema_name,
                     batch_size=MERGE_BATCH_SIZE,
                     max_batch_size=MERGE_MAX_BATCH_SIZE
                 )
             
-            # Validate the destination was created properly
-            if not hasattr(self.base_destination, 'capabilities'):
-                raise Exception("Base destination missing required capabilities attribute")
+            # Validate the factory was created properly
+            if not destination_factory:
+                raise Exception("Failed to create destination factory")
             
-            log(f"🔧 Created isolated staging destination using schema: {staging_schema_name}")
-            log(f"   Destination type: {type(self.base_destination)}")
-            log(f"   Has capabilities: {hasattr(self.base_destination, 'capabilities')}")
+            log(f"🔧 Created destination factory with isolated staging schema: {staging_schema_name}")
+            log(f"   Factory type: {type(destination_factory)}")
+            
+            # Store the factory for later instantiation
+            self.destination_factory = destination_factory
+            
+            # The base_destination will be created when first accessed
+            self._base_destination = None
             
         except Exception as dest_error:
-            log(f"❌ Failed to create base destination: {dest_error}")
-            raise Exception(f"Destination creation failed: {dest_error}")
+            log(f"❌ Failed to create destination factory: {dest_error}")
+            raise Exception(f"Destination factory creation failed: {dest_error}")
+    
+    @property
+    def base_destination(self):
+        """Lazy instantiation of the actual destination object."""
+        if self._base_destination is None:
+            try:
+                log(f"🔧 Instantiating destination from factory...")
+                # Call the factory to get the actual destination object
+                self._base_destination = self.destination_factory()
+                
+                # Validate the instantiated destination
+                if not self._base_destination:
+                    raise Exception("Factory returned None destination")
+                
+                if not callable(self._base_destination):
+                    raise Exception(f"Factory returned non-callable destination: {type(self._base_destination)}")
+                
+                log(f"✅ Destination instantiated successfully")
+                log(f"   Destination type: {type(self._base_destination)}")
+                log(f"   Destination callable: {callable(self._base_destination)}")
+                
+            except Exception as instantiation_error:
+                log(f"❌ Failed to instantiate destination from factory: {instantiation_error}")
+                raise Exception(f"Destination instantiation failed: {instantiation_error}")
+        
+        return self._base_destination
     
     def __getattr__(self, name):
         """Delegate all other attributes to the base destination."""
@@ -2618,13 +2649,18 @@ class IsolatedStagingDestination:
     
     def __call__(self, *args, **kwargs):
         """Make the destination callable like the base destination."""
-        if not callable(self.base_destination):
-            raise Exception(f"Base destination is not callable: {type(self.base_destination)}")
-        return self.base_destination(*args, **kwargs)
+        # Ensure destination is instantiated
+        destination = self.base_destination
+        
+        if not callable(destination):
+            raise Exception(f"Base destination is not callable: {type(destination)}")
+        
+        log(f"🔧 Calling isolated staging destination with schema: {self.staging_schema_name}")
+        return destination(*args, **kwargs)
     
     def __repr__(self):
         """Provide a clear representation of the destination."""
-        return f"IsolatedStagingDestination(schema={self.staging_schema_name}, base={type(self.base_destination)})"
+        return f"IsolatedStagingDestination(schema={self.staging_schema_name}, factory={type(self.destination_factory)}, instantiated={self._base_destination is not None})"
 
 def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schema_name):
     """Create a DLT pipeline with isolated staging to prevent lock conflicts.
@@ -2656,10 +2692,12 @@ def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schem
         )
         
         # Validate destination was created properly
-        if not destination or not hasattr(destination, 'base_destination'):
+        if not destination or not hasattr(destination, 'destination_factory'):
             raise Exception("Failed to create valid isolated staging destination")
         
         log(f"✅ Isolated staging destination created successfully")
+        log(f"   Factory type: {type(destination.destination_factory)}")
+        log(f"   Staging schema: {destination.staging_schema_name}")
         
         # Create the pipeline with isolated staging
         log(f"🔧 Creating DLT pipeline with isolated staging...")
@@ -2831,9 +2869,15 @@ def validate_dlt_staging_usage(pipeline, expected_staging_schema):
             # Try to check if it's our custom destination
             if hasattr(destination, 'base_destination'):
                 log(f"   Base destination type: {type(destination.base_destination)}")
-                if hasattr(destination.base_destination, 'staging_schema'):
-                    base_staging = destination.base_destination.staging_schema
+                # The base_destination property will handle instantiation
+                base_dest = destination.base_destination
+                if hasattr(base_dest, 'staging_schema'):
+                    base_staging = base_dest.staging_schema
                     log(f"   Base destination staging schema: {base_staging}")
+                    return base_staging == expected_staging_schema
+                elif hasattr(base_dest, 'staging_schema_name'):
+                    base_staging = base_dest.staging_schema_name
+                    log(f"   Base destination staging schema name: {base_staging}")
                     return base_staging == expected_staging_schema
             
             return False
@@ -2864,15 +2908,21 @@ def enforce_staging_isolation(pipeline, expected_staging_schema):
             if hasattr(pipeline, 'destination') and hasattr(pipeline.destination, 'base_destination'):
                 try:
                     # Force the staging schema on the base destination
-                    pipeline.destination.base_destination.staging_schema = expected_staging_schema
-                    log(f"🔧 Attempted to force staging schema on base destination")
-                    
-                    # Re-validate
-                    if validate_dlt_staging_usage(pipeline, expected_staging_schema):
-                        log(f"✅ Successfully enforced staging isolation")
-                        return True
+                    # The base_destination property will handle instantiation
+                    base_dest = pipeline.destination.base_destination
+                    if hasattr(base_dest, 'staging_schema'):
+                        base_dest.staging_schema = expected_staging_schema
+                        log(f"🔧 Attempted to force staging schema on base destination")
+                        
+                        # Re-validate
+                        if validate_dlt_staging_usage(pipeline, expected_staging_schema):
+                            log(f"✅ Successfully enforced staging isolation")
+                            return True
+                        else:
+                            log(f"❌ Failed to enforce staging isolation after forcing schema")
+                            return False
                     else:
-                        log(f"❌ Failed to enforce staging isolation after forcing schema")
+                        log(f"❌ Base destination has no staging_schema attribute")
                         return False
                         
                 except Exception as force_error:
