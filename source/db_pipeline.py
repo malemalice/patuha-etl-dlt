@@ -106,7 +106,7 @@ transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
 ENGINE_SOURCE = None
 ENGINE_TARGET = None
 
-def format_primary_key(primary_key: Union[str, List[str]]) -> str:
+def format_primary_key(primary_key: Union[str, List[str]]) -> Union[str, List[str]]:
     """
     Format primary key for DLT hints.
     
@@ -114,11 +114,11 @@ def format_primary_key(primary_key: Union[str, List[str]]) -> str:
         primary_key: Either a string (single key) or list of strings (composite key)
     
     Returns:
-        Formatted primary key string for DLT
+        Formatted primary key for DLT (string for single keys, list for composite keys)
     """
     if isinstance(primary_key, list):
-        # For composite keys, join with comma
-        return ", ".join(primary_key)
+        # For composite keys, return as list (DLT expects list for composite keys)
+        return primary_key
     else:
         # For single keys, return as-is
         return primary_key
