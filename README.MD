@@ -127,7 +127,7 @@ A data synchronization pipeline built with [dlt (data load tool)](https://dlthub
 
 The `tables.json` file supports two types of table configurations:
 
-**Incremental Sync Table** (with modifier column):
+**Incremental Sync Table** (with modifier column):**
 ```json
 {
   "table": "table_name",
@@ -136,11 +136,28 @@ The `tables.json` file supports two types of table configurations:
 }
 ```
 
-**Full Refresh Table** (without modifier):
+**Full Refresh Table** (without modifier):**
 ```json
 {
   "table": "table_name",
   "primary_key": "id"
+}
+```
+
+**Multiple Primary Keys (Composite Keys):**
+```json
+{
+  "table": "order_items",
+  "primary_key": ["order_id", "product_id"],
+  "modifier": "updated_at"
+}
+```
+
+**Complex Composite Keys:**
+```json
+{
+  "table": "user_permissions",
+  "primary_key": ["user_id", "permission_id", "resource_id"]
 }
 ```
 
@@ -175,6 +192,7 @@ The `tables.json` file supports two types of table configurations:
 3. **Incremental Processing**: For tables with modifier columns, only syncs records newer than the last sync
 4. **Full Refresh**: For tables without modifiers, replaces all data
 5. **Primary Key Merging**: Uses primary keys to handle updates and prevent duplicates
+6. **Multiple Primary Key Support**: Handles both single and composite primary keys for complex table relationships
 
 ## Health Check
 
@@ -209,12 +227,63 @@ If you encounter connection pool errors:
 3. **Slow performance**: Check `POOL_RECYCLE` and database network latency
 4. **For large tables**: Consider processing them separately during off-peak hours
 
+## Multiple Primary Key Support
+
+The pipeline now supports **composite primary keys** (multiple columns that together form a unique identifier) in addition to single primary keys.
+
+### Benefits of Multiple Primary Keys
+- **Complex Relationships**: Handle tables with natural composite keys (e.g., order_id + product_id)
+- **Data Integrity**: Ensure proper deduplication across multiple identifying columns
+- **Flexibility**: Support various database design patterns and normalization levels
+
+### Configuration Examples
+
+**Simple Composite Key:**
+```json
+{
+  "table": "order_items",
+  "primary_key": ["order_id", "product_id"],
+  "modifier": "updated_at"
+}
+```
+
+**Complex Composite Key:**
+```json
+{
+  "table": "user_permissions",
+  "primary_key": ["user_id", "permission_id", "resource_id", "tenant_id"]
+}
+```
+
+**Mixed Configuration:**
+```json
+[
+  {
+    "table": "users",
+    "primary_key": "id",
+    "modifier": "updated_at"
+  },
+  {
+    "table": "order_items",
+    "primary_key": ["order_id", "product_id"],
+    "modifier": "modified_at"
+  }
+]
+```
+
+### How It Works
+1. **Single Keys**: Passed directly to DLT as `primary_key="id"`
+2. **Composite Keys**: Automatically formatted as `primary_key="order_id, product_id"`
+3. **Validation**: Configuration is validated at startup to ensure proper format
+4. **Logging**: Clear indication of which tables use single vs. composite keys
+
 ## Important Notes
 
 - **No Column Deletion**: The pipeline never deletes columns during sync operations
 - **Modifier Requirement**: Incremental sync requires a modifier column (e.g., `updated_at`) that's always updated
 - **Initial Sync**: First run will sync all data; subsequent runs sync only changes
 - **Schema Evolution**: New columns in source tables are automatically added to target tables
+- **Primary Key Flexibility**: Support for both single columns and arrays of columns as primary keys
 
 ## Troubleshooting
 

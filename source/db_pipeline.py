@@ -1,6 +1,6 @@
 # flake8: noqa
 import humanize
-from typing import Any
+from typing import Any, Union, List
 import os
 import json
 import threading
@@ -68,12 +68,94 @@ with open(TABLES_FILE, "r") as f:
 
 table_configs = {t["table"]: t for t in tables_data}
 
+# Validate table configurations
+def validate_table_configurations():
+    """Validate all table configurations for proper primary key setup."""
+    log("🔍 Validating table configurations...")
+    
+    for table_name, config in table_configs.items():
+        # Check if primary_key exists
+        if "primary_key" not in config:
+            log(f"❌ Table '{table_name}' missing primary_key configuration")
+            continue
+            
+        primary_key = config["primary_key"]
+        
+        # Validate primary key configuration
+        if not validate_primary_key_config(primary_key):
+            log(f"❌ Table '{table_name}' has invalid primary_key configuration: {primary_key}")
+            continue
+            
+        # Log primary key information
+        log_primary_key_info(table_name, primary_key)
+        
+        # Check if modifier exists for incremental sync
+        if "modifier" in config:
+            log(f"📅 Table '{table_name}' configured for incremental sync using column: {config['modifier']}")
+        else:
+            log(f"🔄 Table '{table_name}' configured for full refresh sync")
+    
+    log(f"✅ Table configuration validation completed for {len(table_configs)} tables")
+
+# Validate configurations at startup
+validate_table_configurations()
+
 # Global transaction semaphore to limit concurrent transactions
 transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
 
 # Global engine variables
 ENGINE_SOURCE = None
 ENGINE_TARGET = None
+
+def format_primary_key(primary_key: Union[str, List[str]]) -> str:
+    """
+    Format primary key for DLT hints.
+    
+    Args:
+        primary_key: Either a string (single key) or list of strings (composite key)
+    
+    Returns:
+        Formatted primary key string for DLT
+    """
+    if isinstance(primary_key, list):
+        # For composite keys, join with comma
+        return ", ".join(primary_key)
+    else:
+        # For single keys, return as-is
+        return primary_key
+
+def validate_primary_key_config(primary_key: Union[str, List[str]]) -> bool:
+    """
+    Validate primary key configuration.
+    
+    Args:
+        primary_key: Primary key configuration to validate
+    
+    Returns:
+        True if valid, False otherwise
+    """
+    if isinstance(primary_key, str):
+        # Single key should be non-empty string
+        return bool(primary_key.strip())
+    elif isinstance(primary_key, list):
+        # Composite key should be non-empty list with non-empty strings
+        return (len(primary_key) > 0 and 
+                all(isinstance(key, str) and bool(key.strip()) for key in primary_key))
+    else:
+        return False
+
+def log_primary_key_info(table_name: str, primary_key: Union[str, List[str]]):
+    """
+    Log information about primary key configuration.
+    
+    Args:
+        table_name: Name of the table
+        primary_key: Primary key configuration
+    """
+    if isinstance(primary_key, list):
+        log(f"📋 Table '{table_name}' configured with composite primary key: {primary_key}")
+    else:
+        log(f"🔑 Table '{table_name}' configured with single primary key: {primary_key}")
 
 # Create engines once with proper connection pool configuration
 def create_engines():
@@ -297,8 +379,8 @@ def ensure_dlt_columns(engine_target, table_name):
         
         if alter_statements:
             alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
-            log(f"Altering table {table_name}: {alter_query}")
-            connection.execute(sa.text(alter_query))
+                log(f"Altering table {table_name}: {alter_query}")
+                connection.execute(sa.text(alter_query))
             return True
         return False
     
@@ -330,8 +412,8 @@ def sync_table_schema(engine_source, engine_target, table_name):
         
         if alter_statements:
             alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
-            log(f"Syncing schema for {table_name}: {alter_query}")
-            connection.execute(sa.text(alter_query))
+                log(f"Syncing schema for {table_name}: {alter_query}")
+                connection.execute(sa.text(alter_query))
             return True
         return False
     
@@ -1020,8 +1102,15 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 log(f"Setting incremental for table {table} on column {config['modifier']}")
                 max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table, config["modifier"])).in_tz("Asia/Bangkok")
                 log(f"Setting incremental for table {table} on column {config['modifier']} with initial value {max_timestamp}")
+                
+                # Log primary key information
+                log_primary_key_info(table, config["primary_key"])
+                
+                # Format primary key for DLT
+                formatted_primary_key = format_primary_key(config["primary_key"])
+                
                 getattr(source_batch, table).apply_hints(
-                    primary_key=config["primary_key"],
+                    primary_key=formatted_primary_key,
                     incremental=dlt.sources.incremental(config["modifier"],
                     initial_value=max_timestamp)
                 )
@@ -1068,8 +1157,15 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     if write_disposition == "merge" and "modifier" in tables_dict[table_name]:
                         config = tables_dict[table_name]
                         max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table_name, config["modifier"])).in_tz("Asia/Bangkok")
+                        
+                        # Log primary key information for connection error recovery
+                        log_primary_key_info(table_name, config["primary_key"])
+                        
+                        # Format primary key for DLT
+                        formatted_primary_key = format_primary_key(config["primary_key"])
+                        
                         getattr(single_source, table_name).apply_hints(
-                            primary_key=config["primary_key"],
+                            primary_key=formatted_primary_key,
                             incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
                         )
                     
@@ -1122,8 +1218,15 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     if write_disposition == "merge" and "modifier" in tables_dict[table_name]:
                         config = tables_dict[table_name]
                         max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table_name, config["modifier"])).in_tz("Asia/Bangkok")
+                        
+                        # Log primary key information for lock timeout recovery
+                        log_primary_key_info(table_name, config["primary_key"])
+                        
+                        # Format primary key for DLT
+                        formatted_primary_key = format_primary_key(config["primary_key"])
+                        
                         getattr(single_source, table_name).apply_hints(
-                            primary_key=config["primary_key"],
+                            primary_key=formatted_primary_key,
                             incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
                         )
                     
@@ -1204,8 +1307,15 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     if write_disposition == "merge" and "modifier" in tables_dict[table_name]:
                         config = tables_dict[table_name]
                         max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table_name, config["modifier"])).in_tz("Asia/Bangkok")
+                        
+                        # Log primary key information for JSON error recovery
+                        log_primary_key_info(table_name, config["primary_key"])
+                        
+                        # Format primary key for DLT
+                        formatted_primary_key = format_primary_key(config["primary_key"])
+                        
                         getattr(single_source, table_name).apply_hints(
-                            primary_key=config["primary_key"],
+                            primary_key=formatted_primary_key,
                             incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
                         )
                     

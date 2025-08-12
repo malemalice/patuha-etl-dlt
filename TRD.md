@@ -45,12 +45,25 @@ graph TB
 
 #### 2.1.2 Configuration Management
 ```json
-// tables.json structure
+// tables.json structure - Single Primary Key
 [
   {
     "table": "table_name",
     "primary_key": "id",
     "modifier": "updated_at"  // Optional for incremental sync
+  }
+]
+
+// Multiple Primary Keys (Composite Keys)
+[
+  {
+    "table": "order_items",
+    "primary_key": ["order_id", "product_id"],
+    "modifier": "updated_at"
+  },
+  {
+    "table": "user_permissions",
+    "primary_key": ["user_id", "permission_id", "resource_id"]
   }
 ]
 ```
@@ -195,7 +208,29 @@ Connection Pool Metrics:
 
 ### 5.1 Core Algorithms
 
-#### 5.1.1 Incremental Sync Algorithm
+#### 5.1.1 Primary Key Handling Algorithm
+```python
+def format_primary_key(primary_key: Union[str, List[str]]) -> str:
+    """Format primary key for DLT hints."""
+    if isinstance(primary_key, list):
+        # For composite keys, join with comma
+        return ", ".join(primary_key)
+    else:
+        # For single keys, return as-is
+        return primary_key
+
+def validate_primary_key_config(primary_key: Union[str, List[str]]) -> bool:
+    """Validate primary key configuration."""
+    if isinstance(primary_key, str):
+        return bool(primary_key.strip())
+    elif isinstance(primary_key, list):
+        return (len(primary_key) > 0 and 
+                all(isinstance(key, str) and bool(key.strip()) for key in primary_key))
+    else:
+        return False
+```
+
+#### 5.1.2 Incremental Sync Algorithm
 ```python
 def incremental_sync(table_config):
     # 1. Get last sync timestamp
@@ -205,10 +240,14 @@ def incremental_sync(table_config):
         table_config['modifier']
     )
     
-    # 2. Configure DLT incremental source
+    # 2. Configure DLT incremental source with primary key formatting
     source = sql_database(engine_source).with_resources(table_config['table'])
+    
+    # Format primary key for DLT (handles both single and composite keys)
+    formatted_primary_key = format_primary_key(table_config['primary_key'])
+    
     getattr(source, table_config['table']).apply_hints(
-        primary_key=table_config['primary_key'],
+        primary_key=formatted_primary_key,
         incremental=dlt.sources.incremental(
             table_config['modifier'],
             initial_value=max_timestamp
@@ -348,8 +387,21 @@ POOL_RECYCLE=3600           # Connection refresh interval (seconds)
         "description": "Table name to sync"
       },
       "primary_key": {
-        "type": "string",
-        "description": "Primary key column for deduplication"
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "Single primary key column for deduplication"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Array of columns forming a composite primary key"
+          }
+        ],
+        "description": "Primary key configuration - can be single column or array of columns"
       },
       "modifier": {
         "type": "string",
