@@ -379,8 +379,8 @@ def ensure_dlt_columns(engine_target, table_name):
         
         if alter_statements:
             alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
-                log(f"Altering table {table_name}: {alter_query}")
-                connection.execute(sa.text(alter_query))
+            log(f"Altering table {table_name}: {alter_query}")
+            connection.execute(sa.text(alter_query))
             return True
         return False
     
@@ -412,8 +412,8 @@ def sync_table_schema(engine_source, engine_target, table_name):
         
         if alter_statements:
             alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
-                log(f"Syncing schema for {table_name}: {alter_query}")
-                connection.execute(sa.text(alter_query))
+            log(f"Syncing schema for {table_name}: {alter_query}")
+            connection.execute(sa.text(alter_query))
             return True
         return False
     
