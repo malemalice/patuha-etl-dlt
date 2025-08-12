@@ -1638,15 +1638,35 @@ def load_select_tables_from_database() -> None:
             batch_tables = all_tables[i:i + BATCH_SIZE]
             log(f"Ensuring DLT columns for batch: {batch_tables}")
             for table in batch_tables:
-                ensure_dlt_columns(engine_target, table)
-                sync_table_schema(engine_source, engine_target, table)
-                
-                # Optimize incremental tables for merge operations
-                if table in incremental_tables:
-                    config = incremental_tables[table]
-                    primary_keys = config.get('primary_key', 'id').split(',')
-                    log(f"🔧 Optimizing incremental table {table} for merge operations")
-                    optimize_incremental_merge(engine_target, table, primary_keys)
+                try:
+                    log(f"Processing table: {table}")
+                    log(f"Table config: {table_configs.get(table, {})}")
+                    
+                    ensure_dlt_columns(engine_target, table)
+                    sync_table_schema(engine_source, engine_target, table)
+                    
+                    # Optimize incremental tables for merge operations
+                    if table in incremental_tables:
+                        config = incremental_tables[table]
+                        # Handle both string and list formats for primary keys
+                        primary_key_config = config.get('primary_key', 'id')
+                        if isinstance(primary_key_config, str):
+                            primary_keys = primary_key_config.split(',')
+                        else:
+                            primary_keys = primary_key_config if isinstance(primary_key_config, list) else ['id']
+                        
+                        log(f"🔧 Optimizing incremental table {table} for merge operations")
+                        log(f"   Primary keys: {primary_keys}")
+                        optimize_incremental_merge(engine_target, table, primary_keys)
+                    
+                    log(f"✅ Completed processing for table: {table}")
+                    
+                except Exception as table_error:
+                    log(f"❌ Error processing table {table}: {table_error}")
+                    log(f"   Error type: {type(table_error).__name__}")
+                    log(f"   Table config: {table_configs.get(table, {})}")
+                    # Continue with next table rather than failing completely
+                    continue
                 
 
                 
@@ -2086,7 +2106,6 @@ def optimize_incremental_merge(engine_target, table_name, primary_keys):
                 "SET SESSION join_buffer_size = 8388608",  # 8MB
                 "SET SESSION sort_buffer_size = 2097152",  # 2MB
                 "SET SESSION read_buffer_size = 1048576",  # 1MB
-                "SET SESSION max_allowed_packet = 67108864",  # 64MB
                 "SET SESSION net_read_timeout = 600",  # 10 minutes
                 "SET SESSION net_write_timeout = 600",  # 10 minutes
                 "SET SESSION innodb_lock_wait_timeout = 120",
@@ -2167,7 +2186,7 @@ def create_merge_optimized_pipeline(engine_target, pipeline_name):
                 normalize_column_name=False,
                 # Add merge-specific optimizations
                 merge_strategy="merge_using_primary_key",  # Use primary key for merge
-                merge_key_columns=lambda table: table_configs.get(table, {}).get('primary_key', 'id').split(','),
+                merge_key_columns=lambda table: table_configs.get(table, {}).get('primary_key', 'id').split(',') if isinstance(table_configs.get(table, {}).get('primary_key', 'id'), str) else table_configs.get(table, {}).get('primary_key', ['id']),
                 # Optimize for large datasets using configuration
                 batch_size=MERGE_BATCH_SIZE,  # Use configured batch size
                 max_batch_size=MERGE_MAX_BATCH_SIZE  # Use configured max batch size
