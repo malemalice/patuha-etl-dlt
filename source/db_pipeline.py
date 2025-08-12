@@ -58,6 +58,12 @@ LOCK_TIMEOUT_JITTER = float(os.getenv("LOCK_TIMEOUT_JITTER", "0.1"))  # Jitter f
 TRANSACTION_TIMEOUT = int(os.getenv("TRANSACTION_TIMEOUT", "300"))  # Transaction timeout in seconds
 MAX_CONCURRENT_TRANSACTIONS = int(os.getenv("MAX_CONCURRENT_TRANSACTIONS", "3"))  # Max concurrent transactions
 
+# Incremental merge optimization configuration
+MERGE_BATCH_SIZE = int(os.getenv("MERGE_BATCH_SIZE", "1000"))  # Batch size for merge operations
+MERGE_MAX_BATCH_SIZE = int(os.getenv("MERGE_MAX_BATCH_SIZE", "5000"))  # Max batch size for merge operations
+MERGE_OPTIMIZATION_ENABLED = os.getenv("MERGE_OPTIMIZATION_ENABLED", "true").lower() == "true"  # Enable merge optimizations
+CONNECTION_LOSS_RETRIES = int(os.getenv("CONNECTION_LOSS_RETRIES", "3"))  # Max retries for connection loss
+
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
@@ -1570,17 +1576,30 @@ def load_select_tables_from_database() -> None:
         engine_source = ENGINE_SOURCE
         engine_target = ENGINE_TARGET
         
-        # Start periodic connection monitoring
-        log(f"🔄 Starting periodic connection monitoring...")
-        periodic_connection_monitoring(engine_target, interval_seconds=120)
+        # Log configuration values being used
+        log(f"🔧 Pipeline Configuration:")
+        log(f"   Lock Timeout Retries: {LOCK_TIMEOUT_RETRIES}")
+        log(f"   Lock Timeout Base Delay: {LOCK_TIMEOUT_BASE_DELAY}s")
+        log(f"   Lock Timeout Max Delay: {LOCK_TIMEOUT_MAX_DELAY}s")
+        log(f"   Lock Timeout Jitter: {LOCK_TIMEOUT_JITTER}")
+        log(f"   Transaction Timeout: {TRANSACTION_TIMEOUT}s")
+        log(f"   Max Concurrent Transactions: {MAX_CONCURRENT_TRANSACTIONS}")
+        log(f"   Merge Batch Size: {MERGE_BATCH_SIZE}")
+        log(f"   Merge Max Batch Size: {MERGE_MAX_BATCH_SIZE}")
+        log(f"   Merge Optimization Enabled: {MERGE_OPTIMIZATION_ENABLED}")
+        log(f"   Connection Loss Retries: {CONNECTION_LOSS_RETRIES}")
         
         # Log connection pool status
         log(f"Source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
         log(f"Target pool status - Size: {engine_target.pool.size()}, Checked out: {engine_target.pool.checkedout()}")
         
+        # Start periodic connection monitoring
+        log(f"🔄 Starting periodic connection monitoring...")
+        periodic_connection_monitoring(engine_target, interval_seconds=120)
+        
         # Use a single pipeline instance with state corruption handling
         pipeline_name = "dlt_unified_pipeline_v1_0_18"
-        pipeline = create_fresh_pipeline(engine_target, pipeline_name)
+        pipeline = create_merge_optimized_pipeline(engine_target, pipeline_name)
         
         # Configure DLT to handle both strict and unrestricted MySQL modes automatically
         try:
@@ -1621,6 +1640,13 @@ def load_select_tables_from_database() -> None:
             for table in batch_tables:
                 ensure_dlt_columns(engine_target, table)
                 sync_table_schema(engine_source, engine_target, table)
+                
+                # Optimize incremental tables for merge operations
+                if table in incremental_tables:
+                    config = incremental_tables[table]
+                    primary_keys = config.get('primary_key', 'id').split(',')
+                    log(f"🔧 Optimizing incremental table {table} for merge operations")
+                    optimize_incremental_merge(engine_target, table, primary_keys)
                 
 
                 
@@ -2025,6 +2051,240 @@ def manual_dlt_state_cleanup():
     except Exception as cleanup_error:
         log(f"❌ Manual DLT state cleanup failed: {cleanup_error}")
         raise
+
+def optimize_incremental_merge(engine_target, table_name, primary_keys):
+    """Optimize table for incremental merge operations to prevent connection timeouts.
+    
+    Args:
+        engine_target: Target database engine
+        table_name: Name of the table to optimize
+        primary_keys: List of primary key columns
+    
+    Returns:
+        bool: True if optimization was successful
+    """
+    # Check if merge optimization is enabled
+    if not MERGE_OPTIMIZATION_ENABLED:
+        log(f"ℹ️  Merge optimization disabled for {table_name} (MERGE_OPTIMIZATION_ENABLED=false)")
+        return True
+    
+    def _optimize_table(connection):
+        try:
+            log(f"🔧 Optimizing table {table_name} for incremental merge operations...")
+            
+            # Add database hints to optimize DELETE operations
+            # These help MySQL choose better execution plans for complex DELETE with EXISTS
+            
+            # 1. Analyze table to update statistics
+            connection.execute(sa.text(f"ANALYZE TABLE {table_name}"))
+            log(f"✅ Table statistics updated for {table_name}")
+            
+            # 2. Add hints for better DELETE performance
+            # Set session variables that help with large DELETE operations
+            optimization_queries = [
+                "SET SESSION sql_buffer_result = ON",
+                "SET SESSION join_buffer_size = 8388608",  # 8MB
+                "SET SESSION sort_buffer_size = 2097152",  # 2MB
+                "SET SESSION read_buffer_size = 1048576",  # 1MB
+                "SET SESSION max_allowed_packet = 67108864",  # 64MB
+                "SET SESSION net_read_timeout = 600",  # 10 minutes
+                "SET SESSION net_write_timeout = 600",  # 10 minutes
+                "SET SESSION innodb_lock_wait_timeout = 120",
+                "SET SESSION lock_wait_timeout = 120"
+            ]
+            
+            for query in optimization_queries:
+                try:
+                    connection.execute(sa.text(query))
+                except Exception as opt_error:
+                    log(f"⚠️  Could not set optimization: {query} - {opt_error}")
+            
+            log(f"✅ Session optimizations applied for {table_name}")
+            
+            # 3. Check if indexes exist on primary keys for better DELETE performance
+            inspector = sa.inspect(engine_target)
+            indexes = inspector.get_indexes(table_name)
+            
+            primary_key_set = set(primary_keys)
+            existing_indexes = set()
+            
+            for index in indexes:
+                if index.get('unique', False) or index.get('primary_key', False):
+                    existing_indexes.update(index['column_names'])
+            
+            # Log index status
+            missing_indexes = primary_key_set - existing_indexes
+            if missing_indexes:
+                log(f"⚠️  Missing indexes on primary keys: {missing_indexes}")
+                log(f"   This may cause slow DELETE operations during incremental merge")
+            else:
+                log(f"✅ All primary keys have proper indexes: {primary_keys}")
+            
+            # 4. Set table-specific optimizations
+            table_optimizations = [
+                f"SET SESSION innodb_lock_wait_timeout = 120",
+                f"SET SESSION lock_wait_timeout = 120"
+            ]
+            
+            for query in table_optimizations:
+                try:
+                    connection.execute(sa.text(query))
+                except Exception as table_opt_error:
+                    log(f"⚠️  Could not set table optimization: {query} - {table_opt_error}")
+            
+            log(f"✅ Table {table_name} optimized for incremental merge operations")
+            return True
+            
+        except Exception as optimization_error:
+            log(f"❌ Failed to optimize table {table_name}: {optimization_error}")
+            return False
+    
+    return execute_with_transaction_management(
+        engine_target,
+        f"optimize_incremental_merge for {table_name}",
+        _optimize_table
+    )
+
+def create_merge_optimized_pipeline(engine_target, pipeline_name):
+    """Create a DLT pipeline with optimizations for incremental merge operations."""
+    try:
+        log(f"Creating merge-optimized DLT pipeline: {pipeline_name}")
+        
+        # First, clean up any corrupted state
+        state_was_corrupted = cleanup_corrupted_dlt_state(engine_target, pipeline_name)
+        
+        if state_was_corrupted:
+            log(f"Corrupted state was cleaned up, creating fresh pipeline")
+        
+        # Create destination with merge optimizations
+        if PRESERVE_COLUMN_NAMES:
+            log(f"🔧 Configuring DLT destination with merge optimizations and column name preservation")
+            
+            destination = dlt.destinations.sqlalchemy(
+                engine_target,
+                table_name=lambda table: table,
+                column_name=lambda column: column,
+                normalize_column_name=False,
+                # Add merge-specific optimizations
+                merge_strategy="merge_using_primary_key",  # Use primary key for merge
+                merge_key_columns=lambda table: table_configs.get(table, {}).get('primary_key', 'id').split(','),
+                # Optimize for large datasets using configuration
+                batch_size=MERGE_BATCH_SIZE,  # Use configured batch size
+                max_batch_size=MERGE_MAX_BATCH_SIZE  # Use configured max batch size
+            )
+            
+            log(f"   ✅ Merge-optimized destination created with batch_size={MERGE_BATCH_SIZE}, max_batch_size={MERGE_MAX_BATCH_SIZE}")
+        else:
+            log(f"⚠️  Using default DLT destination configuration with merge optimizations")
+            destination = dlt.destinations.sqlalchemy(
+                engine_target,
+                merge_strategy="merge_using_primary_key",
+                batch_size=MERGE_BATCH_SIZE,
+                max_batch_size=MERGE_MAX_BATCH_SIZE
+            )
+        
+        # Create the pipeline with merge optimizations
+        pipeline = dlt.pipeline(
+            pipeline_name=pipeline_name,
+            destination=destination,
+            dataset_name=TARGET_DB_NAME,
+            dev_mode=False,
+            # Add pipeline-level optimizations
+            progress="log",  # Log progress for better monitoring
+            # Optimize for incremental operations
+            incremental_key=lambda table: table_configs.get(table, {}).get('modifier', 'updated_at')
+        )
+        
+        log(f"✅ Merge-optimized pipeline created successfully: {pipeline_name}")
+        return pipeline
+        
+    except Exception as pipeline_error:
+        log(f"Error creating merge-optimized pipeline: {pipeline_error}")
+        # Fall back to regular pipeline creation
+        return create_fresh_pipeline(engine_target, pipeline_name)
+
+def retry_on_connection_loss(func, db_type="unknown", operation_name="operation", *args, **kwargs):
+    """Enhanced retry function specifically for connection loss errors (2013) with exponential backoff.
+    
+    Args:
+        func: Function to retry
+        db_type: Type of database ('source' or 'target') for better error logging
+        operation_name: Name of the operation being retried for better logging
+        *args, **kwargs: Arguments to pass to the function
+    """
+    global ENGINE_SOURCE, ENGINE_TARGET
+    
+    for attempt in range(CONNECTION_LOSS_RETRIES + 1):  # Use configured retry count
+        try:
+            return func(*args, **kwargs)
+        except sa.exc.OperationalError as e:
+            error_str = str(e).lower()
+            
+            # Check for connection loss errors
+            if any(keyword in error_str for keyword in [
+                'lost connection to server during query',
+                '2013',
+                'server has gone away',
+                '2006',
+                'connection was killed',
+                'connection timeout'
+            ]):
+                if attempt < CONNECTION_LOSS_RETRIES:
+                    # Calculate delay with exponential backoff
+                    delay = 5 * (2 ** attempt)  # 5s, 10s, 20s
+                    
+                    log(f"🔌 Connection lost on {db_type} during {operation_name} (attempt {attempt + 1}/{CONNECTION_LOSS_RETRIES + 1})")
+                    log(f"   Error: {e}")
+                    log(f"   Waiting {delay}s before retry...")
+                    
+                    time.sleep(delay)
+                    
+                    # Reset the specific connection that failed
+                    try:
+                        if db_type == "source" and ENGINE_SOURCE:
+                            ENGINE_SOURCE.dispose()
+                            ENGINE_SOURCE, _ = create_engines()
+                        elif db_type == "target" and ENGINE_TARGET:
+                            _, ENGINE_TARGET = create_engines()
+                        elif db_type == "source+target":
+                            ENGINE_SOURCE.dispose()
+                            ENGINE_TARGET.dispose()
+                            ENGINE_SOURCE, ENGINE_TARGET = create_engines()
+                    except Exception as reset_error:
+                        log(f"Warning: Could not reset {db_type} connection: {reset_error}")
+                    
+                    continue
+                else:
+                    log(f"❌ Max connection loss retries reached for {operation_name} on {db_type} database")
+                    log(f"   Final error: {e}")
+                    raise
+            else:
+                # Re-raise non-connection loss errors immediately
+                log(f"Non-connection loss error occurred on {db_type} database: {e}")
+                raise
+        except Exception as e:
+            log(f"Non-connection loss error occurred on {db_type} database: {e}")
+            raise
+
+def execute_with_connection_loss_handling(engine, operation_name, operation_func, *args, **kwargs):
+    """Execute database operations with connection loss handling for long-running operations.
+    
+    Args:
+        engine: SQLAlchemy engine to use
+        operation_name: Name of the operation for logging
+        operation_func: Function to execute within transaction
+        *args, **kwargs: Arguments to pass to the operation function
+    """
+    # Use retry logic specifically for connection loss
+    return retry_on_connection_loss(
+        _execute_transaction,
+        "target" if engine == ENGINE_TARGET else "source",
+        operation_name,
+        engine,
+        operation_func,
+        *args,
+        **kwargs
+    )
 
 if __name__ == "__main__":
     import sys
