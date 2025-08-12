@@ -2577,35 +2577,54 @@ class IsolatedStagingDestination:
         self.staging_schema_name = staging_schema_name
         self.preserve_column_names = preserve_column_names
         
-        # Create the base destination
-        if preserve_column_names:
-            self.base_destination = dlt.destinations.sqlalchemy(
-                engine_target,
-                column_name=lambda column: column,
-                normalize_column_name=False,
-                # Override staging schema
-                staging_schema=staging_schema_name,
-                # Optimize for large datasets
-                batch_size=MERGE_BATCH_SIZE,
-                max_batch_size=MERGE_MAX_BATCH_SIZE
-            )
-        else:
-            self.base_destination = dlt.destinations.sqlalchemy(
-                engine_target,
-                staging_schema=staging_schema_name,
-                batch_size=MERGE_BATCH_SIZE,
-                max_batch_size=MERGE_MAX_BATCH_SIZE
-            )
-        
-        log(f"🔧 Created isolated staging destination using schema: {staging_schema_name}")
+        # Create the base destination with proper error handling
+        try:
+            if preserve_column_names:
+                self.base_destination = dlt.destinations.sqlalchemy(
+                    engine_target,
+                    column_name=lambda column: column,
+                    normalize_column_name=False,
+                    # Override staging schema
+                    staging_schema=staging_schema_name,
+                    # Optimize for large datasets
+                    batch_size=MERGE_BATCH_SIZE,
+                    max_batch_size=MERGE_MAX_BATCH_SIZE
+                )
+            else:
+                self.base_destination = dlt.destinations.sqlalchemy(
+                    engine_target,
+                    staging_schema=staging_schema_name,
+                    batch_size=MERGE_BATCH_SIZE,
+                    max_batch_size=MERGE_MAX_BATCH_SIZE
+                )
+            
+            # Validate the destination was created properly
+            if not hasattr(self.base_destination, 'capabilities'):
+                raise Exception("Base destination missing required capabilities attribute")
+            
+            log(f"🔧 Created isolated staging destination using schema: {staging_schema_name}")
+            log(f"   Destination type: {type(self.base_destination)}")
+            log(f"   Has capabilities: {hasattr(self.base_destination, 'capabilities')}")
+            
+        except Exception as dest_error:
+            log(f"❌ Failed to create base destination: {dest_error}")
+            raise Exception(f"Destination creation failed: {dest_error}")
     
     def __getattr__(self, name):
         """Delegate all other attributes to the base destination."""
+        if not hasattr(self.base_destination, name):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
         return getattr(self.base_destination, name)
     
     def __call__(self, *args, **kwargs):
         """Make the destination callable like the base destination."""
+        if not callable(self.base_destination):
+            raise Exception(f"Base destination is not callable: {type(self.base_destination)}")
         return self.base_destination(*args, **kwargs)
+    
+    def __repr__(self):
+        """Provide a clear representation of the destination."""
+        return f"IsolatedStagingDestination(schema={self.staging_schema_name}, base={type(self.base_destination)})"
 
 def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schema_name):
     """Create a DLT pipeline with isolated staging to prevent lock conflicts.
@@ -2629,13 +2648,21 @@ def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schem
             log(f"Corrupted state was cleaned up, creating fresh pipeline")
         
         # Create destination with isolated staging
+        log(f"🔧 Creating isolated staging destination...")
         destination = IsolatedStagingDestination(
             engine_target, 
             staging_schema_name, 
             preserve_column_names=PRESERVE_COLUMN_NAMES
         )
         
+        # Validate destination was created properly
+        if not destination or not hasattr(destination, 'base_destination'):
+            raise Exception("Failed to create valid isolated staging destination")
+        
+        log(f"✅ Isolated staging destination created successfully")
+        
         # Create the pipeline with isolated staging
+        log(f"🔧 Creating DLT pipeline with isolated staging...")
         pipeline = dlt.pipeline(
             pipeline_name=pipeline_name,
             destination=destination,
@@ -2645,15 +2672,57 @@ def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schem
             progress="log"  # Log progress for better monitoring
         )
         
+        # Validate pipeline was created
+        if not pipeline:
+            raise Exception("Failed to create DLT pipeline")
+        
         log(f"✅ Isolated staging pipeline created successfully: {pipeline_name}")
         log(f"   Staging schema: {staging_schema_name}")
+        log(f"   Pipeline type: {type(pipeline)}")
+        
+        # Verify that the pipeline is actually using our isolated staging
+        log(f"🔍 Verifying pipeline configuration...")
+        if hasattr(pipeline, 'destination') and hasattr(pipeline.destination, 'staging_schema_name'):
+            actual_staging = pipeline.destination.staging_schema_name
+            if actual_staging == staging_schema_name:
+                log(f"✅ Pipeline confirmed using isolated staging schema: {actual_staging}")
+            else:
+                log(f"⚠️  Pipeline staging schema mismatch - Expected: {staging_schema_name}, Got: {actual_staging}")
+        else:
+            log(f"⚠️  Could not verify pipeline staging schema configuration")
+        
+        # Enforce staging isolation to prevent any fallback to default staging
+        log(f"🔒 Enforcing staging isolation...")
+        if not enforce_staging_isolation(pipeline, staging_schema_name):
+            log(f"❌ CRITICAL: Failed to enforce staging isolation!")
+            log(f"❌ Pipeline will not use isolated staging - this will cause lock timeouts!")
+            raise Exception("Staging isolation enforcement failed - cannot proceed without isolation")
+        
+        log(f"✅ Staging isolation successfully enforced for pipeline: {pipeline_name}")
         return pipeline
         
     except Exception as pipeline_error:
-        log(f"Error creating isolated staging pipeline: {pipeline_error}")
-        log(f"Falling back to regular pipeline creation...")
-        # Fall back to regular pipeline creation
-        return create_fresh_pipeline(engine_target, pipeline_name)
+        log(f"❌ Error creating isolated staging pipeline: {pipeline_error}")
+        log(f"❌ CRITICAL: Cannot fall back to regular pipeline - this would break staging isolation!")
+        log(f"❌ Pipeline creation must succeed with isolated staging to prevent lock timeouts!")
+        
+        # Instead of falling back, try to diagnose and fix the issue
+        log(f"🔍 Diagnosing isolated staging pipeline creation failure...")
+        
+        # Check if staging schema exists
+        try:
+            with engine_target.connect() as connection:
+                schema_check = f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '{staging_schema_name}'"
+                result = connection.execute(sa.text(schema_check))
+                if result.fetchone():
+                    log(f"✅ Staging schema exists: {staging_schema_name}")
+                else:
+                    log(f"❌ Staging schema does not exist: {staging_schema_name}")
+        except Exception as check_error:
+            log(f"⚠️  Could not check staging schema: {check_error}")
+        
+        # Re-raise the error to prevent fallback
+        raise Exception(f"Isolated staging pipeline creation failed - cannot proceed without isolation: {pipeline_error}")
 
 def verify_staging_schema_usage(engine_target, expected_staging_schema):
     """Verify that DLT is actually using our isolated staging schema.
@@ -2720,6 +2789,105 @@ def periodic_staging_verification(engine_target, expected_staging_schema, operat
             log(f"❌ Staging isolation broken for {operation_name} - this may cause lock timeouts!")
     except Exception as verify_error:
         log(f"⚠️  Could not verify staging schema usage for {operation_name}: {verify_error}")
+
+def validate_dlt_staging_usage(pipeline, expected_staging_schema):
+    """Validate that DLT is actually using our isolated staging schema during pipeline execution.
+    
+    Args:
+        pipeline: The DLT pipeline to validate
+        expected_staging_schema: The staging schema we expect DLT to use
+    
+    Returns:
+        bool: True if DLT is using our isolated staging schema
+    """
+    try:
+        log(f"🔍 Validating DLT staging schema usage for pipeline: {pipeline.pipeline_name}")
+        
+        # Check pipeline destination configuration
+        if not hasattr(pipeline, 'destination'):
+            log(f"❌ Pipeline has no destination attribute")
+            return False
+        
+        destination = pipeline.destination
+        
+        # Check if destination has staging schema information
+        if hasattr(destination, 'staging_schema_name'):
+            actual_staging = destination.staging_schema_name
+            log(f"   Destination staging schema: {actual_staging}")
+            
+            if actual_staging == expected_staging_schema:
+                log(f"✅ Pipeline destination correctly configured with isolated staging")
+                return True
+            else:
+                log(f"❌ Pipeline destination staging schema mismatch")
+                log(f"   Expected: {expected_staging_schema}")
+                log(f"   Actual: {actual_staging}")
+                return False
+        else:
+            log(f"⚠️  Pipeline destination has no staging_schema_name attribute")
+            log(f"   Destination type: {type(destination)}")
+            log(f"   Destination attributes: {dir(destination)}")
+            
+            # Try to check if it's our custom destination
+            if hasattr(destination, 'base_destination'):
+                log(f"   Base destination type: {type(destination.base_destination)}")
+                if hasattr(destination.base_destination, 'staging_schema'):
+                    base_staging = destination.base_destination.staging_schema
+                    log(f"   Base destination staging schema: {base_staging}")
+                    return base_staging == expected_staging_schema
+            
+            return False
+            
+    except Exception as validation_error:
+        log(f"❌ Error validating DLT staging usage: {validation_error}")
+        return False
+
+def enforce_staging_isolation(pipeline, expected_staging_schema):
+    """Enforce that DLT uses our isolated staging schema and prevent fallback to default staging.
+    
+    Args:
+        pipeline: The DLT pipeline to enforce isolation on
+        expected_staging_schema: The staging schema that must be used
+    
+    Returns:
+        bool: True if isolation is enforced and working
+    """
+    try:
+        log(f"🔒 Enforcing staging isolation for pipeline: {pipeline.pipeline_name}")
+        
+        # Validate current staging usage
+        if not validate_dlt_staging_usage(pipeline, expected_staging_schema):
+            log(f"❌ CRITICAL: Pipeline is not using isolated staging schema!")
+            log(f"❌ This will cause lock timeouts and defeat the isolation strategy!")
+            
+            # Try to force the staging schema
+            if hasattr(pipeline, 'destination') and hasattr(pipeline.destination, 'base_destination'):
+                try:
+                    # Force the staging schema on the base destination
+                    pipeline.destination.base_destination.staging_schema = expected_staging_schema
+                    log(f"🔧 Attempted to force staging schema on base destination")
+                    
+                    # Re-validate
+                    if validate_dlt_staging_usage(pipeline, expected_staging_schema):
+                        log(f"✅ Successfully enforced staging isolation")
+                        return True
+                    else:
+                        log(f"❌ Failed to enforce staging isolation after forcing schema")
+                        return False
+                        
+                except Exception as force_error:
+                    log(f"❌ Could not force staging schema: {force_error}")
+                    return False
+            else:
+                log(f"❌ Cannot enforce staging isolation - pipeline structure not compatible")
+                return False
+        
+        log(f"✅ Staging isolation is properly enforced")
+        return True
+        
+    except Exception as enforce_error:
+        log(f"❌ Error enforcing staging isolation: {enforce_error}")
+        return False
 
 if __name__ == "__main__":
     import sys
