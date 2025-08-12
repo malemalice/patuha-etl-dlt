@@ -64,6 +64,11 @@ MERGE_MAX_BATCH_SIZE = int(os.getenv("MERGE_MAX_BATCH_SIZE", "5000"))  # Max bat
 MERGE_OPTIMIZATION_ENABLED = os.getenv("MERGE_OPTIMIZATION_ENABLED", "true").lower() == "true"  # Enable merge optimizations
 CONNECTION_LOSS_RETRIES = int(os.getenv("CONNECTION_LOSS_RETRIES", "3"))  # Max retries for connection loss
 
+# Staging table isolation configuration
+STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower() == "true"  # Enable staging table isolation
+STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", f"dlt_staging_{datetime.now().strftime('%Y%m%d_%H%M%S')}")  # Dynamic base prefix for staging schemas
+STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
+
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
@@ -1588,6 +1593,9 @@ def load_select_tables_from_database() -> None:
         log(f"   Merge Max Batch Size: {MERGE_MAX_BATCH_SIZE}")
         log(f"   Merge Optimization Enabled: {MERGE_OPTIMIZATION_ENABLED}")
         log(f"   Connection Loss Retries: {CONNECTION_LOSS_RETRIES}")
+        log(f"   Staging Isolation Enabled: {STAGING_ISOLATION_ENABLED}")
+        log(f"   Staging Schema Prefix: {STAGING_SCHEMA_PREFIX}")
+        log(f"   Staging Retention Hours: {STAGING_SCHEMA_RETENTION_HOURS}")
         
         # Log connection pool status
         log(f"Source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
@@ -1597,9 +1605,51 @@ def load_select_tables_from_database() -> None:
         log(f"🔄 Starting periodic connection monitoring...")
         periodic_connection_monitoring(engine_target, interval_seconds=120)
         
+        # Staging schema management
+        if STAGING_ISOLATION_ENABLED:
+            log(f"🔧 Staging isolation is ENABLED - creating unique staging schema...")
+            
+            # Clean up old staging schemas first
+            try:
+                cleaned_count = cleanup_old_staging_schemas(
+                    engine_target, 
+                    STAGING_SCHEMA_PREFIX, 
+                    STAGING_SCHEMA_RETENTION_HOURS
+                )
+                log(f"🧹 Cleaned up {cleaned_count} old staging schemas")
+            except Exception as cleanup_error:
+                log(f"⚠️  Failed to clean up old staging schemas: {cleanup_error}")
+                log(f"   Continuing with pipeline execution...")
+            
+            # Create unique staging schema for this run
+            try:
+                staging_schema_name = create_unique_staging_schema(engine_target, STAGING_SCHEMA_PREFIX)
+                log(f"✅ Created unique staging schema: {staging_schema_name}")
+                
+                # Show current staging schema status
+                try:
+                    status = get_staging_schema_status(engine_target, STAGING_SCHEMA_PREFIX)
+                    log(f"📊 Current staging schemas: {status['total_schemas']} total")
+                    for schema in status['schemas'][:3]:  # Show first 3
+                        log(f"   - {schema['name']}: {schema['table_count']} tables, {schema['total_rows']} rows, age: {schema['age_hours']}h")
+                except Exception as status_error:
+                    log(f"⚠️  Could not get staging schema status: {status_error}")
+                
+            except Exception as schema_error:
+                log(f"❌ Failed to create unique staging schema: {schema_error}")
+                log(f"   Falling back to default staging behavior...")
+                staging_schema_name = None
+        else:
+            log(f"ℹ️  Staging isolation is DISABLED - using default staging behavior")
+            staging_schema_name = None
+        
         # Use a single pipeline instance with state corruption handling
         pipeline_name = "dlt_unified_pipeline_v1_0_18"
-        pipeline = create_merge_optimized_pipeline(engine_target, pipeline_name)
+        
+        if staging_schema_name and STAGING_ISOLATION_ENABLED:
+            pipeline = create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schema_name)
+        else:
+            pipeline = create_merge_optimized_pipeline(engine_target, pipeline_name)
         
         # Configure DLT to handle both strict and unrestricted MySQL modes automatically
         try:
@@ -1720,8 +1770,46 @@ def load_select_tables_from_database() -> None:
         # Log final connection pool status
         log(f"Final source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
         log(f"Final target pool status - Size: {engine_target.pool.size()}, Checked out: {engine_target.pool.checkedout()}")
+        
+        # Clean up staging schema after successful completion
+        if staging_schema_name and STAGING_ISOLATION_ENABLED:
+            try:
+                log(f"🧹 Cleaning up staging schema after successful completion: {staging_schema_name}")
+                cleanup_staging_schema_after_completion(engine_target, staging_schema_name)
+                log(f"✅ Staging schema cleanup completed")
+            except Exception as final_cleanup_error:
+                log(f"⚠️  Failed to clean up staging schema after completion: {final_cleanup_error}")
+                log(f"   Schema {staging_schema_name} will be cleaned up in next run")
 
     return retry_on_connection_error(_load_tables, "source+target (main data loading)")
+
+def cleanup_staging_schema_after_completion(engine_target, staging_schema_name):
+    """Clean up the staging schema after successful pipeline completion.
+    
+    Args:
+        engine_target: Target database engine
+        staging_schema_name: Name of the staging schema to clean up
+    """
+    def _cleanup_schema(connection):
+        log(f"🗑️  Dropping completed staging schema: {staging_schema_name}")
+        
+        # Drop the schema and all its tables
+        drop_schema_query = f"DROP SCHEMA IF EXISTS `{staging_schema_name}`"
+        connection.execute(sa.text(drop_schema_query))
+        
+        # Verify schema was dropped
+        verify_query = f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '{staging_schema_name}'"
+        result = connection.execute(sa.text(verify_query))
+        if not result.fetchone():
+            log(f"✅ Staging schema {staging_schema_name} successfully cleaned up")
+        else:
+            log(f"⚠️  Staging schema {staging_schema_name} may not have been fully cleaned up")
+    
+    return execute_with_transaction_management(
+        engine_target,
+        f"cleanup_staging_schema_after_completion for {staging_schema_name}",
+        _cleanup_schema
+    )
 
 def cleanup_corrupted_dlt_state(engine_target, pipeline_name):
     """Clean up corrupted DLT pipeline state tables."""
@@ -2304,6 +2392,275 @@ def execute_with_connection_loss_handling(engine, operation_name, operation_func
         *args,
         **kwargs
     )
+
+def create_unique_staging_schema(engine_target, base_prefix="zains_rz_staging"):
+    """Create a unique staging schema for this pipeline run to prevent lock conflicts.
+    
+    Args:
+        engine_target: Target database engine
+        base_prefix: Base prefix for staging schema names
+    
+    Returns:
+        str: The unique staging schema name created
+    """
+    def _create_schema(connection):
+        # Generate unique schema name with timestamp and random suffix
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        import uuid
+        random_suffix = uuid.uuid4().hex[:6]
+        schema_name = f"{base_prefix}_{timestamp}_{random_suffix}"
+        
+        log(f"🔧 Creating unique staging schema: {schema_name}")
+        
+        # Create the schema
+        create_schema_query = f"CREATE SCHEMA IF NOT EXISTS `{schema_name}`"
+        connection.execute(sa.text(create_schema_query))
+        
+        # Verify schema was created
+        verify_query = f"SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '{schema_name}'"
+        result = connection.execute(sa.text(verify_query))
+        if result.fetchone():
+            log(f"✅ Staging schema created successfully: {schema_name}")
+            return schema_name
+        else:
+            raise Exception(f"Failed to create staging schema: {schema_name}")
+    
+    return execute_with_transaction_management(
+        engine_target,
+        "create_unique_staging_schema",
+        _create_schema,
+        base_prefix
+    )
+
+def cleanup_old_staging_schemas(engine_target, base_prefix="zains_rz_staging", retention_hours=24):
+    """Clean up old staging schemas to prevent database clutter.
+    
+    Args:
+        engine_target: Target database engine
+        base_prefix: Base prefix for staging schema names
+        retention_hours: How many hours to keep staging schemas
+    
+    Returns:
+        int: Number of schemas cleaned up
+    """
+    def _cleanup_schemas(connection):
+        log(f"🧹 Cleaning up old staging schemas older than {retention_hours} hours...")
+        
+        # Find all staging schemas
+        find_schemas_query = f"""
+        SELECT SCHEMA_NAME 
+        FROM INFORMATION_SCHEMA.SCHEMATA 
+        WHERE SCHEMA_NAME LIKE '{base_prefix}_%'
+        """
+        result = connection.execute(sa.text(find_schemas_query))
+        staging_schemas = [row[0] for row in result.fetchall()]
+        
+        if not staging_schemas:
+            log(f"ℹ️  No old staging schemas found to clean up")
+            return 0
+        
+        log(f"Found {len(staging_schemas)} staging schemas to check")
+        
+        cleaned_count = 0
+        current_time = datetime.now()
+        
+        for schema_name in staging_schemas:
+            try:
+                # Extract timestamp from schema name (format: prefix_YYYYMMDD_HHMMSS_random)
+                parts = schema_name.split('_')
+                if len(parts) >= 3:
+                    try:
+                        # Parse timestamp from schema name
+                        date_str = f"{parts[-3]}_{parts[-2]}"  # YYYYMMDD_HHMMSS
+                        schema_time = datetime.strptime(date_str, "%Y%m%d_%H%M%S")
+                        
+                        # Check if schema is old enough to delete
+                        age_hours = (current_time - schema_time).total_seconds() / 3600
+                        
+                        if age_hours > retention_hours:
+                            log(f"🗑️  Dropping old staging schema: {schema_name} (age: {age_hours:.1f} hours)")
+                            
+                            # Drop the schema and all its tables
+                            drop_schema_query = f"DROP SCHEMA IF EXISTS `{schema_name}`"
+                            connection.execute(sa.text(drop_schema_query))
+                            
+                            cleaned_count += 1
+                        else:
+                            log(f"ℹ️  Keeping staging schema: {schema_name} (age: {age_hours:.1f} hours)")
+                    except ValueError:
+                        log(f"⚠️  Could not parse timestamp from schema: {schema_name}")
+                        # If we can't parse the timestamp, assume it's old and delete it
+                        log(f"🗑️  Dropping unparseable staging schema: {schema_name}")
+                        drop_schema_query = f"DROP SCHEMA IF EXISTS `{schema_name}`"
+                        connection.execute(sa.text(drop_schema_query))
+                        cleaned_count += 1
+                else:
+                    log(f"⚠️  Unexpected staging schema format: {schema_name}")
+                    
+            except Exception as cleanup_error:
+                log(f"⚠️  Error cleaning up schema {schema_name}: {cleanup_error}")
+                continue
+        
+        log(f"✅ Cleanup completed: {cleaned_count} staging schemas removed")
+        return cleaned_count
+    
+    return execute_with_transaction_management(
+        engine_target,
+        "cleanup_old_staging_schemas",
+        _cleanup_schema,
+        base_prefix,
+        retention_hours
+    )
+
+def get_staging_schema_status(engine_target, base_prefix="zains_rz_staging"):
+    """Get current status of staging schemas for monitoring.
+    
+    Args:
+        engine_target: Target database engine
+        base_prefix: Base prefix for staging schema names
+    
+    Returns:
+        dict: Status information about staging schemas
+    """
+    def _get_status(connection):
+        # Find all staging schemas
+        find_schemas_query = f"""
+        SELECT SCHEMA_NAME, 
+               COUNT(TABLE_NAME) as table_count,
+               SUM(TABLE_ROWS) as total_rows
+        FROM INFORMATION_SCHEMA.SCHEMATA s
+        LEFT JOIN INFORMATION_SCHEMA.TABLES t ON s.SCHEMA_NAME = t.TABLE_SCHEMA
+        WHERE s.SCHEMA_NAME LIKE '{base_prefix}_%'
+        GROUP BY s.SCHEMA_NAME
+        ORDER BY s.SCHEMA_NAME
+        """
+        
+        result = connection.execute(sa.text(find_schemas_query))
+        schemas = []
+        
+        for row in result.fetchall():
+            schema_name, table_count, total_rows = row
+            table_count = table_count or 0
+            total_rows = total_rows or 0
+            
+            # Extract timestamp for age calculation
+            parts = schema_name.split('_')
+            age_hours = "unknown"
+            if len(parts) >= 3:
+                try:
+                    date_str = f"{parts[-3]}_{parts[-2]}"
+                    schema_time = datetime.strptime(date_str, "%Y%m%d_%H%M%S")
+                    age_hours = f"{((datetime.now() - schema_time).total_seconds() / 3600):.1f}"
+                except ValueError:
+                    age_hours = "unparseable"
+            
+            schemas.append({
+                'name': schema_name,
+                'table_count': table_count,
+                'total_rows': total_rows,
+                'age_hours': age_hours
+            })
+        
+        return {
+            'total_schemas': len(schemas),
+            'schemas': schemas
+        }
+    
+    return execute_with_transaction_management(
+        engine_target,
+        "get_staging_schema_status",
+        _get_status,
+        base_prefix
+    )
+
+class IsolatedStagingDestination:
+    """Custom DLT destination that uses isolated staging schemas to prevent lock conflicts."""
+    
+    def __init__(self, engine_target, staging_schema_name, preserve_column_names=True):
+        self.engine_target = engine_target
+        self.staging_schema_name = staging_schema_name
+        self.preserve_column_names = preserve_column_names
+        
+        # Create the base destination
+        if preserve_column_names:
+            self.base_destination = dlt.destinations.sqlalchemy(
+                engine_target,
+                table_name=lambda table: table,
+                column_name=lambda column: column,
+                normalize_column_name=False,
+                # Override staging schema
+                staging_schema=staging_schema_name,
+                # Optimize for large datasets
+                batch_size=MERGE_BATCH_SIZE,
+                max_batch_size=MERGE_MAX_BATCH_SIZE
+            )
+        else:
+            self.base_destination = dlt.destinations.sqlalchemy(
+                engine_target,
+                staging_schema=staging_schema_name,
+                batch_size=MERGE_BATCH_SIZE,
+                max_batch_size=MERGE_MAX_BATCH_SIZE
+            )
+        
+        log(f"🔧 Created isolated staging destination using schema: {staging_schema_name}")
+    
+    def __getattr__(self, name):
+        """Delegate all other attributes to the base destination."""
+        return getattr(self.base_destination, name)
+    
+    def __call__(self, *args, **kwargs):
+        """Make the destination callable like the base destination."""
+        return self.base_destination(*args, **kwargs)
+
+def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schema_name):
+    """Create a DLT pipeline with isolated staging to prevent lock conflicts.
+    
+    Args:
+        engine_target: Target database engine
+        pipeline_name: Name of the pipeline
+        staging_schema_name: Unique staging schema name to use
+    
+    Returns:
+        dlt.Pipeline: Configured pipeline with isolated staging
+    """
+    try:
+        log(f"Creating isolated staging DLT pipeline: {pipeline_name}")
+        log(f"Using staging schema: {staging_schema_name}")
+        
+        # First, clean up any corrupted state
+        state_was_corrupted = cleanup_corrupted_dlt_state(engine_target, pipeline_name)
+        
+        if state_was_corrupted:
+            log(f"Corrupted state was cleaned up, creating fresh pipeline")
+        
+        # Create destination with isolated staging
+        destination = IsolatedStagingDestination(
+            engine_target, 
+            staging_schema_name, 
+            preserve_column_names=PRESERVE_COLUMN_NAMES
+        )
+        
+        # Create the pipeline with isolated staging
+        pipeline = dlt.pipeline(
+            pipeline_name=pipeline_name,
+            destination=destination,
+            dataset_name=TARGET_DB_NAME,
+            dev_mode=False,
+            # Add pipeline-level optimizations
+            progress="log",  # Log progress for better monitoring
+            # Optimize for incremental operations
+            incremental_key=lambda table: table_configs.get(table, {}).get('modifier', 'updated_at')
+        )
+        
+        log(f"✅ Isolated staging pipeline created successfully: {pipeline_name}")
+        log(f"   Staging schema: {staging_schema_name}")
+        return pipeline
+        
+    except Exception as pipeline_error:
+        log(f"Error creating isolated staging pipeline: {pipeline_error}")
+        log(f"Falling back to regular pipeline creation...")
+        # Fall back to regular pipeline creation
+        return create_fresh_pipeline(engine_target, pipeline_name)
 
 if __name__ == "__main__":
     import sys
