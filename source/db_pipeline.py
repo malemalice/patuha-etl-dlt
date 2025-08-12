@@ -768,6 +768,117 @@ def sanitize_table_data(items):
         else:
             yield item
 
+def force_table_clear(engine_target, table_name):
+    """Force clear a table completely to prevent DLT from generating complex DELETE statements.
+    
+    This function ensures the table is completely empty before DLT processing,
+    preventing DLT from generating expensive EXISTS-based DELETE queries.
+    
+    Args:
+        engine_target: Target database engine
+        table_name: Name of the table to clear
+    
+    Returns:
+        bool: True if clear was successful
+    """
+    def _clear_table(connection):
+        log(f"🧹 Force clearing table {table_name} to prevent complex DELETE operations")
+        
+        # First try TRUNCATE (fastest and safest)
+        try:
+            log(f"Attempting TRUNCATE for {table_name}")
+            connection.execute(sa.text(f"TRUNCATE TABLE {table_name}"))
+            log(f"✅ TRUNCATE successful for {table_name}")
+            return True
+        except Exception as truncate_error:
+            log(f"⚠️  TRUNCATE failed for {table_name}: {truncate_error}")
+            
+            # If TRUNCATE fails, try DROP and CREATE
+            try:
+                log(f"Attempting DROP and CREATE for {table_name}")
+                
+                # Get table structure
+                inspector = sa.inspect(engine_target)
+                columns = inspector.get_columns(table_name)
+                indexes = inspector.get_indexes(table_name)
+                
+                # Build CREATE TABLE statement
+                column_defs = []
+                for col in columns:
+                    col_type = str(col['type'])
+                    nullable = "NULL" if col.get('nullable', True) else "NOT NULL"
+                    default = ""
+                    if col.get('default') is not None:
+                        default = f" DEFAULT {col['default']}"
+                    column_defs.append(f"`{col['name']}` {col_type} {nullable}{default}")
+                
+                # Drop the table
+                connection.execute(sa.text(f"DROP TABLE IF EXISTS {table_name}"))
+                
+                # Recreate the table
+                create_sql = f"CREATE TABLE {table_name} (\n  " + ",\n  ".join(column_defs) + "\n)"
+                connection.execute(sa.text(create_sql))
+                
+                # Recreate indexes
+                for index in indexes:
+                    if not index['unique']:
+                        index_sql = f"CREATE INDEX {index['name']} ON {table_name} ({', '.join(index['column_names'])})"
+                        connection.execute(sa.text(index_sql))
+                    else:
+                        unique_sql = f"CREATE UNIQUE INDEX {index['name']} ON {table_name} ({', '.join(index['column_names'])})"
+                        connection.execute(sa.text(unique_sql))
+                
+                log(f"✅ DROP and CREATE successful for {table_name}")
+                return True
+                
+            except Exception as drop_create_error:
+                log(f"❌ DROP and CREATE also failed for {table_name}: {drop_create_error}")
+                
+                # Last resort: DELETE with batching
+                try:
+                    log(f"Attempting DELETE with batching as last resort for {table_name}")
+                    
+                    # Get row count
+                    count_result = connection.execute(sa.text(f"SELECT COUNT(*) FROM {table_name}"))
+                    total_rows = count_result.scalar()
+                    
+                    if total_rows == 0:
+                        log(f"Table {table_name} is already empty")
+                        return True
+                    
+                    log(f"Table {table_name} has {total_rows} rows, deleting in small batches...")
+                    
+                    # Use very small batches to avoid timeouts
+                    batch_size = 1000
+                    deleted_rows = 0
+                    
+                    while deleted_rows < total_rows:
+                        delete_query = f"DELETE FROM {table_name} LIMIT {batch_size}"
+                        result = connection.execute(sa.text(delete_query))
+                        batch_deleted = result.rowcount
+                        
+                        if batch_deleted == 0:
+                            break
+                        
+                        deleted_rows += batch_deleted
+                        log(f"Deleted {deleted_rows}/{total_rows} rows from {table_name}")
+                        
+                        # Longer delay between batches to reduce pressure
+                        time.sleep(0.5)
+                    
+                    log(f"✅ DELETE cleanup completed for {table_name}: {deleted_rows} rows deleted")
+                    return True
+                    
+                except Exception as delete_error:
+                    log(f"❌ All cleanup methods failed for {table_name}: {delete_error}")
+                    raise
+    
+    return execute_with_transaction_management(
+        engine_target,
+        f"force_table_clear for {table_name}",
+        _clear_table
+    )
+
 def safe_table_cleanup(engine_target, table_name, write_disposition="replace"):
     """Safely clean up table data based on write disposition with lock timeout handling.
     
@@ -881,7 +992,8 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
         for table_name in table_names:
             try:
                 log(f"Pre-cleaning table: {table_name}")
-                safe_table_cleanup(engine_target, table_name, write_disposition)
+                # Use force_table_clear for replace operations to prevent DLT from generating complex DELETE statements
+                force_table_clear(engine_target, table_name)
                 log(f"✅ Pre-cleanup completed for {table_name}")
             except Exception as cleanup_error:
                 log(f"⚠️  Pre-cleanup failed for {table_name}: {cleanup_error}")
@@ -933,6 +1045,59 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
         log(f"Error in batch processing: {error_message}")
         log(f"Error type: {error_type}")
         
+        # Check for connection lost errors specifically
+        if any(keyword in error_message.lower() for keyword in [
+            'lost connection to server during query',
+            '2013',
+            'connection lost',
+            'server has gone away',
+            '2006'
+        ]):
+            log(f"🔌 Connection lost error detected in batch processing!")
+            log(f"This is likely caused by long-running queries or server timeouts.")
+            log(f"Attempting to recover with individual table processing...")
+            
+            # Try processing tables individually to isolate the problem
+            for table_name in table_names:
+                try:
+                    log(f"Attempting individual processing for table: {table_name}")
+                    
+                    # Create single table source
+                    single_source = sql_database(engine_source).with_resources(table_name)
+                    
+                    if write_disposition == "merge" and "modifier" in tables_dict[table_name]:
+                        config = tables_dict[table_name]
+                        max_timestamp = pendulum.instance(get_max_timestamp(engine_target, table_name, config["modifier"])).in_tz("Asia/Bangkok")
+                        getattr(single_source, table_name).apply_hints(
+                            primary_key=config["primary_key"],
+                            incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
+                        )
+                    
+                    # Pre-cleanup for replace operations using force_table_clear
+                    if write_disposition == "replace":
+                        force_table_clear(engine_target, table_name)
+                    
+                    # Process individual table
+                    single_info = pipeline.run(single_source, write_disposition=write_disposition)
+                    log(f"✅ Individual processing successful for {table_name}: {single_info}")
+                    
+                except Exception as individual_error:
+                    individual_error_str = str(individual_error)
+                    log(f"❌ Individual processing failed for {table_name}: {individual_error_str}")
+                    
+                    # Check if it's still a connection error
+                    if any(keyword in individual_error_str.lower() for keyword in [
+                        'lost connection', '2013', 'server has gone away', '2006'
+                    ]):
+                        log(f"🔌 Connection error persists for {table_name}, skipping...")
+                        continue
+                    else:
+                        log(f"Different error for {table_name}, continuing...")
+                        continue
+            
+            log(f"Individual table processing completed")
+            return  # Success with individual processing
+        
         # Check for lock timeout and deadlock errors specifically
         if any(keyword in error_message.lower() for keyword in [
             'lock wait timeout exceeded',
@@ -962,9 +1127,9 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                             incremental=dlt.sources.incremental(config["modifier"], initial_value=max_timestamp)
                         )
                     
-                    # Pre-cleanup for replace operations
+                    # Pre-cleanup for replace operations using force_table_clear
                     if write_disposition == "replace":
-                        safe_table_cleanup(engine_target, table_name, write_disposition)
+                        force_table_clear(engine_target, table_name)
                     
                     # Process individual table
                     single_info = pipeline.run(single_source, write_disposition=write_disposition)
@@ -1248,12 +1413,54 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     # Small delay to let connections settle
     time.sleep(1)
 
+def periodic_connection_monitoring(engine_target, interval_seconds=60):
+    """Periodically monitor and clean up problematic connections and queries.
+    
+    Args:
+        engine_target: Target database engine
+        interval_seconds: How often to perform monitoring
+    """
+    def _monitor():
+        while True:
+            try:
+                log(f"🔍 Performing periodic connection monitoring...")
+                
+                # Monitor and kill long-running queries
+                killed_queries = monitor_and_kill_long_queries(engine_target, timeout_seconds=120)
+                
+                # Check connection pool status
+                pool_size = engine_target.pool.size()
+                checked_out = engine_target.pool.checkedout()
+                overflow = engine_target.pool.overflow()
+                
+                log(f"📊 Connection pool status - Size: {pool_size}, Checked out: {checked_out}, Overflow: {overflow}")
+                
+                # If too many connections are checked out, log a warning
+                if checked_out > pool_size * 0.8:
+                    log(f"⚠️  High connection usage detected ({checked_out}/{pool_size})")
+                
+                # Wait for next monitoring cycle
+                time.sleep(interval_seconds)
+                
+            except Exception as monitor_error:
+                log(f"⚠️  Periodic monitoring error: {monitor_error}")
+                time.sleep(interval_seconds)
+    
+    # Start monitoring in a separate thread
+    monitor_thread = threading.Thread(target=_monitor, daemon=True)
+    monitor_thread.start()
+    log(f"🔄 Started periodic connection monitoring (every {interval_seconds}s)")
+
 def load_select_tables_from_database() -> None:
     """Use the sql_database source to reflect an entire database schema and load select tables from it."""
     def _load_tables():
         # Use global engines instead of creating new ones
         engine_source = ENGINE_SOURCE
         engine_target = ENGINE_TARGET
+        
+        # Start periodic connection monitoring
+        log(f"🔄 Starting periodic connection monitoring...")
+        periodic_connection_monitoring(engine_target, interval_seconds=120)
         
         # Log connection pool status
         log(f"Source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
@@ -1446,6 +1653,68 @@ def cleanup_corrupted_dlt_state(engine_target, pipeline_name):
         log(f"Error during DLT state cleanup: {cleanup_error}")
         return False
 
+def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
+    """Monitor and kill long-running queries that might cause connection timeouts.
+    
+    Args:
+        engine_target: Target database engine
+        timeout_seconds: Maximum query execution time before killing
+    
+    Returns:
+        int: Number of queries killed
+    """
+    def _monitor_queries(connection):
+        try:
+            # Find long-running queries
+            query = """
+            SELECT id, user, host, db, command, time, state, info 
+            FROM information_schema.PROCESSLIST 
+            WHERE command != 'Sleep' 
+            AND time > %s 
+            AND info IS NOT NULL 
+            AND info != ''
+            """
+            
+            result = connection.execute(sa.text(query), (timeout_seconds,))
+            long_running = result.fetchall()
+            
+            killed_count = 0
+            
+            for process in long_running:
+                process_id, user, host, db, command, time, state, info = process
+                
+                # Skip system processes and our own connections
+                if user in ['system user', 'event_scheduler'] or 'dlt' in str(info).lower():
+                    continue
+                
+                log(f"🔍 Found long-running query (ID: {process_id}, Time: {time}s): {info[:100]}...")
+                
+                try:
+                    # Kill the long-running query
+                    kill_query = f"KILL {process_id}"
+                    connection.execute(sa.text(kill_query))
+                    log(f"✅ Killed long-running query ID: {process_id}")
+                    killed_count += 1
+                except Exception as kill_error:
+                    log(f"⚠️  Failed to kill query ID {process_id}: {kill_error}")
+            
+            if killed_count > 0:
+                log(f"🎯 Killed {killed_count} long-running queries to prevent timeouts")
+            else:
+                log(f"ℹ️  No long-running queries found")
+            
+            return killed_count
+            
+        except Exception as monitor_error:
+            log(f"⚠️  Error monitoring queries: {monitor_error}")
+            return 0
+    
+    return execute_with_transaction_management(
+        engine_target,
+        "monitor_and_kill_long_queries",
+        _monitor_queries
+    )
+
 def create_fresh_pipeline(engine_target, pipeline_name):
     """Create a fresh DLT pipeline instance, handling any existing state corruption."""
     try:
@@ -1456,6 +1725,15 @@ def create_fresh_pipeline(engine_target, pipeline_name):
         
         if state_was_corrupted:
             log(f"Corrupted state was cleaned up, creating fresh pipeline")
+        
+        # Monitor and kill any long-running queries before creating pipeline
+        try:
+            log(f"🔍 Monitoring for long-running queries before pipeline creation...")
+            killed_queries = monitor_and_kill_long_queries(engine_target, timeout_seconds=60)
+            if killed_queries > 0:
+                log(f"🧹 Cleaned up {killed_queries} long-running queries")
+        except Exception as monitor_error:
+            log(f"⚠️  Query monitoring failed: {monitor_error}")
         
         # Create destination with comprehensive column name preservation
         if PRESERVE_COLUMN_NAMES:
