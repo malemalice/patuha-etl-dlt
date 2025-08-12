@@ -79,7 +79,44 @@ with open(TABLES_FILE, "r") as f:
 
 table_configs = {t["table"]: t for t in tables_data}
 
-# Validate table configurations
+def generate_unique_staging_prefix(base_name="dlt_staging"):
+    """Generate a truly unique staging schema prefix to prevent collisions between services.
+    
+    Args:
+        base_name: Base name for the staging prefix
+    
+    Returns:
+        str: Unique prefix with timestamp, process ID, and random suffix
+    """
+    import os
+    import uuid
+    
+    # Get current timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Get process ID for additional uniqueness
+    process_id = os.getpid()
+    
+    # Generate random suffix
+    random_suffix = uuid.uuid4().hex[:4]
+    
+    # Create unique prefix
+    unique_prefix = f"{base_name}_{timestamp}_{process_id}_{random_suffix}"
+    
+    return unique_prefix
+
+# Global transaction semaphore to limit concurrent transactions
+transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
+
+# Global engine variables
+ENGINE_SOURCE = None
+ENGINE_TARGET = None
+
+def log(message):
+    """Log a message with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{timestamp} - INFO - {message}")
+
 def validate_table_configurations():
     """Validate all table configurations for proper primary key setup."""
     log("🔍 Validating table configurations...")
@@ -107,22 +144,6 @@ def validate_table_configurations():
             log(f"🔄 Table '{table_name}' configured for full refresh sync")
     
     log(f"✅ Table configuration validation completed for {len(table_configs)} tables")
-
-# Validate configurations at startup (moved to after log function and engines are defined)
-
-# Global transaction semaphore to limit concurrent transactions
-transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
-
-# Global engine variables
-ENGINE_SOURCE = None
-ENGINE_TARGET = None
-
-def log_primary_key_info(table_name, primary_key):
-    """Log information about the primary key configuration for debugging."""
-    if isinstance(primary_key, list):
-        log(f"📋 Table '{table_name}' configured with composite primary key: {primary_key}")
-    else:
-        log(f"📋 Table '{table_name}' configured with single primary key: {primary_key}")
 
 def format_primary_key(primary_key):
     """Format primary key for DLT hints, handling both string and list formats."""
@@ -214,10 +235,6 @@ def create_engines():
 
 # Initialize global engines
 ENGINE_SOURCE, ENGINE_TARGET = create_engines()
-
-def log(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{timestamp} - INFO - {message}")
 
 # Validate table configurations at startup (after log function and engines are defined)
 validate_table_configurations()
@@ -2649,32 +2666,6 @@ def create_isolated_staging_pipeline(engine_target, pipeline_name, staging_schem
         log(f"Falling back to regular pipeline creation...")
         # Fall back to regular pipeline creation
         return create_fresh_pipeline(engine_target, pipeline_name)
-
-def generate_unique_staging_prefix(base_name="dlt_staging"):
-    """Generate a truly unique staging schema prefix to prevent collisions between services.
-    
-    Args:
-        base_name: Base name for the staging prefix
-    
-    Returns:
-        str: Unique prefix with timestamp, process ID, and random suffix
-    """
-    import os
-    import uuid
-    
-    # Get current timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Get process ID for additional uniqueness
-    process_id = os.getpid()
-    
-    # Generate random suffix
-    random_suffix = uuid.uuid4().hex[:4]
-    
-    # Create unique prefix
-    unique_prefix = f"{base_name}_{timestamp}_{process_id}_{random_suffix}"
-    
-    return unique_prefix
 
 def verify_staging_schema_usage(engine_target, expected_staging_schema):
     """Verify that DLT is actually using our isolated staging schema.
