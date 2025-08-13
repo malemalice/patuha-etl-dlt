@@ -1,4 +1,4 @@
-dlt>=1.20.0
+dlt>=1.15.0
 mysql-connector-python
 pymysql
 sqlalchemy
