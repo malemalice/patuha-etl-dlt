@@ -20,7 +20,7 @@ COPY source/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir pymysql && \
-    pip install --no-cache-dir "dlt[sqlalchemy]==1.8.1" && \
+    pip install --no-cache-dir "dlt[sqlalchemy]>=1.20.0" && \
     pip install --no-cache-dir mysqlclient && \
     pip install --no-cache-dir python-dotenv && \
     pip install --no-cache-dir pandas>=1.5.0 && \

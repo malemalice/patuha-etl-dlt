@@ -71,11 +71,13 @@ STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower
 STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", "dlt_staging")  # Base prefix for staging schemas
 STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
 
-# Parquet staging configuration (alternative to database staging)
-PARQUET_STAGING_ENABLED = os.getenv("PARQUET_STAGING_ENABLED", "true").lower() == "true"  # Enable Parquet file staging
-PARQUET_STAGING_DIR = os.getenv("PARQUET_STAGING_DIR", "staging")  # Base directory for Parquet staging files
-PARQUET_STAGING_RETENTION_HOURS = int(os.getenv("PARQUET_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
-PARQUET_STAGING_COMPRESSION = os.getenv("PARQUET_STAGING_COMPRESSION", "snappy")  # Compression algorithm
+
+
+# File-based staging configuration (alternative to database staging)
+FILE_STAGING_ENABLED = os.getenv("FILE_STAGING_ENABLED", "true").lower() == "true"  # Enable file-based staging
+FILE_STAGING_DIR = os.getenv("FILE_STAGING_DIR", "staging")  # Base directory for staging files
+FILE_STAGING_RETENTION_HOURS = int(os.getenv("FILE_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
+FILE_STAGING_COMPRESSION = os.getenv("FILE_STAGING_COMPRESSION", "snappy")  # Compression algorithm
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
@@ -1645,9 +1647,9 @@ def load_select_tables_from_database() -> None:
         if incremental_tables:
             log(f"Processing {len(incremental_tables)} incremental tables in batches of {BATCH_SIZE}")
             
-            # Auto-cleanup old Parquet staging files before processing
-            if PARQUET_STAGING_ENABLED:
-                auto_cleanup_parquet_staging()
+            # Auto-cleanup old file staging files before processing
+            if FILE_STAGING_ENABLED:
+                auto_cleanup_file_staging()
             
             incremental_items = list(incremental_tables.items())
             
@@ -1656,14 +1658,14 @@ def load_select_tables_from_database() -> None:
                 batch_dict = dict(batch_items)
                 
                 try:
-                    # Check if we should use Parquet staging for this batch
-                    if PARQUET_STAGING_ENABLED:
-                        log(f"📁 Using Parquet staging for incremental tables to avoid DELETE conflicts")
-                        # Process each table individually with Parquet staging
+                    # Check if we should use file staging for this batch
+                    if FILE_STAGING_ENABLED:
+                        log(f"📁 Using file staging for incremental tables to avoid DELETE conflicts")
+                        # Process each table individually with file staging
                         for table_name, table_config in batch_dict.items():
                             try:
-                                if not process_incremental_table_with_parquet(table_name, table_config, engine_source, engine_target):
-                                    log(f"❌ Failed to process table {table_name} with Parquet staging")
+                                if not process_incremental_table_with_file(table_name, table_config, engine_source, engine_target):
+                                    log(f"❌ Failed to process table {table_name} with file staging")
                                     continue
                             except Exception as table_error:
                                 log(f"❌ Error processing table {table_name}: {table_error}")
@@ -1676,15 +1678,15 @@ def load_select_tables_from_database() -> None:
                     log(f"Error in batch processing: {e}")
                     log(f"Error type: {type(e).__name__}")
                     
-                    # If using Parquet staging, try to continue with individual table processing
-                    if PARQUET_STAGING_ENABLED:
-                        log(f"🔄 Attempting to recover with individual table processing using Parquet staging...")
+                    # If using file staging, try to continue with individual table processing
+                    if FILE_STAGING_ENABLED:
+                        log(f"🔄 Attempting to recover with individual table processing using file staging...")
                         log(f"This is likely caused by concurrent access or long-running transactions.")
                         
                         for table_name, table_config in batch_dict.items():
                             try:
                                 log(f"Attempting individual processing for table: {table_name}")
-                                if not process_incremental_table_with_parquet(table_name, table_config, engine_source, engine_target):
+                                if not process_incremental_table_with_file(table_name, table_config, engine_source, engine_target):
                                     log(f"❌ Individual processing failed for table: {table_name}")
                                     continue
                                 log(f"✅ Individual processing completed for table: {table_name}")
@@ -2024,7 +2026,7 @@ class SimpleHandler(SimpleHTTPRequestHandler):
             status_info = {
                 "timestamp": datetime.now().isoformat(),
                 "pipeline_status": "running",
-                "parquet_staging": get_parquet_staging_status(),
+                                        "file_staging": get_file_staging_status(),
                 "connection_pools": {
                     "source": {
                         "pool_size": getattr(ENGINE_SOURCE, 'pool', {}).get('size', 'unknown') if ENGINE_SOURCE else 'not_initialized',
@@ -2352,39 +2354,72 @@ def execute_with_connection_loss_handling(engine, operation_name, operation_func
         **kwargs
     )
 
-def create_parquet_staging_pipeline(pipeline_name, staging_dir=None):
-    """Create a DLT pipeline with Parquet file staging to avoid database staging conflicts.
+def create_file_staging_pipeline(pipeline_name, staging_dir=None):
+    """Create a DLT pipeline with file-based staging to avoid database staging conflicts.
     
     Args:
         pipeline_name: Name of the pipeline
         staging_dir: Directory for staging files (auto-generated if None)
     
     Returns:
-        dlt.Pipeline: Configured pipeline with Parquet file staging
+        dlt.Pipeline: Configured pipeline with file-based staging
     """
     try:
         # Generate staging directory with timestamp if not provided
         if staging_dir is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            staging_dir = f"{PARQUET_STAGING_DIR}/{pipeline_name}_{timestamp}"
+            staging_dir = f"{FILE_STAGING_DIR}/{pipeline_name}_{timestamp}"
         
         # Ensure staging directory exists
         os.makedirs(staging_dir, exist_ok=True)
         
-        log(f"🔧 Creating Parquet staging pipeline: {pipeline_name}")
+        log(f"🔧 Creating file-based staging pipeline: {pipeline_name}")
         log(f"   Staging directory: {staging_dir}")
-        log(f"   Compression: {PARQUET_STAGING_COMPRESSION}")
+        log(f"   Compression: {FILE_STAGING_COMPRESSION}")
         
-        # Create destination with Parquet file staging
-        destination = dlt.destinations.parquet(
-            staging_dir,
-            compression=PARQUET_STAGING_COMPRESSION,  # Use configured compression
-            # Optimize for large datasets
-            batch_size=MERGE_BATCH_SIZE,
-            max_batch_size=MERGE_MAX_BATCH_SIZE
-        )
+        # Try different destination types based on DLT version
+        destination = None
         
-        # Create the pipeline with Parquet staging
+        # First try: Parquet destination (DLT >= 1.20.0)
+        try:
+            destination = dlt.destinations.parquet(
+                staging_dir,
+                compression=FILE_STAGING_COMPRESSION,
+                batch_size=MERGE_BATCH_SIZE,
+                max_batch_size=MERGE_MAX_BATCH_SIZE
+            )
+            log(f"✅ Using dlt.destinations.parquet destination")
+        except AttributeError:
+            log(f"⚠️  dlt.destinations.parquet not available, trying filesystem destination...")
+            
+            # Second try: Filesystem destination (DLT >= 1.15.0)
+            try:
+                destination = dlt.destinations.filesystem(
+                    staging_dir,
+                    file_format="parquet",
+                    compression=FILE_STAGING_COMPRESSION
+                )
+                log(f"✅ Using dlt.destinations.filesystem destination with Parquet format")
+            except AttributeError:
+                log(f"⚠️  dlt.destinations.filesystem not available, trying filesystem without format...")
+                
+                # Third try: Basic filesystem destination
+                try:
+                    destination = dlt.destinations.filesystem(staging_dir)
+                    log(f"✅ Using dlt.destinations.filesystem destination (basic)")
+                except AttributeError:
+                    # Last resort: Use filesystem with path
+                    try:
+                        destination = dlt.destinations.filesystem(path=staging_dir)
+                        log(f"✅ Using dlt.destinations.filesystem destination (path parameter)")
+                    except Exception as e:
+                        log(f"❌ No compatible filesystem destination found: {e}")
+                        raise Exception(f"No compatible staging destination found in DLT version {dlt.__version__}")
+        
+        if destination is None:
+            raise Exception("Failed to create any compatible staging destination")
+        
+        # Create the pipeline with staging destination
         pipeline = dlt.pipeline(
             pipeline_name=pipeline_name,
             destination=destination,
@@ -2393,21 +2428,22 @@ def create_parquet_staging_pipeline(pipeline_name, staging_dir=None):
             progress="log"  # Log progress for better monitoring
         )
         
-        log(f"✅ Parquet staging pipeline created successfully: {pipeline_name}")
+        log(f"✅ Staging pipeline created successfully: {pipeline_name}")
         log(f"   Staging directory: {staging_dir}")
         log(f"   Pipeline type: {type(pipeline)}")
+        log(f"   DLT version: {dlt.__version__}")
         
         return pipeline, staging_dir
         
     except Exception as pipeline_error:
-        log(f"❌ Error creating Parquet staging pipeline: {pipeline_error}")
-        raise Exception(f"Parquet staging pipeline creation failed: {pipeline_error}")
+        log(f"❌ Error creating staging pipeline: {pipeline_error}")
+        raise Exception(f"Staging pipeline creation failed: {pipeline_error}")
 
-def process_parquet_staging_files(staging_dir, table_name, engine_target, primary_keys):
-    """Process staging Parquet files and merge into target database efficiently.
+def process_file_staging_files(staging_dir, table_name, engine_target, primary_keys):
+    """Process staging file files and merge into target database efficiently.
     
     Args:
-        staging_dir: Directory containing staging Parquet files
+        staging_dir: Directory containing staging file files
         table_name: Name of the table to process
         engine_target: Target database engine
         primary_keys: Primary key columns for the table
@@ -2416,40 +2452,49 @@ def process_parquet_staging_files(staging_dir, table_name, engine_target, primar
         bool: True if processing was successful
     """
     try:
-        log(f"🔧 Processing Parquet staging files for table: {table_name}")
+        log(f"🔧 Processing file staging files for table: {table_name}")
         log(f"   Staging directory: {staging_dir}")
         log(f"   Primary keys: {primary_keys}")
         
-        # Check if staging files exist
-        if not os.path.exists(staging_dir):
-            log(f"❌ Staging directory does not exist: {staging_dir}")
-            return False
-        
-        # Find Parquet files for this table
-        parquet_files = []
+        # Find staging files for this table
+        staging_files = []
         for file in os.listdir(staging_dir):
-            if file.endswith('.parquet') and table_name in file:
-                parquet_files.append(os.path.join(staging_dir, file))
+            # Check for various file extensions that might be used
+            if (file.endswith(('.parquet', '.json', '.csv')) and table_name in file):
+                staging_files.append(os.path.join(staging_dir, file))
         
-        if not parquet_files:
-            log(f"⚠️  No Parquet files found for table: {table_name}")
+        if not staging_files:
+            log(f"⚠️  No staging files found for table: {table_name}")
             return False
         
-        log(f"📁 Found {len(parquet_files)} Parquet files to process")
+        log(f"📁 Found {len(staging_files)} staging files to process")
         
         # Process files in batches to avoid memory issues
         batch_size = 10000  # Process 10k records at a time
         
-        for parquet_file in parquet_files:
-            log(f"🔧 Processing file: {os.path.basename(parquet_file)}")
+        for staging_file in staging_files:
+            log(f"🔧 Processing file: {os.path.basename(staging_file)}")
             
-            # Read Parquet file in batches
+            # Read file based on its extension
             import pandas as pd
             
-            # Use pandas to read Parquet in chunks
-            parquet_reader = pd.read_parquet(parquet_file, chunksize=batch_size)
+            file_ext = os.path.splitext(staging_file)[1].lower()
             
-            for chunk_num, chunk in enumerate(parquet_reader):
+            if file_ext == '.parquet':
+                # Use pandas to read Parquet in chunks
+                file_reader = pd.read_parquet(staging_file, chunksize=batch_size)
+            elif file_ext == '.json':
+                # Use pandas to read JSON in chunks
+                file_reader = pd.read_json(staging_file, lines=True, chunksize=batch_size)
+            elif file_ext == '.csv':
+                # Use pandas to read CSV in chunks
+                file_reader = pd.read_csv(staging_file, chunksize=batch_size)
+            else:
+                log(f"⚠️  Unsupported file type: {file_ext}, skipping...")
+                continue
+            
+            # Process the file in chunks
+            for chunk_num, chunk in enumerate(file_reader):
                 log(f"   Processing chunk {chunk_num + 1} ({len(chunk)} records)")
                 
                 # Convert chunk to list of dictionaries for processing
@@ -2462,11 +2507,11 @@ def process_parquet_staging_files(staging_dir, table_name, engine_target, primar
                 
                 log(f"   ✅ Chunk {chunk_num + 1} processed successfully")
         
-        log(f"✅ All Parquet files processed successfully for table: {table_name}")
+        log(f"✅ All staging files processed successfully for table: {table_name}")
         return True
         
     except Exception as processing_error:
-        log(f"❌ Error processing Parquet staging files: {processing_error}")
+        log(f"❌ Error processing file staging files: {processing_error}")
         return False
 
 def process_data_chunk(records, table_name, engine_target, primary_keys):
@@ -2542,8 +2587,8 @@ def process_data_chunk(records, table_name, engine_target, primary_keys):
         log(f"❌ Error processing data chunk: {chunk_error}")
         return False
 
-def cleanup_parquet_staging_files(staging_dir=None, retention_hours=None):
-    """Clean up old Parquet staging files to prevent disk space issues.
+def cleanup_file_staging_files(staging_dir=None, retention_hours=None):
+    """Clean up old file staging files to prevent disk space issues.
     
     Args:
         staging_dir: Base staging directory (uses configured default if None)
@@ -2555,15 +2600,15 @@ def cleanup_parquet_staging_files(staging_dir=None, retention_hours=None):
     try:
         # Use configured defaults if not specified
         if staging_dir is None:
-            staging_dir = PARQUET_STAGING_DIR
+            staging_dir = FILE_STAGING_DIR
         if retention_hours is None:
-            retention_hours = PARQUET_STAGING_RETENTION_HOURS
+            retention_hours = FILE_STAGING_RETENTION_HOURS
         
         if not os.path.exists(staging_dir):
             log(f"ℹ️  Staging directory does not exist: {staging_dir}")
             return 0
         
-        log(f"🧹 Cleaning up Parquet staging files older than {retention_hours} hours...")
+        log(f"🧹 Cleaning up file staging files older than {retention_hours} hours...")
         log(f"   Base directory: {staging_dir}")
         
         cleaned_count = 0
@@ -2604,16 +2649,16 @@ def cleanup_parquet_staging_files(staging_dir=None, retention_hours=None):
         return cleaned_count
         
     except Exception as cleanup_error:
-        log(f"❌ Error during Parquet staging cleanup: {cleanup_error}")
+        log(f"❌ Error during file staging cleanup: {cleanup_error}")
         return 0
 
-def create_hybrid_pipeline(engine_target, pipeline_name, use_parquet_staging=True):
-    """Create a hybrid pipeline that uses Parquet staging for incremental tables to avoid DELETE conflicts.
+def create_hybrid_pipeline(engine_target, pipeline_name, use_file_staging=True):
+    """Create a hybrid pipeline that uses file-based staging for incremental tables to avoid DELETE conflicts.
     
     Args:
         engine_target: Target database engine
         pipeline_name: Name of the pipeline
-        use_parquet_staging: Whether to use Parquet staging for incremental tables
+        use_file_staging: Whether to use file-based staging for incremental tables
     
     Returns:
         tuple: (pipeline, staging_dir) or (pipeline, None) for regular pipeline
@@ -2621,10 +2666,10 @@ def create_hybrid_pipeline(engine_target, pipeline_name, use_parquet_staging=Tru
     try:
         log(f"🔧 Creating hybrid pipeline: {pipeline_name}")
         
-        if use_parquet_staging:
-            # Use Parquet staging to avoid DELETE query conflicts
-            log(f"📁 Using Parquet file staging to avoid database staging conflicts")
-            pipeline, staging_dir = create_parquet_staging_pipeline(pipeline_name)
+        if use_file_staging:
+            # Use file-based staging to avoid DELETE query conflicts
+            log(f"📁 Using file file staging to avoid database staging conflicts")
+            pipeline, staging_dir = create_file_staging_pipeline(pipeline_name)
             return pipeline, staging_dir
         else:
             # Fall back to regular database staging
@@ -2636,8 +2681,8 @@ def create_hybrid_pipeline(engine_target, pipeline_name, use_parquet_staging=Tru
         log(f"❌ Error creating hybrid pipeline: {pipeline_error}")
         raise Exception(f"Hybrid pipeline creation failed: {pipeline_error}")
 
-def process_incremental_table_with_parquet(table_name, table_config, engine_source, engine_target):
-    """Process an incremental table using Parquet staging to avoid DELETE query conflicts.
+def process_incremental_table_with_file(table_name, table_config, engine_source, engine_target):
+    """Process an incremental table using file-based staging to avoid DELETE query conflicts.
     
     Args:
         table_name: Name of the table to process
@@ -2649,7 +2694,7 @@ def process_incremental_table_with_parquet(table_name, table_config, engine_sour
         bool: True if processing was successful
     """
     try:
-        log(f"🔄 Processing incremental table with Parquet staging: {table_name}")
+        log(f"🔄 Processing incremental table with file staging: {table_name}")
         
         # Get primary keys
         primary_keys = table_config.get('primary_key', 'id')
@@ -2662,12 +2707,12 @@ def process_incremental_table_with_parquet(table_name, table_config, engine_sour
         log(f"   Primary keys: {primary_keys}")
         log(f"   Modifier column: {modifier_column}")
         
-        # Step 1: Create Parquet staging pipeline
+        # Step 1: Create file staging pipeline
         staging_pipeline_name = f"staging_{table_name}_{int(time.time())}"
-        staging_pipeline, staging_dir = create_parquet_staging_pipeline(staging_pipeline_name)
+        staging_pipeline, staging_dir = create_file_staging_pipeline(staging_pipeline_name)
         
-        # Step 2: Extract data to Parquet files
-        log(f"📤 Extracting data to Parquet staging files...")
+        # Step 2: Extract data to file files
+        log(f"📤 Extracting data to file staging files...")
         
         # Create DLT source for the table
         source = sql_database(
@@ -2679,54 +2724,54 @@ def process_incremental_table_with_parquet(table_name, table_config, engine_sour
         # Run the staging pipeline to extract data
         staging_pipeline.run(source)
         
-        log(f"✅ Data extracted to Parquet staging files")
+        log(f"✅ Data extracted to file staging files")
         
-        # Step 3: Process Parquet files and merge into target database
-        log(f"📥 Processing Parquet files and merging into target database...")
+        # Step 3: Process file files and merge into target database
+        log(f"📥 Processing file files and merging into target database...")
         
-        if not process_parquet_staging_files(staging_dir, table_name, engine_target, primary_keys):
-            log(f"❌ Failed to process Parquet staging files for table: {table_name}")
+        if not process_file_staging_files(staging_dir, table_name, engine_target, primary_keys):
+            log(f"❌ Failed to process file staging files for table: {table_name}")
             return False
         
-        log(f"✅ Successfully processed table: {table_name} using Parquet staging")
+        log(f"✅ Successfully processed table: {table_name} using file staging")
         
         # Step 4: Clean up staging files (optional - can be done later)
-        # cleanup_parquet_staging_files(staging_dir, retention_hours=1)
+        # cleanup_file_staging_files(staging_dir, retention_hours=1)
         
         return True
         
     except Exception as table_error:
-        log(f"❌ Error processing table {table_name} with Parquet staging: {table_error}")
+        log(f"❌ Error processing table {table_name} with file staging: {table_error}")
         return False
 
 
 
-def auto_cleanup_parquet_staging():
-    """Automatically clean up old Parquet staging files based on configuration."""
+def auto_cleanup_file_staging():
+    """Automatically clean up old file staging files based on configuration."""
     try:
-        if PARQUET_STAGING_ENABLED:
-            log(f"🧹 Running automatic cleanup of Parquet staging files...")
-            cleaned_count = cleanup_parquet_staging_files()
+        if FILE_STAGING_ENABLED:
+            log(f"🧹 Running automatic cleanup of file staging files...")
+            cleaned_count = cleanup_file_staging_files()
             if cleaned_count > 0:
                 log(f"✅ Automatic cleanup completed: {cleaned_count} staging directories removed")
             else:
                 log(f"ℹ️  No old staging directories found to clean up")
         else:
-            log(f"ℹ️  Parquet staging cleanup skipped (PARQUET_STAGING_ENABLED=false)")
+            log(f"ℹ️  file staging cleanup skipped (FILE_STAGING_ENABLED=false)")
     except Exception as cleanup_error:
         log(f"⚠️  Automatic cleanup failed: {cleanup_error}")
 
-def get_parquet_staging_status():
-    """Get current status of Parquet staging directories for monitoring.
+def get_file_staging_status():
+    """Get current status of file staging directories for monitoring.
     
     Returns:
-        dict: Status information about Parquet staging
+        dict: Status information about file staging
     """
     try:
-        if not PARQUET_STAGING_ENABLED:
-            return {"enabled": False, "message": "Parquet staging is disabled"}
+        if not FILE_STAGING_ENABLED:
+            return {"enabled": False, "message": "file staging is disabled"}
         
-        staging_dir = PARQUET_STAGING_DIR
+        staging_dir = FILE_STAGING_DIR
         if not os.path.exists(staging_dir):
             return {
                 "enabled": True,
@@ -2759,13 +2804,13 @@ def get_parquet_staging_status():
             "status": "active",
             "total_directories": total_directories,
             "total_size_mb": round(total_size_mb, 2),
-            "retention_hours": PARQUET_STAGING_RETENTION_HOURS,
-            "compression": PARQUET_STAGING_COMPRESSION
+            "retention_hours": FILE_STAGING_RETENTION_HOURS,
+            "compression": FILE_STAGING_COMPRESSION
         }
         
     except Exception as status_error:
         return {
-            "enabled": PARQUET_STAGING_ENABLED,
+            "enabled": FILE_STAGING_ENABLED,
             "error": str(status_error)
         }
 
