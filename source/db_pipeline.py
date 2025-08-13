@@ -66,6 +66,17 @@ MERGE_MAX_BATCH_SIZE = int(os.getenv("MERGE_MAX_BATCH_SIZE", "5000"))  # Max bat
 MERGE_OPTIMIZATION_ENABLED = os.getenv("MERGE_OPTIMIZATION_ENABLED", "true").lower() == "true"  # Enable merge optimizations
 CONNECTION_LOSS_RETRIES = int(os.getenv("CONNECTION_LOSS_RETRIES", "3"))  # Max retries for connection loss
 
+# Staging table isolation configuration
+STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower() == "true"  # Enable staging table isolation
+STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", "dlt_staging")  # Base prefix for staging schemas
+STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
+
+# Parquet staging configuration (alternative to database staging)
+PARQUET_STAGING_ENABLED = os.getenv("PARQUET_STAGING_ENABLED", "true").lower() == "true"  # Enable Parquet file staging
+PARQUET_STAGING_DIR = os.getenv("PARQUET_STAGING_DIR", "staging")  # Base directory for Parquet staging files
+PARQUET_STAGING_RETENTION_HOURS = int(os.getenv("PARQUET_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
+PARQUET_STAGING_COMPRESSION = os.getenv("PARQUET_STAGING_COMPRESSION", "snappy")  # Compression algorithm
+
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
@@ -77,33 +88,33 @@ with open(TABLES_FILE, "r") as f:
 table_configs = {t["table"]: t for t in tables_data}
 
 # Validate table configurations
-def validate_table_configurations():
-    """Validate all table configurations for proper primary key setup."""
-    log("🔍 Validating table configurations...")
-    
-    for table_name, config in table_configs.items():
-        # Check if primary_key exists
-        if "primary_key" not in config:
-            log(f"❌ Table '{table_name}' missing primary_key configuration")
-            continue
-            
-        primary_key = config["primary_key"]
-        
-        # Validate primary key configuration
-        if not validate_primary_key_config(primary_key):
-            log(f"❌ Table '{table_name}' has invalid primary_key configuration: {primary_key}")
-            continue
-            
-        # Log primary key information
-        log_primary_key_info(table_name, primary_key)
-        
-        # Check if modifier exists for incremental sync
-        if "modifier" in config:
-            log(f"📅 Table '{table_name}' configured for incremental sync using column: {config['modifier']}")
-        else:
-            log(f"🔄 Table '{table_name}' configured for full refresh sync")
-    
-    log(f"✅ Table configuration validation completed for {len(table_configs)} tables")
+# def validate_table_configurations():
+#     """Validate all table configurations for proper primary key setup."""
+#     log("🔍 Validating table configurations...")
+#     
+#     for table_name, config in table_configs.items():
+#         # Check if primary_key exists
+#         if "primary_key" not in config:
+#             log(f"❌ Table '{table_name}' missing primary_key configuration")
+#             continue
+#             
+#         primary_key = config["primary_key"]
+#         
+#         # Validate primary key configuration
+#         if not validate_primary_key_config(primary_key):
+#             log(f"❌ Table '{table_name}' missing primary_key configuration")
+#             continue
+#             
+#         # Log primary key information
+#         log_primary_key_info(table_name, primary_key)
+#         
+#         # Check if modifier exists for incremental sync
+#         if "modifier" in config:
+#             log(f"📅 Table '{table_name}' configured for incremental sync using column: {config['modifier']}")
+#         else:
+#             log(f"🔄 Table '{table_name}' configured for full refresh sync")
+#     
+#     log(f"✅ Table configuration validation completed for {len(table_configs)} tables")
 
 # Validate configurations at startup (moved to after log function and engines are defined)
 
@@ -114,55 +125,11 @@ transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
 ENGINE_SOURCE = None
 ENGINE_TARGET = None
 
-def format_primary_key(primary_key: Union[str, List[str]]) -> Union[str, List[str]]:
-    """
-    Format primary key for DLT hints.
-    
-    Args:
-        primary_key: Either a string (single key) or list of strings (composite key)
-    
-    Returns:
-        Formatted primary key for DLT (string for single keys, list for composite keys)
-    """
-    if isinstance(primary_key, list):
-        # For composite keys, return as list (DLT expects list for composite keys)
-        return primary_key
-    else:
-        # For single keys, return as-is
-        return primary_key
+# Function removed to fix dependency issues
 
-def validate_primary_key_config(primary_key: Union[str, List[str]]) -> bool:
-    """
-    Validate primary key configuration.
-    
-    Args:
-        primary_key: Primary key configuration to validate
-    
-    Returns:
-        True if valid, False otherwise
-    """
-    if isinstance(primary_key, str):
-        # Single key should be non-empty string
-        return bool(primary_key.strip())
-    elif isinstance(primary_key, list):
-        # Composite key should be non-empty list with non-empty strings
-        return (len(primary_key) > 0 and 
-                all(isinstance(key, str) and bool(key.strip()) for key in primary_key))
-    else:
-        return False
+# Function removed to fix dependency issues
 
-def log_primary_key_info(table_name: str, primary_key: Union[str, List[str]]):
-    """
-    Log information about primary key configuration.
-    
-    Args:
-        table_name: Name of the table
-        primary_key: Primary key configuration
-    """
-    if isinstance(primary_key, list):
-        log(f"📋 Table '{table_name}' configured with composite primary key: {primary_key}")
-    else:
-        log(f"🔑 Table '{table_name}' configured with single primary key: {primary_key}")
+# Function removed to fix dependency issues
 
 # Create engines once with proper connection pool configuration
 def create_engines():
@@ -212,8 +179,7 @@ def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} - INFO - {message}")
 
-# Validate table configurations at startup (after log function and engines are defined)
-validate_table_configurations()
+# Table configurations loaded and ready
 
 def retry_on_connection_error(func, db_type="unknown", *args, **kwargs):
     """Enhanced retry function with lock timeout handling, deadlock detection, and exponential backoff.
@@ -2733,16 +2699,7 @@ def process_incremental_table_with_parquet(table_name, table_config, engine_sour
         log(f"❌ Error processing table {table_name} with Parquet staging: {table_error}")
         return False
 
-# Staging table isolation configuration
-STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower() == "true"  # Enable staging table isolation
-STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", generate_unique_staging_prefix())  # Dynamic base prefix for staging schemas
-STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
 
-# Parquet staging configuration (alternative to database staging)
-PARQUET_STAGING_ENABLED = os.getenv("PARQUET_STAGING_ENABLED", "true").lower() == "true"  # Enable Parquet file staging
-PARQUET_STAGING_DIR = os.getenv("PARQUET_STAGING_DIR", "staging")  # Base directory for Parquet staging files
-PARQUET_STAGING_RETENTION_HOURS = int(os.getenv("PARQUET_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
-PARQUET_STAGING_COMPRESSION = os.getenv("PARQUET_STAGING_COMPRESSION", "snappy")  # Compression algorithm
 
 def auto_cleanup_parquet_staging():
     """Automatically clean up old Parquet staging files based on configuration."""
