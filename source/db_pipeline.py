@@ -1650,6 +1650,8 @@ def load_select_tables_from_database() -> None:
             # Auto-cleanup old file staging files before processing
             if FILE_STAGING_ENABLED:
                 auto_cleanup_file_staging()
+                # Also clean up any orphaned staging directories from failed runs
+                cleanup_failed_staging_directories()
             
             incremental_items = list(incremental_tables.items())
             
@@ -1662,14 +1664,28 @@ def load_select_tables_from_database() -> None:
                     if FILE_STAGING_ENABLED:
                         log(f"📁 Using file staging for incremental tables to avoid DELETE conflicts")
                         # Process each table individually with file staging
+                        successful_tables = 0
+                        failed_tables = 0
+                        
                         for table_name, table_config in batch_dict.items():
                             try:
-                                if not process_incremental_table_with_file(table_name, table_config, engine_source, engine_target):
-                                    log(f"❌ Failed to process table {table_name} with file staging")
-                                    continue
+                                log(f"🔄 Processing table: {table_name}")
+                                if process_incremental_table_with_file(table_name, table_config, engine_source, engine_target):
+                                    successful_tables += 1
+                                    log(f"✅ Successfully processed table: {table_name}")
+                                else:
+                                    failed_tables += 1
+                                    log(f"❌ Failed to process table: {table_name}")
                             except Exception as table_error:
+                                failed_tables += 1
                                 log(f"❌ Error processing table {table_name}: {table_error}")
                                 continue
+                        
+                        log(f"📊 Batch processing summary: {successful_tables} successful, {failed_tables} failed")
+                        
+                        if failed_tables > 0:
+                            log(f"⚠️  Some tables in this batch failed processing")
+                        
                     else:
                         log(f"🗄️  Using regular database staging for incremental tables")
                         process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "merge")
@@ -1739,6 +1755,17 @@ def load_select_tables_from_database() -> None:
         # Log final connection pool status
         log(f"Final source pool status - Size: {engine_source.pool.size()}, Checked out: {engine_source.pool.checkedout()}")
         log(f"Final target pool status - Size: {engine_target.pool.size()}, Checked out: {engine_target.pool.checkedout()}")
+        
+        # Log pipeline completion summary
+        log(f"🎉 Pipeline execution completed successfully!")
+        log(f"📊 Summary:")
+        log(f"   - Full refresh tables processed: {len(full_refresh_tables) if full_refresh_tables else 0}")
+        log(f"   - Incremental tables processed: {len(incremental_tables) if incremental_tables else 0}")
+        log(f"   - Total tables in this run: {(len(full_refresh_tables) if full_refresh_tables else 0) + (len(incremental_tables) if incremental_tables else 0)}")
+        log(f"   - File staging enabled: {FILE_STAGING_ENABLED}")
+        log(f"   - Staging directory: {FILE_STAGING_DIR}")
+        
+        return True
 
     return retry_on_connection_error(_load_tables, "source+target (main data loading)")
 
@@ -2714,19 +2741,52 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
         # Step 2: Extract data to file files
         log(f"📤 Extracting data to file staging files...")
         
-        # Create DLT source for the table
-        source = sql_database(
-            engine_source,
-            table_names=[table_name],
-            schema=SOURCE_DB_NAME
-        )
+        try:
+            # Create DLT source for the table
+            source = sql_database(
+                engine_source,
+                table_names=[table_name],
+                schema=SOURCE_DB_NAME
+            )
+            
+            # Run the staging pipeline to extract data
+            staging_pipeline.run(source)
+            
+            log(f"✅ Data extracted to file staging files")
+            
+        except Exception as extraction_error:
+            log(f"❌ Data extraction failed for table {table_name}: {extraction_error}")
+            log(f"🔄 Skipping file processing since no staging files were created")
+            # Clean up the failed staging directory
+            try:
+                if os.path.exists(staging_dir):
+                    import shutil
+                    shutil.rmtree(staging_dir)
+                    log(f"🧹 Cleaned up failed staging directory: {staging_dir}")
+            except Exception as cleanup_error:
+                log(f"⚠️  Warning: Could not clean up failed staging directory: {cleanup_error}")
+            return False
         
-        # Run the staging pipeline to extract data
-        staging_pipeline.run(source)
+        # Step 3: Verify staging files exist before processing
+        log(f"🔍 Verifying staging files were created...")
         
-        log(f"✅ Data extracted to file staging files")
+        files_exist, staging_files = validate_staging_files_exist(staging_dir, table_name)
+        if not files_exist:
+            log(f"❌ No staging files found for table: {table_name}")
+            log(f"🔄 Skipping file processing since no staging files exist")
+            # Clean up the empty staging directory
+            try:
+                if os.path.exists(staging_dir):
+                    import shutil
+                    shutil.rmtree(staging_dir)
+                    log(f"🧹 Cleaned up empty staging directory: {staging_dir}")
+            except Exception as cleanup_error:
+                log(f"⚠️  Warning: Could not clean up empty staging directory: {cleanup_error}")
+            return False
         
-        # Step 3: Process file files and merge into target database
+        log(f"✅ Found {len(staging_files)} staging files: {staging_files}")
+        
+        # Step 4: Process file files and merge into target database
         log(f"📥 Processing file files and merging into target database...")
         
         if not process_file_staging_files(staging_dir, table_name, engine_target, primary_keys):
@@ -2735,7 +2795,7 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
         
         log(f"✅ Successfully processed table: {table_name} using file staging")
         
-        # Step 4: Clean up staging files (optional - can be done later)
+        # Step 5: Clean up staging files (optional - can be done later)
         # cleanup_file_staging_files(staging_dir, retention_hours=1)
         
         return True
@@ -2813,6 +2873,165 @@ def get_file_staging_status():
             "enabled": FILE_STAGING_ENABLED,
             "error": str(status_error)
         }
+
+def validate_staging_files_exist(staging_dir, table_name):
+    """Validate that staging files exist and are accessible.
+    
+    Args:
+        staging_dir: Directory containing staging files
+        table_name: Name of the table being processed
+    
+    Returns:
+        tuple: (bool, list) - (files_exist, list_of_files)
+    """
+    try:
+        if not os.path.exists(staging_dir):
+            return False, []
+        
+        staging_files = []
+        for file in os.listdir(staging_dir):
+            if file.endswith(('.parquet', '.json', '.csv')):
+                staging_files.append(file)
+        
+        return len(staging_files) > 0, staging_files
+        
+    except Exception as validation_error:
+        log(f"❌ Error validating staging files: {validation_error}")
+        return False, []
+
+def cleanup_failed_staging_directories():
+    """Clean up any staging directories that might be orphaned from failed runs."""
+    try:
+        if not FILE_STAGING_ENABLED:
+            return 0
+        
+        staging_dir = FILE_STAGING_DIR
+        if not os.path.exists(staging_dir):
+            return 0
+        
+        cleaned_count = 0
+        current_time = datetime.now()
+        
+        for dir_name in os.listdir(staging_dir):
+            dir_path = os.path.join(staging_dir, dir_name)
+            if os.path.isdir(dir_path):
+                # Check if directory is very old (more than 48 hours) - likely from failed runs
+                try:
+                    # Extract timestamp from directory name (format: staging_tablename_timestamp_date)
+                    if '_' in dir_name:
+                        parts = dir_name.split('_')
+                        if len(parts) >= 3:
+                            # Try to parse the date part
+                            date_part = '_'.join(parts[-2:])  # Last two parts should be date
+                            dir_time = datetime.strptime(date_part, "%Y%m%d_%H%M%S")
+                            
+                            # Check if directory is older than 48 hours
+                            age_hours = (current_time - dir_time).total_seconds() / 3600
+                            if age_hours > 48:
+                                log(f"🧹 Cleaning up old staging directory (likely from failed run): {dir_name}")
+                                import shutil
+                                shutil.rmtree(dir_path)
+                                cleaned_count += 1
+                except (ValueError, IndexError):
+                    # If we can't parse the timestamp, skip this directory
+                    continue
+        
+        if cleaned_count > 0:
+            log(f"✅ Cleaned up {cleaned_count} old staging directories from failed runs")
+        
+        return cleaned_count
+        
+    except Exception as cleanup_error:
+        log(f"⚠️  Error during failed staging cleanup: {cleanup_error}")
+        return 0
+
+def cleanup_corrupted_dlt_state(engine_target, pipeline_name):
+    """Clean up corrupted DLT pipeline state tables."""
+    try:
+        log(f"Checking for corrupted DLT state for pipeline: {pipeline_name}")
+        
+        # DLT state tables that might contain corrupted data
+        state_tables = [
+            f"_dlt_pipeline_state",
+            f"_dlt_loads", 
+            f"_dlt_version"
+        ]
+        
+        with engine_target.connect() as connection:
+            inspector = sa.inspect(engine_target)
+            existing_tables = inspector.get_table_names()
+            
+            for state_table in state_tables:
+                if state_table in existing_tables:
+                    log(f"Found DLT state table: {state_table}")
+                    
+                    # Check if the state table has corrupted data
+                    try:
+                        if state_table == "_dlt_pipeline_state":
+                            # Check for corrupted pipeline state specifically
+                            check_query = f"SELECT pipeline_name, state FROM {state_table} WHERE pipeline_name = '{pipeline_name}'"
+                            result = connection.execute(sa.text(check_query))
+                            state_rows = result.fetchall()
+                            
+                            for row in state_rows:
+                                pipeline_name_val, state_val = row
+                                log(f"Found state for pipeline: {pipeline_name_val}")
+                                
+                                # Try to validate the state data
+                                if state_val is None or state_val == '' or state_val.strip() == '':
+                                    log(f"⚠️  Empty or NULL state detected for pipeline {pipeline_name_val} - this causes JSON decode errors!")
+                                    
+                                    # Delete the corrupted state
+                                    delete_query = f"DELETE FROM {state_table} WHERE pipeline_name = '{pipeline_name}'"
+                                    connection.execute(sa.text(delete_query))
+                                    connection.commit()
+                                    log(f"✅ Deleted corrupted state for pipeline: {pipeline_name_val}")
+                                    return True
+                                
+                                # Try to decode the state to check if it's valid
+                                try:
+                                    import base64
+                                    # Test base64 decoding
+                                    base64.b64decode(state_val, validate=True)
+                                    log(f"✅ State appears valid for pipeline: {pipeline_name_val}")
+                                except Exception as decode_error:
+                                    log(f"⚠️  Invalid base64 state detected for pipeline {pipeline_name_val}: {decode_error}")
+                                    
+                                    # Delete the corrupted state
+                                    delete_query = f"DELETE FROM {state_table} WHERE pipeline_name = '{pipeline_name}'"
+                                    connection.execute(sa.text(delete_query))
+                                    connection.commit()
+                                    log(f"✅ Deleted corrupted state for pipeline: {pipeline_name_val}")
+                                    return True
+                        else:
+                            # For other state tables, just check if they exist and are accessible
+                            count_query = f"SELECT COUNT(*) FROM {state_table}"
+                            count = connection.execute(sa.text(count_query)).scalar()
+                            log(f"State table {state_table} has {count} rows")
+                            
+                    except Exception as table_error:
+                        log(f"Error checking state table {state_table}: {table_error}")
+                        
+                        # If we can't even read the table, it might be corrupted
+                        if "doesn't exist" not in str(table_error).lower():
+                            log(f"⚠️  State table {state_table} appears corrupted, attempting to drop and recreate")
+                            try:
+                                drop_query = f"DROP TABLE IF EXISTS {state_table}"
+                                connection.execute(sa.text(drop_query))
+                                connection.commit()
+                                log(f"✅ Dropped corrupted state table: {state_table}")
+                                return True
+                            except Exception as drop_error:
+                                log(f"Failed to drop corrupted state table {state_table}: {drop_error}")
+                else:
+                    log(f"DLT state table {state_table} does not exist yet")
+            
+        log(f"DLT state validation completed for pipeline: {pipeline_name}")
+        return False  # No corruption found
+        
+    except Exception as cleanup_error:
+        log(f"Error during DLT state cleanup: {cleanup_error}")
+        return False
 
 if __name__ == "__main__":
     import sys
