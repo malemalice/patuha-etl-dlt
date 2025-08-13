@@ -78,6 +78,7 @@ FILE_STAGING_ENABLED = os.getenv("FILE_STAGING_ENABLED", "true").lower() == "tru
 FILE_STAGING_DIR = os.getenv("FILE_STAGING_DIR", "staging")  # Base directory for staging files
 FILE_STAGING_RETENTION_HOURS = int(os.getenv("FILE_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
 FILE_STAGING_COMPRESSION = os.getenv("FILE_STAGING_COMPRESSION", "snappy")  # Compression algorithm
+FILE_STAGING_ADVANCED_MONITORING = os.getenv("FILE_STAGING_ADVANCED_MONITORING", "true").lower() == "true"
 
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
 DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
@@ -2446,6 +2447,10 @@ def create_file_staging_pipeline(pipeline_name, staging_dir=None):
         if destination is None:
             raise Exception("Failed to create any compatible staging destination")
         
+        # Test the destination to ensure it's working
+        if not test_filesystem_destination(destination, staging_dir):
+            log(f"⚠️  Filesystem destination test failed, but continuing...")
+        
         # Create the pipeline with staging destination
         pipeline = dlt.pipeline(
             pipeline_name=pipeline_name,
@@ -2752,7 +2757,24 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
             # Run the staging pipeline to extract data
             staging_pipeline.run(source)
             
-            log(f"✅ Data extracted to file staging files")
+            # Verify the pipeline actually completed successfully
+            try:
+                pipeline_state = staging_pipeline.state
+                log(f"🔍 Pipeline state after extraction: {pipeline_state}")
+                
+                # Check if there are any failed jobs
+                failed_jobs = [job for job in staging_pipeline.list_jobs() if job.state == 'failed']
+                if failed_jobs:
+                    log(f"❌ Pipeline has {len(failed_jobs)} failed jobs")
+                    for job in failed_jobs:
+                        log(f"   Failed job: {job.job_id} - {job.state}")
+                    raise Exception(f"Pipeline extraction failed with {len(failed_jobs)} failed jobs")
+                
+                log(f"✅ Data extracted to file staging files")
+                
+            except Exception as state_error:
+                log(f"❌ Error checking pipeline state: {state_error}")
+                raise Exception(f"Pipeline state verification failed: {state_error}")
             
         except Exception as extraction_error:
             log(f"❌ Data extraction failed for table {table_name}: {extraction_error}")
@@ -2767,12 +2789,14 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
                 log(f"⚠️  Warning: Could not clean up failed staging directory: {cleanup_error}")
             return False
         
-        # Step 3: Verify staging files exist before processing
-        log(f"🔍 Verifying staging files were created...")
+        # Step 3: Synchronously wait for file creation to complete
+        if FILE_STAGING_ADVANCED_MONITORING:
+            success, staging_files, wait_time = wait_for_file_creation_advanced(staging_dir, table_name, timeout_seconds=60)
+        else:
+            success, staging_files, wait_time = wait_for_file_creation(staging_dir, table_name, timeout_seconds=60)
         
-        files_exist, staging_files = validate_staging_files_exist(staging_dir, table_name)
-        if not files_exist:
-            log(f"❌ No staging files found for table: {table_name}")
+        if not success:
+            log(f"❌ File creation failed after {wait_time:.1f}s")
             log(f"🔄 Skipping file processing since no staging files exist")
             # Clean up the empty staging directory
             try:
@@ -3032,6 +3056,217 @@ def cleanup_corrupted_dlt_state(engine_target, pipeline_name):
     except Exception as cleanup_error:
         log(f"Error during DLT state cleanup: {cleanup_error}")
         return False
+
+def test_filesystem_destination(destination, staging_dir):
+    """Test if the filesystem destination is working correctly.
+    
+    Args:
+        destination: DLT destination object
+        staging_dir: Staging directory path
+    
+    Returns:
+        bool: True if destination appears to be working
+    """
+    try:
+        log(f"🔍 Testing filesystem destination configuration...")
+        
+        # Check destination type
+        destination_type = type(destination).__name__
+        log(f"   Destination type: {destination_type}")
+        
+        # Check if destination has expected attributes
+        if hasattr(destination, 'config'):
+            log(f"   Destination config: {destination.config}")
+        
+        # Check if staging directory is accessible
+        if os.path.exists(staging_dir):
+            log(f"   Staging directory exists: {staging_dir}")
+            
+            # Try to create a test file
+            test_file = os.path.join(staging_dir, "test_destination.txt")
+            try:
+                with open(test_file, 'w') as f:
+                    f.write("test")
+                os.remove(test_file)
+                log(f"   ✅ File I/O test passed")
+                return True
+            except Exception as io_error:
+                log(f"   ❌ File I/O test failed: {io_error}")
+                return False
+        else:
+            log(f"   ❌ Staging directory does not exist: {staging_dir}")
+            return False
+            
+    except Exception as test_error:
+        log(f"❌ Error testing filesystem destination: {test_error}")
+        return False
+
+def wait_for_file_creation(staging_dir, table_name, timeout_seconds=60):
+    """Synchronously wait for staging files to be created.
+    
+    This function monitors the staging directory and waits for files to appear,
+    making the file creation process truly synchronous.
+    
+    Args:
+        staging_dir: Directory to monitor
+        table_name: Name of the table being processed
+        timeout_seconds: Maximum time to wait
+    
+    Returns:
+        tuple: (success, staging_files, wait_time)
+    """
+    import time
+    import os
+    
+    log(f"🔍 Monitoring file creation in: {staging_dir}")
+    start_time = time.time()
+    
+    # Initial check - maybe files are already there
+    files_exist, staging_files = validate_staging_files_exist(staging_dir, table_name)
+    if files_exist:
+        log(f"✅ Files already exist: {staging_files}")
+        return True, staging_files, 0.0
+    
+    # Wait for files to appear with intelligent backoff
+    wait_time = 0.1  # Start with 100ms
+    max_wait_time = 2.0  # Cap at 2 seconds between checks
+    total_wait_time = 0
+    
+    while total_wait_time < timeout_seconds:
+        # Check if files exist
+        files_exist, staging_files = validate_staging_files_exist(staging_dir, table_name)
+        if files_exist:
+            elapsed = time.time() - start_time
+            log(f"✅ Files created successfully after {elapsed:.1f}s")
+            return True, staging_files, elapsed
+        
+        # Wait before next check
+        time.sleep(wait_time)
+        total_wait_time += wait_time
+        
+        # Exponential backoff (but cap at max_wait_time)
+        wait_time = min(wait_time * 1.2, max_wait_time)
+        
+        # Log progress every 3 seconds
+        if int(total_wait_time) % 3 == 0:
+            log(f"⏳ Waiting for files... ({total_wait_time:.1f}s elapsed)")
+            
+            # Show directory contents for debugging
+            try:
+                if os.path.exists(staging_dir):
+                    dir_contents = os.listdir(staging_dir)
+                    if dir_contents:
+                        log(f"   📁 Directory contains: {dir_contents}")
+                    else:
+                        log(f"   📁 Directory is empty")
+                else:
+                    log(f"   📁 Directory doesn't exist yet")
+            except Exception as list_error:
+                log(f"   ⚠️  Error listing directory: {list_error}")
+    
+    # Timeout reached
+    elapsed = time.time() - start_time
+    log(f"❌ File creation timeout after {elapsed:.1f}s")
+    return False, [], elapsed
+
+def wait_for_file_creation_advanced(staging_dir, table_name, timeout_seconds=60):
+    """Advanced file system monitoring with real-time event detection.
+    
+    This function uses file system monitoring to detect when files are created,
+    providing the most reliable synchronization possible.
+    
+    Args:
+        staging_dir: Directory to monitor
+        table_name: Name of the table being processed
+        timeout_seconds: Maximum time to wait
+    
+    Returns:
+        tuple: (success, staging_files, wait_time)
+    """
+    import time
+    import os
+    
+    log(f"🔍 Advanced file monitoring in: {staging_dir}")
+    start_time = time.time()
+    
+    # Initial check - maybe files are already there
+    files_exist, staging_files = validate_staging_files_exist(staging_dir, table_name)
+    if files_exist:
+        log(f"✅ Files already exist: {staging_files}")
+        return True, staging_files, 0.0
+    
+    # Try to use file system monitoring if available
+    try:
+        # Check if watchdog is available for real-time monitoring
+        import watchdog
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+        
+        class FileCreationHandler(FileSystemEventHandler):
+            def __init__(self, target_files, result_container):
+                self.target_files = target_files
+                self.result_container = result_container
+                self.files_created = []
+                
+            def on_created(self, event):
+                if not event.is_directory:
+                    file_name = os.path.basename(event.src_path)
+                    if file_name.endswith(('.parquet', '.json', '.csv')):
+                        self.files_created.append(file_name)
+                        log(f"📁 File created: {file_name}")
+                        
+                        # Check if we have all expected files
+                        if len(self.files_created) >= len(self.target_files):
+                            self.result_container['success'] = True
+                            self.result_container['files'] = self.files_created.copy()
+        
+        # Set up file monitoring
+        result_container = {'success': False, 'files': []}
+        event_handler = FileCreationHandler([], result_container)
+        observer = Observer()
+        observer.schedule(event_handler, staging_dir, recursive=False)
+        observer.start()
+        
+        log(f"🔍 File system monitoring started")
+        
+        # Wait for files with monitoring
+        wait_time = 0.1
+        total_wait_time = 0
+        
+        while total_wait_time < timeout_seconds and not result_container['success']:
+            time.sleep(wait_time)
+            total_wait_time += wait_time
+            
+            # Also check manually as backup
+            files_exist, staging_files = validate_staging_files_exist(staging_dir, table_name)
+            if files_exist:
+                result_container['success'] = True
+                result_container['files'] = staging_files
+                break
+            
+            # Exponential backoff
+            wait_time = min(wait_time * 1.2, 2.0)
+            
+            # Log progress
+            if int(total_wait_time) % 3 == 0:
+                log(f"⏳ Monitoring files... ({total_wait_time:.1f}s elapsed)")
+        
+        # Stop monitoring
+        observer.stop()
+        observer.join()
+        
+        if result_container['success']:
+            elapsed = time.time() - start_time
+            log(f"✅ Files detected via monitoring after {elapsed:.1f}s")
+            return True, result_container['files'], elapsed
+            
+    except ImportError:
+        log(f"⚠️  Watchdog not available, using fallback monitoring")
+    except Exception as monitor_error:
+        log(f"⚠️  File monitoring failed: {monitor_error}")
+    
+    # Fallback to standard monitoring
+    return wait_for_file_creation(staging_dir, table_name, timeout_seconds)
 
 if __name__ == "__main__":
     import sys

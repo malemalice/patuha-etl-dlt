@@ -15,16 +15,15 @@ RUN apt-get update && apt-get install -y \
 # Set the working directory
 WORKDIR /app
 
-# Copy the dependency file and install Python dependencies
-COPY source/requirements.txt ./
+# Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir pymysql && \
-    pip install --no-cache-dir "dlt[sqlalchemy]>=1.15.0" && \
-    pip install --no-cache-dir mysqlclient && \
-    pip install --no-cache-dir python-dotenv && \
-    pip install --no-cache-dir pandas>=1.5.0 && \
-    pip install --no-cache-dir pyarrow>=10.0.0
+    pip install --no-cache-dir \
+    dlt[sqlalchemy]>=1.15.0 \
+    sqlalchemy>=1.4.0 \
+    mysqlclient>=2.1.0 \
+    pandas>=1.5.0 \
+    pyarrow>=10.0.0 \
+    watchdog>=3.0.0
 
 # Create staging directory for Parquet files
 RUN mkdir -p /app/staging && \

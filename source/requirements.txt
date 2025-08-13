@@ -1,7 +1,6 @@
 dlt>=1.15.0
-mysql-connector-python
-pymysql
-sqlalchemy
-setuptools<81
+sqlalchemy>=1.4.0
+mysqlclient>=2.1.0
 pandas>=1.5.0
 pyarrow>=10.0.0
+watchdog>=3.0.0
