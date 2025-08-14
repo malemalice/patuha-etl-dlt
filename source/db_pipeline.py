@@ -2421,27 +2421,29 @@ def create_file_staging_pipeline(pipeline_name, staging_dir=None):
             log(f"⚠️  dlt.destinations.parquet not available, trying filesystem destination...")
             
             # Second try: Filesystem destination (DLT >= 1.15.0)
+            # Note: DLT filesystem destination has specific configuration requirements
             try:
-                destination = dlt.destinations.filesystem(
-                    staging_dir,
-                    file_format="parquet",
-                    compression=FILE_STAGING_COMPRESSION
-                )
-                log(f"✅ Using dlt.destinations.filesystem destination with Parquet format")
-            except AttributeError:
-                log(f"⚠️  dlt.destinations.filesystem not available, trying filesystem without format...")
-                
-                # Third try: Basic filesystem destination
+                # Use the correct DLT filesystem destination configuration for 1.15.0+
+                destination = dlt.destinations.filesystem(staging_dir)
+                log(f"✅ Using dlt.destinations.filesystem destination (basic)")
+            except Exception as filesystem_error:
+                log(f"⚠️  Basic filesystem destination failed: {filesystem_error}")
+                # Last resort: Use filesystem with path parameter
                 try:
-                    destination = dlt.destinations.filesystem(staging_dir)
-                    log(f"✅ Using dlt.destinations.filesystem destination (basic)")
-                except AttributeError:
-                    # Last resort: Use filesystem with path
+                    destination = dlt.destinations.filesystem(path=staging_dir)
+                    log(f"✅ Using dlt.destinations.filesystem destination (path parameter)")
+                except Exception as e:
+                    log(f"❌ No compatible filesystem destination found: {e}")
+                    # Try to create a simple text-based destination as fallback
                     try:
-                        destination = dlt.destinations.filesystem(path=staging_dir)
-                        log(f"✅ Using dlt.destinations.filesystem destination (path parameter)")
-                    except Exception as e:
-                        log(f"❌ No compatible filesystem destination found: {e}")
+                        log(f"🔄 Attempting to create text-based destination as fallback...")
+                        destination = dlt.destinations.filesystem(
+                            staging_dir,
+                            file_format="jsonl"  # JSON Lines format is more reliable
+                        )
+                        log(f"✅ Using dlt.destinations.filesystem with JSONL format")
+                    except Exception as fallback_error:
+                        log(f"❌ All destination attempts failed: {fallback_error}")
                         raise Exception(f"No compatible staging destination found in DLT version {dlt.__version__}")
         
         if destination is None:
@@ -2460,10 +2462,67 @@ def create_file_staging_pipeline(pipeline_name, staging_dir=None):
             progress="log"  # Log progress for better monitoring
         )
         
+        log(f"🔧 Pipeline configuration:")
+        log(f"   Pipeline name: {pipeline.pipeline_name}")
+        log(f"   Dataset name: {pipeline.dataset_name}")
+        log(f"   Destination: {pipeline.destination}")
+        log(f"   Working directory: {pipeline.working_dir}")
+        log(f"   State path: {pipeline.state_path}")
+        
         log(f"✅ Staging pipeline created successfully: {pipeline_name}")
         log(f"   Staging directory: {staging_dir}")
         log(f"   Pipeline type: {type(pipeline)}")
         log(f"   DLT version: {dlt.__version__}")
+        log(f"   Destination type: {type(destination)}")
+        log(f"   Destination: {destination}")
+        
+        # Check DLT environment and configuration
+        try:
+            dlt_config = dlt.config
+            log(f"   DLT config: {dlt_config}")
+            
+            # Check DLT working directory
+            dlt_working_dir = dlt.config.get('working_dir', 'Not set')
+            log(f"   DLT working directory: {dlt_working_dir}")
+            
+            # Check DLT data directory
+            dlt_data_dir = dlt.config.get('data_dir', 'Not set')
+            log(f"   DLT data directory: {dlt_data_dir}")
+            
+        except Exception as config_error:
+            log(f"⚠️  Could not access DLT config: {config_error}")
+        
+        # Check if staging directory is writable
+        try:
+            test_file = os.path.join(staging_dir, "dlt_test_write.tmp")
+            with open(test_file, 'w') as f:
+                f.write("DLT write test")
+            os.remove(test_file)
+            log(f"✅ Staging directory is writable")
+        except Exception as write_error:
+            log(f"❌ Staging directory is not writable: {write_error}")
+            log(f"   This will prevent DLT from creating files")
+        
+        # Check DLT version compatibility
+        try:
+            dlt_version = dlt.__version__
+            log(f"   DLT version: {dlt_version}")
+            
+            # Check if this version supports filesystem destination
+            if dlt_version.startswith('1.15'):
+                log(f"   ✅ DLT 1.15.x detected - filesystem destination should work")
+            elif dlt_version.startswith('1.16') or dlt_version.startswith('1.17'):
+                log(f"   ✅ DLT {dlt_version} detected - filesystem destination should work")
+            else:
+                log(f"   ⚠️  DLT version {dlt_version} - filesystem destination compatibility unknown")
+        except Exception as version_error:
+            log(f"⚠️  Could not determine DLT version: {version_error}")
+        
+        # Test the destination to ensure it's working
+        if not test_filesystem_destination(destination, staging_dir):
+            log(f"⚠️  Filesystem destination test failed, but continuing...")
+        else:
+            log(f"✅ Filesystem destination test passed")
         
         return pipeline, staging_dir
         
@@ -2491,12 +2550,19 @@ def process_file_staging_files(staging_dir, table_name, engine_target, primary_k
         # Find staging files for this table
         staging_files = []
         for file in os.listdir(staging_dir):
-            # Check for various file extensions that might be used
-            if (file.endswith(('.parquet', '.json', '.csv')) and table_name in file):
+            # Check for various file extensions and DLT-specific patterns
+            if ((file.endswith(('.parquet', '.json', '.csv', '.jsonl')) and table_name in file) or
+                (file.startswith('data_') and table_name in file) or
+                (file.startswith('schema_') and table_name in file) or
+                ('load' in file.lower() and table_name in file) or
+                ('state' in file.lower() and table_name in file)):
                 staging_files.append(os.path.join(staging_dir, file))
         
         if not staging_files:
             log(f"⚠️  No staging files found for table: {table_name}")
+            # Check if there are any files at all (for debugging)
+            all_files = os.listdir(staging_dir)
+            log(f"   All files in staging directory: {all_files}")
             return False
         
         log(f"📁 Found {len(staging_files)} staging files to process")
@@ -2517,6 +2583,9 @@ def process_file_staging_files(staging_dir, table_name, engine_target, primary_k
                 file_reader = pd.read_parquet(staging_file, chunksize=batch_size)
             elif file_ext == '.json':
                 # Use pandas to read JSON in chunks
+                file_reader = pd.read_json(staging_file, lines=True, chunksize=batch_size)
+            elif file_ext == '.jsonl':
+                # Use pandas to read JSONL in chunks (JSON Lines format)
                 file_reader = pd.read_json(staging_file, lines=True, chunksize=batch_size)
             elif file_ext == '.csv':
                 # Use pandas to read CSV in chunks
@@ -2748,14 +2817,96 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
         
         try:
             # Create DLT source for the table
+            log(f"🔧 Creating DLT source for table: {table_name}")
+            log(f"   Database: {SOURCE_DB_NAME}")
+            log(f"   Engine: {type(engine_source)}")
+            
             source = sql_database(
                 engine_source,
                 table_names=[table_name],
                 schema=SOURCE_DB_NAME
             )
             
+            log(f"✅ DLT source created successfully")
+            log(f"   Source type: {type(source)}")
+            log(f"   Available resources: {list(source.resources.keys()) if hasattr(source, 'resources') else 'Unknown'}")
+            
+            # Check if the table resource exists
+            if hasattr(source, table_name):
+                table_resource = getattr(source, table_name)
+                log(f"   Table resource: {table_resource}")
+                log(f"   Table resource type: {type(table_resource)}")
+                
+                # Check if the source table has data
+                try:
+                    with engine_source.connect() as conn:
+                        count_query = f"SELECT COUNT(*) as record_count FROM {SOURCE_DB_NAME}.{table_name}"
+                        result = conn.execute(sa.text(count_query))
+                        record_count = result.fetchone()[0]
+                        log(f"   Source table record count: {record_count}")
+                        
+                        if record_count == 0:
+                            log(f"⚠️  Warning: Source table '{table_name}' has no records")
+                        else:
+                            log(f"✅ Source table '{table_name}' has {record_count} records to process")
+                except Exception as count_error:
+                    log(f"⚠️  Could not check source table record count: {count_error}")
+            else:
+                log(f"⚠️  Table resource '{table_name}' not found in source")
+                log(f"   Available resources: {dir(source)}")
+            
             # Run the staging pipeline to extract data
-            staging_pipeline.run(source)
+            log(f"🚀 Starting DLT pipeline extraction for table: {table_name}")
+            log(f"   Source: {SOURCE_DB_NAME}.{table_name}")
+            log(f"   Destination: {staging_dir}")
+            log(f"   Pipeline: {staging_pipeline.pipeline_name}")
+            
+            # Validate source before running pipeline
+            try:
+                # Check if source has data
+                source_resource = getattr(source, table_name, None)
+                if source_resource is None:
+                    raise Exception(f"Source resource '{table_name}' not found")
+                
+                log(f"   Source resource validated: {source_resource}")
+                
+                # Check if source is properly configured
+                if hasattr(source_resource, 'incremental'):
+                    log(f"   Source has incremental configuration")
+                if hasattr(source_resource, 'primary_key'):
+                    log(f"   Source has primary key configuration")
+                    
+            except Exception as source_validation_error:
+                log(f"❌ Source validation failed: {source_validation_error}")
+                raise Exception(f"Source validation failed: {source_validation_error}")
+            
+            # Run the pipeline with detailed logging
+            try:
+                run_result = staging_pipeline.run(source)
+                log(f"✅ DLT pipeline.run() completed successfully")
+                log(f"   Run result type: {type(run_result)}")
+                log(f"   Run result: {run_result}")
+            except Exception as run_error:
+                log(f"❌ DLT pipeline.run() failed: {run_error}")
+                log(f"   Error type: {type(run_error).__name__}")
+                log(f"   Error details: {str(run_error)}")
+                
+                # Check if it's a destination-related error
+                if "destination" in str(run_error).lower() or "filesystem" in str(run_error).lower():
+                    log(f"   This appears to be a destination/filesystem error")
+                    log(f"   The DLT filesystem destination may not be working correctly")
+                
+                raise Exception(f"DLT pipeline execution failed: {run_error}")
+            
+            # Check if files were created immediately after run
+            log(f"🔍 Checking for files immediately after pipeline run...")
+            immediate_files_exist, immediate_files = validate_staging_files_exist(staging_dir, table_name)
+            if immediate_files_exist:
+                log(f"✅ Files created immediately: {immediate_files}")
+            else:
+                log(f"⚠️  No files found immediately after pipeline run")
+                log(f"   This might indicate DLT filesystem destination issue")
+                log(f"   Checking pipeline state for clues...")
             
             # Verify the pipeline actually completed successfully
             try:
@@ -2769,6 +2920,21 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
                     log(f"✅ Pipeline extraction completed at: {pipeline_state._last_extracted_at}")
                 else:
                     log(f"⚠️  Pipeline state doesn't show extraction timestamp")
+                
+                # Check for any error indicators in the state
+                if hasattr(pipeline_state, '_local'):
+                    local_state = pipeline_state._local
+                    log(f"   Local state: {local_state}")
+                    if hasattr(local_state, '_last_extracted_hash'):
+                        log(f"   Last extraction hash: {local_state._last_extracted_hash}")
+                
+                # Check if pipeline has any error indicators
+                if hasattr(pipeline_state, 'last_error'):
+                    log(f"⚠️  Pipeline has error indicator: {pipeline_state.last_error}")
+                
+                # Check pipeline working directory and state path
+                log(f"   Pipeline working directory: {staging_pipeline.working_dir}")
+                log(f"   Pipeline state path: {staging_pipeline.state_path}")
                 
                 log(f"✅ Data extracted to file staging files")
                 
@@ -2799,6 +2965,26 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
         if not success:
             log(f"❌ File creation failed after {wait_time:.1f}s")
             log(f"🔄 Skipping file processing since no staging files exist")
+            
+            # Try alternative staging strategy: memory-based staging
+            log(f"🔄 Attempting alternative staging strategy: memory-based staging...")
+            try:
+                if attempt_memory_based_staging(table_name, table_config, engine_source, engine_target, primary_keys):
+                    log(f"✅ Memory-based staging successful for table: {table_name}")
+                    # Clean up the empty staging directory
+                    try:
+                        if os.path.exists(staging_dir):
+                            import shutil
+                            shutil.rmtree(staging_dir)
+                            log(f"🧹 Cleaned up empty staging directory: {staging_dir}")
+                    except Exception as cleanup_error:
+                        log(f"⚠️  Warning: Could not clean up empty staging directory: {cleanup_error}")
+                    return True
+                else:
+                    log(f"❌ Memory-based staging also failed for table: {table_name}")
+            except Exception as memory_error:
+                log(f"❌ Memory-based staging error: {memory_error}")
+            
             # Clean up the empty staging directory
             try:
                 if os.path.exists(staging_dir):
@@ -2911,12 +3097,52 @@ def validate_staging_files_exist(staging_dir, table_name):
     """
     try:
         if not os.path.exists(staging_dir):
+            log(f"❌ Staging directory does not exist: {staging_dir}")
             return False, []
         
+        # List all files and directories for debugging
+        all_items = os.listdir(staging_dir)
+        log(f"🔍 Staging directory contents: {all_items}")
+        
         staging_files = []
-        for file in os.listdir(staging_dir):
-            if file.endswith(('.parquet', '.json', '.csv')):
-                staging_files.append(file)
+        for item in all_items:
+            item_path = os.path.join(staging_dir, item)
+            
+            # Check if it's a file with known extensions
+            if os.path.isfile(item_path):
+                # Check for various file types that DLT might create
+                if (item.endswith(('.parquet', '.json', '.csv', '.txt', '.log', '.jsonl')) or
+                    item.startswith('data_') or  # DLT data files
+                    item.startswith('schema_') or  # DLT schema files
+                    'load' in item.lower() or  # DLT load files
+                    'state' in item.lower()):   # DLT state files
+                    staging_files.append(item)
+                    log(f"   Found file: {item}")
+            
+            # Check if it's a directory (DLT might create subdirectories)
+            elif os.path.isdir(item_path):
+                log(f"   Found subdirectory: {item}")
+                # Recursively check subdirectories for files
+                try:
+                    sub_files = os.listdir(item_path)
+                    log(f"     Subdirectory contents: {sub_files}")
+                    for sub_file in sub_files:
+                        sub_file_path = os.path.join(item_path, sub_file)
+                        if os.path.isfile(sub_file_path):
+                            # Check for DLT-specific file patterns
+                            if (sub_file.endswith(('.parquet', '.json', '.csv', '.txt', '.log', '.jsonl')) or
+                                sub_file.startswith('data_') or
+                                sub_file.startswith('schema_') or
+                                'load' in sub_file.lower() or
+                                'state' in sub_file.lower()):
+                                staging_files.append(os.path.join(item, sub_file))
+                                log(f"     Found file in subdirectory: {item}/{sub_file}")
+                except Exception as sub_error:
+                    log(f"     Error reading subdirectory {item}: {sub_error}")
+        
+        log(f"📁 Total staging files found: {len(staging_files)}")
+        if staging_files:
+            log(f"   Files: {staging_files}")
         
         return len(staging_files) > 0, staging_files
         
@@ -3268,6 +3494,116 @@ def wait_for_file_creation_advanced(staging_dir, table_name, timeout_seconds=60)
     
     # Fallback to standard monitoring
     return wait_for_file_creation(staging_dir, table_name, timeout_seconds)
+
+def attempt_memory_based_staging(table_name, table_config, engine_source, engine_target, primary_keys):
+    """Attempt to process table using memory-based staging as fallback.
+    
+    This function serves as a fallback when DLT filesystem destination fails.
+    It directly extracts data from source and merges to target without intermediate files.
+    
+    Args:
+        table_name: Name of the table to process
+        table_config: Table configuration dictionary
+        engine_source: Source database engine
+        engine_target: Target database engine
+        primary_keys: Primary key columns
+    
+    Returns:
+        bool: True if processing was successful
+    """
+    try:
+        log(f"🔄 Attempting memory-based staging for table: {table_name}")
+        
+        # Get modifier column for incremental sync
+        modifier_column = table_config.get('modifier', 'updated_at')
+        
+        # Get the last sync timestamp from target table
+        max_timestamp = None
+        try:
+            with engine_target.connect() as conn:
+                # Check if table exists and has the modifier column
+                inspector = sa.inspect(engine_target)
+                if table_name in inspector.get_table_names():
+                    columns = [col['name'] for col in inspector.get_columns(table_name)]
+                    if modifier_column in columns:
+                        # Get max timestamp from target table
+                        max_query = f"SELECT MAX(`{modifier_column}`) as max_time FROM `{table_name}`"
+                        result = conn.execute(sa.text(max_query))
+                        max_timestamp = result.fetchone()[0]
+                        log(f"   Last sync timestamp: {max_timestamp}")
+                    else:
+                        log(f"   Modifier column '{modifier_column}' not found in target table")
+                else:
+                    log(f"   Target table '{table_name}' does not exist, will create it")
+        except Exception as timestamp_error:
+            log(f"⚠️  Could not get last sync timestamp: {timestamp_error}")
+        
+        # Extract data from source table
+        log(f"📤 Extracting data from source table: {table_name}")
+        
+        if max_timestamp:
+            # Incremental sync
+            source_query = f"""
+            SELECT * FROM `{table_name}` 
+            WHERE `{modifier_column}` > %s 
+            ORDER BY `{modifier_column}`
+            """
+            source_params = [max_timestamp]
+            log(f"   Using incremental sync with timestamp: {max_timestamp}")
+        else:
+            # Full sync
+            source_query = f"SELECT * FROM `{table_name}` ORDER BY `{modifier_column}`"
+            source_params = []
+            log(f"   Using full sync (no previous timestamp found)")
+        
+        # Execute source query in chunks
+        chunk_size = 10000
+        total_records = 0
+        
+        with engine_source.connect() as source_conn:
+            # Get total count first
+            count_query = f"SELECT COUNT(*) as total FROM `{table_name}`"
+            if max_timestamp:
+                count_query += f" WHERE `{modifier_column}` > %s"
+            
+            count_result = source_conn.execute(sa.text(count_query), source_params)
+            total_count = count_result.fetchone()[0]
+            log(f"   Total records to process: {total_count}")
+            
+            if total_count == 0:
+                log(f"✅ No new records to sync")
+                return True
+            
+            # Process in chunks
+            offset = 0
+            while offset < total_count:
+                chunk_query = source_query + f" LIMIT {chunk_size} OFFSET {offset}"
+                chunk_result = source_conn.execute(sa.text(chunk_query), source_params)
+                chunk_records = chunk_result.fetchall()
+                
+                if not chunk_records:
+                    break
+                
+                # Convert to list of dictionaries
+                columns = [desc[0] for desc in chunk_result.description]
+                records = [dict(zip(columns, row)) for row in chunk_records]
+                
+                # Process this chunk
+                if not process_data_chunk(records, table_name, engine_target, primary_keys):
+                    log(f"❌ Failed to process chunk starting at offset {offset}")
+                    return False
+                
+                total_records += len(records)
+                offset += chunk_size
+                log(f"   Processed {total_records}/{total_count} records ({total_records/total_count*100:.1f}%)")
+        
+        log(f"✅ Memory-based staging completed successfully for table: {table_name}")
+        log(f"   Total records processed: {total_records}")
+        return True
+        
+    except Exception as memory_error:
+        log(f"❌ Memory-based staging failed for table {table_name}: {memory_error}")
+        return False
 
 if __name__ == "__main__":
     import sys
