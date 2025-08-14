@@ -117,7 +117,7 @@ def retry_on_lock_timeout(func: Callable, db_type: str = "unknown", operation_na
                 'server has gone away', 
                 'mysql server has gone away',
                 'lost connection to mysql server'
-            ]):
+            ])
             
             if is_lock_error or is_connection_error:
                 log(f"🔒 Lock/connection error on attempt {attempt + 1}/{config.LOCK_TIMEOUT_RETRIES} for {operation_name} [{db_type}]: {e}")
@@ -171,7 +171,7 @@ def retry_on_connection_loss(func: Callable, db_type: str = "unknown", operation
                 'broken pipe',
                 'connection reset by peer',
                 'connection timeout'
-            ]):
+            ])
             
             if is_connection_loss:
                 log(f"🔌 Connection loss detected on attempt {attempt + 1}/{config.CONNECTION_LOSS_RETRIES} for {operation_name} [{db_type}]: {e}")

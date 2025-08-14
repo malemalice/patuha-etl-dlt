@@ -8,10 +8,7 @@ import dlt
 from dlt.sources.sql_database import sql_database
 import sqlalchemy as sa
 from typing import Dict, Any, List, Union
-from config import (
-    table_configs, BATCH_SIZE, BATCH_DELAY, DEBUG_MODE, PRESERVE_COLUMN_NAMES,
-    MERGE_OPTIMIZATION_ENABLED
-)
+import config
 from utils import log, format_primary_key, validate_primary_key_config, log_primary_key_info
 from database import execute_with_transaction_management, ensure_dlt_columns
 from schema_management import sync_table_schema
@@ -294,7 +291,7 @@ def create_pipeline(pipeline_name="mysql_sync", destination="mysql"):
             "dataset_name": "sync_data"
         }
         
-        if PRESERVE_COLUMN_NAMES:
+        if config.PRESERVE_COLUMN_NAMES:
             pipeline_config["config"] = {"normalize": {"naming": "direct"}}
         
         pipeline = dlt.pipeline(**pipeline_config)
@@ -314,19 +311,19 @@ def load_select_tables_from_database():
         # Create DLT pipeline
         pipeline = create_pipeline()
         
-        log(f"🚀 Starting database sync with {len(table_configs)} configured tables")
-        log(f"📋 Configured tables: {list(table_configs.keys())}")
+        log(f"🚀 Starting database sync with {len(config.table_configs)} configured tables")
+        log(f"📋 Configured tables: {list(config.table_configs.keys())}")
         
         # Process tables in batches
-        table_items = list(table_configs.items())
+        table_items = list(config.table_configs.items())
         total_successful = 0
         total_failed = 0
         
-        for i in range(0, len(table_items), BATCH_SIZE):
-            batch_num = (i // BATCH_SIZE) + 1
-            total_batches = (len(table_items) + BATCH_SIZE - 1) // BATCH_SIZE
+        for i in range(0, len(table_items), config.BATCH_SIZE):
+            batch_num = (i // config.BATCH_SIZE) + 1
+            total_batches = (len(table_items) + config.BATCH_SIZE - 1) // config.BATCH_SIZE
             
-            batch_items = table_items[i:i + BATCH_SIZE]
+            batch_items = table_items[i:i + config.BATCH_SIZE]
             batch_dict = dict(batch_items)
             
             log(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_dict)} tables)")
@@ -336,17 +333,17 @@ def load_select_tables_from_database():
             total_failed += failed
             
             # Add delay between batches
-            if i + BATCH_SIZE < len(table_items) and BATCH_DELAY > 0:
-                log(f"⏳ Waiting {BATCH_DELAY} seconds before next batch...")
-                time.sleep(BATCH_DELAY)
+            if i + config.BATCH_SIZE < len(table_items) and config.BATCH_DELAY > 0:
+                log(f"⏳ Waiting {config.BATCH_DELAY} seconds before next batch...")
+                time.sleep(config.BATCH_DELAY)
         
         # Final summary
         log(f"\n{'='*60}")
         log(f"🎯 FINAL SYNC SUMMARY")
-        log(f"📊 Total tables processed: {len(table_configs)}")
+        log(f"📊 Total tables processed: {len(config.table_configs)}")
         log(f"✅ Successful: {total_successful}")
         log(f"❌ Failed: {total_failed}")
-        log(f"📈 Success rate: {(total_successful/len(table_configs)*100):.1f}%")
+        log(f"📈 Success rate: {(total_successful/len(config.table_configs)*100):.1f}%")
         log(f"{'='*60}")
     
     return retry_on_connection_error(_load_tables, "pipeline")

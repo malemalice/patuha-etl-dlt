@@ -9,7 +9,7 @@ import pandas as pd
 from decimal import Decimal
 import math
 import orjson
-from config import DEBUG_MODE, AUTO_SANITIZE_DATA, DEEP_DEBUG_JSON
+import config
 from utils import log
 
 def validate_table_data(engine_source, table_name):
@@ -21,7 +21,7 @@ def validate_table_data(engine_source, table_name):
             row_count = connection.execute(sa.text(count_query)).scalar()
             
             if row_count == 0:
-                if DEBUG_MODE:
+                if config.DEBUG_MODE:
                     log(f"Table {table_name} is empty")
                 return True
             
@@ -30,7 +30,7 @@ def validate_table_data(engine_source, table_name):
             result = connection.execute(sa.text(sample_query))
             sample_rows = result.fetchall()
             
-            if DEBUG_MODE:
+            if config.DEBUG_MODE:
                 log(f"Table {table_name} validation - Rows: {row_count}, Sample fetched: {len(sample_rows)}")
             
             # Basic validation passed
@@ -112,7 +112,7 @@ def sanitize_data_value(value, column_name="unknown"):
 @dlt.transformer
 def sanitize_table_data(items):
     """DLT transformer to sanitize data before JSON serialization."""
-    if not AUTO_SANITIZE_DATA:
+    if not config.AUTO_SANITIZE_DATA:
         return items
         
     for item in items:
@@ -228,7 +228,7 @@ def debug_json_parse_error(engine_source, table_name, limit=10):
 
 def debug_value_for_json_parse_error(col_name, value, row_num):
     """Debug a specific value for JSON parse error potential."""
-    if not DEEP_DEBUG_JSON:
+    if not config.DEEP_DEBUG_JSON:
         return
         
     try:

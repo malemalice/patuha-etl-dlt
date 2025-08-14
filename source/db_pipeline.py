@@ -29,7 +29,7 @@ import sys
 from typing import Any, Union, List
 
 # Import configuration first
-from config import INTERVAL, DEBUG_MODE, table_configs
+import config
 
 # Import utilities
 from utils import log
@@ -46,13 +46,13 @@ def validate_table_configurations():
     
     log("🔍 Validating table configurations...")
     
-    for table_name, config in table_configs.items():
+    for table_name, table_config in config.table_configs.items():
         # Check if primary_key exists
-        if "primary_key" not in config:
+        if "primary_key" not in table_config:
             log(f"❌ Table '{table_name}' missing primary_key configuration")
             continue
             
-        primary_key = config["primary_key"]
+        primary_key = table_config["primary_key"]
         
         # Validate primary key configuration
         if not validate_primary_key_config(primary_key):
@@ -63,17 +63,17 @@ def validate_table_configurations():
         log_primary_key_info(table_name, primary_key)
         
         # Check if modifier exists for incremental sync
-        if "modifier" in config:
-            log(f"📅 Table '{table_name}' configured for incremental sync using column: {config['modifier']}")
+        if "modifier" in table_config:
+            log(f"📅 Table '{table_name}' configured for incremental sync using column: {table_config['modifier']}")
         else:
             log(f"🔄 Table '{table_name}' configured for full refresh sync")
     
-    log(f"✅ Table configuration validation completed for {len(table_configs)} tables")
+    log(f"✅ Table configuration validation completed for {len(config.table_configs)} tables")
 
 def run_pipeline():
     """Main pipeline execution function."""
-    if INTERVAL > 0:
-        log(f"🔄 Running pipeline in continuous mode (interval: {INTERVAL} seconds)")
+    if config.INTERVAL > 0:
+        log(f"🔄 Running pipeline in continuous mode (interval: {config.INTERVAL} seconds)")
         while True:
             try:
                 log(f"\n{'='*80}")
@@ -83,17 +83,17 @@ def run_pipeline():
                 load_select_tables_from_database()
                 
                 log(f"✅ Sync cycle completed at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                log(f"⏳ Waiting {INTERVAL} seconds until next sync...")
+                log(f"⏳ Waiting {config.INTERVAL} seconds until next sync...")
                 
-                time.sleep(INTERVAL)
+                time.sleep(config.INTERVAL)
                 
             except KeyboardInterrupt:
                 log("🛑 Received interrupt signal, shutting down gracefully...")
                 break
             except Exception as e:
                 log(f"❌ Error in sync cycle: {e}")
-                log(f"⏳ Waiting {INTERVAL} seconds before retry...")
-                time.sleep(INTERVAL)
+                log(f"⏳ Waiting {config.INTERVAL} seconds before retry...")
+                time.sleep(config.INTERVAL)
     else:
         log("🔄 Running pipeline in single execution mode")
         try:
@@ -117,8 +117,8 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
         
         log("🚀 Starting DLT Database Sync Pipeline")
-        log(f"🐛 Debug mode: {'ON' if DEBUG_MODE else 'OFF'}")
-        log(f"📊 Tables configured: {len(table_configs)}")
+        log(f"🐛 Debug mode: {'ON' if config.DEBUG_MODE else 'OFF'}")
+        log(f"📊 Tables configured: {len(config.table_configs)}")
         
         # Validate table configurations
         validate_table_configurations()
