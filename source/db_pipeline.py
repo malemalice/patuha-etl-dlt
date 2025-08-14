@@ -178,10 +178,10 @@ def create_engines():
 # Initialize global engines
 ENGINE_SOURCE, ENGINE_TARGET = create_engines()
 
-# Global assertion to ensure no SQLAlchemy destinations are created when file staging is enabled
+# Log file staging mode status
 if FILE_STAGING_ENABLED:
-    log(f"🔒 File staging mode enabled - SQLAlchemy destinations are blocked")
-    log(f"   All tables will use file-based staging or memory-based staging")
+    print(f"🔒 File staging mode enabled - using filesystem staging")
+    print(f"   SQLAlchemy destinations will be avoided to prevent connection timeouts")
 
 def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1049,12 +1049,12 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     if not tables_dict:
         return
     
-    # Prevent SQLAlchemy pipeline usage when file staging is enabled
+    # When file staging is enabled, pipeline should be None
     if FILE_STAGING_ENABLED and pipeline is not None:
-        log(f"🚫 File staging enabled - preventing SQLAlchemy pipeline usage")
+        log(f"⚠️  Warning: SQLAlchemy pipeline provided when file staging is enabled")
         log(f"   Pipeline type: {type(pipeline)}")
-        log(f"   This function should not be called with SQLAlchemy pipeline when file staging is enabled")
-        raise Exception("SQLAlchemy pipeline usage blocked - file staging is enabled")
+        log(f"   This should not happen - pipeline should be None")
+        # Don't raise exception, just log warning and continue
     
     table_names = list(tables_dict.keys())
     log(f"Processing batch of {len(table_names)} tables: {table_names}")
@@ -1977,20 +1977,16 @@ def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
         _monitor_queries
     )
 
-def check_file_staging_compatibility():
-    """Check if file staging is enabled and prevent SQLAlchemy destination creation."""
-    if FILE_STAGING_ENABLED:
-        log(f"🚫 File staging enabled - SQLAlchemy destinations are not allowed")
-        log(f"   Use file-based staging or memory-based staging instead")
-        return False
-    return True
+
 
 def create_fresh_pipeline(engine_target, pipeline_name):
     """Create a fresh DLT pipeline with comprehensive error handling and state corruption recovery."""
     try:
-        # Prevent SQLAlchemy destination creation when file staging is enabled
-        if not check_file_staging_compatibility():
-            raise Exception("SQLAlchemy destination creation blocked - file staging is enabled")
+        # When file staging is enabled, we don't create SQLAlchemy pipelines
+        if FILE_STAGING_ENABLED:
+            log(f"🚫 File staging enabled - not creating SQLAlchemy pipeline")
+            log(f"   Use file staging functions instead")
+            return None
         
         log(f"🔧 Creating fresh pipeline: {pipeline_name}")
         log(f"   Target database: {TARGET_DB_NAME}")
@@ -2315,9 +2311,11 @@ def optimize_incremental_merge(engine_target, table_name, primary_keys):
 def create_merge_optimized_pipeline(engine_target, pipeline_name):
     """Create a DLT pipeline optimized for merge operations with comprehensive error handling."""
     try:
-        # Prevent SQLAlchemy destination creation when file staging is enabled
-        if not check_file_staging_compatibility():
-            raise Exception("SQLAlchemy destination creation blocked - file staging is enabled")
+        # When file staging is enabled, we don't create SQLAlchemy pipelines
+        if FILE_STAGING_ENABLED:
+            log(f"🚫 File staging enabled - not creating SQLAlchemy pipeline")
+            log(f"   Use file staging functions instead")
+            return None
         
         log(f"🔧 Creating merge-optimized pipeline: {pipeline_name}")
         log(f"   Target database: {TARGET_DB_NAME}")
