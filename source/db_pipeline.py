@@ -2490,20 +2490,61 @@ def create_file_staging_pipeline(pipeline_name, staging_dir=None):
             log(f"⚠️  Filesystem destination test failed, but continuing...")
         
         # Create the pipeline with staging destination
-        pipeline = dlt.pipeline(
-            pipeline_name=pipeline_name,
-            destination=destination,
-            dataset_name=TARGET_DB_NAME,
-            dev_mode=False,
-            progress="log"  # Log progress for better monitoring
-        )
+        try:
+            pipeline = dlt.pipeline(
+                pipeline_name=pipeline_name,
+                destination=destination,
+                dataset_name=TARGET_DB_NAME,
+                dev_mode=False,
+                progress="log"  # Log progress for better monitoring
+            )
+            
+            # Validate that the pipeline was created successfully
+            if pipeline is None:
+                raise Exception("Pipeline creation returned None")
+                
+            log(f"🔧 Pipeline created successfully, validating attributes...")
+            
+        except Exception as pipeline_creation_error:
+            log(f"❌ Pipeline creation failed: {pipeline_creation_error}")
+            log(f"   Error type: {type(pipeline_creation_error).__name__}")
+            log(f"   DLT version: {dlt.__version__}")
+            log(f"   Destination type: {type(destination)}")
+            raise Exception(f"Pipeline creation failed: {pipeline_creation_error}")
         
         log(f"🔧 Pipeline configuration:")
-        log(f"   Pipeline name: {pipeline.pipeline_name}")
-        log(f"   Dataset name: {pipeline.dataset_name}")
-        log(f"   Destination: {pipeline.destination}")
-        log(f"   Working directory: {pipeline.working_dir}")
-        log(f"   State path: {pipeline.state_path}")
+        # Safe access to pipeline attributes (may not exist in all DLT versions)
+        try:
+            if hasattr(pipeline, 'pipeline_name'):
+                log(f"   Pipeline name: {pipeline.pipeline_name}")
+            else:
+                log(f"   Pipeline name: Not available in this DLT version")
+                
+            if hasattr(pipeline, 'dataset_name'):
+                log(f"   Dataset name: {pipeline.dataset_name}")
+            else:
+                log(f"   Dataset name: Not available in this DLT version")
+                
+            if hasattr(pipeline, 'destination'):
+                log(f"   Destination: {pipeline.destination}")
+            else:
+                log(f"   Destination: Not available in this DLT version")
+                
+            if hasattr(pipeline, 'working_dir'):
+                log(f"   Working directory: {pipeline.working_dir}")
+            else:
+                log(f"   Working directory: Not available in this DLT version")
+                
+            # Safe access to state_path attribute (may not exist in all DLT versions)
+            if hasattr(pipeline, 'state_path'):
+                log(f"   State path: {pipeline.state_path}")
+            else:
+                log(f"   State path: Not available in this DLT version")
+                
+        except Exception as attr_error:
+            log(f"⚠️  Warning: Could not access some pipeline attributes: {attr_error}")
+            log(f"   This may be due to DLT version differences")
+            log(f"   Continuing with available attributes...")
         
         log(f"✅ Staging pipeline created successfully: {pipeline_name}")
         log(f"   Staging directory: {staging_dir}")
@@ -2895,7 +2936,15 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
             log(f"🚀 Starting DLT pipeline extraction for table: {table_name}")
             log(f"   Source: {SOURCE_DB_NAME}.{table_name}")
             log(f"   Destination: {staging_dir}")
-            log(f"   Pipeline: {staging_pipeline.pipeline_name}")
+            # Safe access to pipeline_name attribute
+            try:
+                if hasattr(staging_pipeline, 'pipeline_name'):
+                    log(f"   Pipeline: {staging_pipeline.pipeline_name}")
+                else:
+                    log(f"   Pipeline: Not available in this DLT version")
+            except Exception as attr_error:
+                log(f"⚠️  Warning: Could not access pipeline name: {attr_error}")
+                log(f"   Pipeline: Not available in this DLT version")
             
             # Validate source before running pipeline
             try:
@@ -2969,8 +3018,22 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
                     log(f"⚠️  Pipeline has error indicator: {pipeline_state.last_error}")
                 
                 # Check pipeline working directory and state path
-                log(f"   Pipeline working directory: {staging_pipeline.working_dir}")
-                log(f"   Pipeline state path: {staging_pipeline.state_path}")
+                try:
+                    # Safe access to working_dir attribute
+                    if hasattr(staging_pipeline, 'working_dir'):
+                        log(f"   Pipeline working directory: {staging_pipeline.working_dir}")
+                    else:
+                        log(f"   Pipeline working directory: Not available in this DLT version")
+                        
+                    # Safe access to state_path attribute (may not exist in all DLT versions)
+                    if hasattr(staging_pipeline, 'state_path'):
+                        log(f"   Pipeline state path: {staging_pipeline.state_path}")
+                    else:
+                        log(f"   Pipeline state path: Not available in this DLT version")
+                except Exception as attr_error:
+                    log(f"⚠️  Warning: Could not access pipeline attributes: {attr_error}")
+                    log(f"   Pipeline working directory: Not available in this DLT version")
+                    log(f"   Pipeline state path: Not available in this DLT version")
                 
                 log(f"✅ Data extracted to file staging files")
                 
