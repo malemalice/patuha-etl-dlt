@@ -1568,9 +1568,16 @@ def load_select_tables_from_database() -> None:
         log(f"🔄 Starting periodic connection monitoring...")
         periodic_connection_monitoring(engine_target, interval_seconds=120)
         
-        # Use a single pipeline instance with state corruption handling
-        pipeline_name = "dlt_unified_pipeline_v1_0_18"
-        pipeline = create_merge_optimized_pipeline(engine_target, pipeline_name)
+        # Use file staging for all incremental tables to avoid SQLAlchemy destination issues
+        if FILE_STAGING_ENABLED:
+            log(f"📁 File staging enabled - avoiding SQLAlchemy destination to prevent dependency issues")
+            log(f"   All incremental tables will use file-based staging")
+            pipeline = None  # No SQLAlchemy pipeline needed
+        else:
+            # Only create SQLAlchemy pipeline if file staging is disabled
+            log(f"🗄️  File staging disabled - creating SQLAlchemy pipeline")
+            pipeline_name = "dlt_unified_pipeline_v1_0_18"
+            pipeline = create_merge_optimized_pipeline(engine_target, pipeline_name)
         
         # Configure DLT to handle both strict and unrestricted MySQL modes automatically
         try:
@@ -1689,8 +1696,24 @@ def load_select_tables_from_database() -> None:
                         
                     else:
                         log(f"🗄️  Using regular database staging for incremental tables")
-                        process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "merge")
-                        
+                        if pipeline is not None:
+                            process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "merge")
+                        else:
+                            log(f"❌ Cannot use regular database staging - pipeline is None")
+                            log(f"   This should not happen when file staging is disabled")
+                            # Fall back to individual processing
+                            for table_name, table_config in batch_dict.items():
+                                try:
+                                    log(f"Attempting individual processing for table: {table_name}")
+                                    if attempt_memory_based_staging(table_name, table_config, engine_source, engine_target, 
+                                                                  table_config.get('primary_key', 'id')):
+                                        log(f"✅ Individual processing completed for table: {table_name}")
+                                    else:
+                                        log(f"❌ Individual processing failed for table: {table_name}")
+                                except Exception as individual_error:
+                                    log(f"❌ Individual processing failed for table: {table_name}: {individual_error}")
+                                    continue
+                
                 except Exception as e:
                     log(f"Error in batch processing: {e}")
                     log(f"Error type: {type(e).__name__}")
@@ -1711,21 +1734,19 @@ def load_select_tables_from_database() -> None:
                                 log(f"❌ Individual processing failed for table: {table_name}: {individual_error}")
                                 continue
                     else:
-                        # Fall back to individual table processing with regular staging
-                        log(f"🔄 Attempting to recover with individual table processing...")
+                        # Fall back to individual table processing with memory-based staging
+                        log(f"🔄 Attempting to recover with individual table processing using memory-based staging...")
                         log(f"This is likely caused by concurrent access or long-running transactions.")
                         
                         for table_name, table_config in batch_dict.items():
                             try:
                                 log(f"Attempting individual processing for table: {table_name}")
-                                # Create individual pipeline for this table
-                                individual_pipeline = create_fresh_pipeline(engine_target, f"dlt_individual_{table_name}_{int(time.time())}")
-                                
-                                if individual_pipeline:
-                                    process_tables_batch(individual_pipeline, engine_source, engine_target, {table_name: table_config}, "merge")
+                                # Use memory-based staging instead of creating SQLAlchemy pipeline
+                                if attempt_memory_based_staging(table_name, table_config, engine_source, engine_target, 
+                                                              table_config.get('primary_key', 'id')):
                                     log(f"✅ Individual processing completed for table: {table_name}")
                                 else:
-                                    log(f"❌ Failed to create individual pipeline for table: {table_name}")
+                                    log(f"❌ Individual processing failed for table: {table_name}")
                             except Exception as individual_error:
                                 log(f"❌ Individual processing failed for table: {table_name}: {individual_error}")
                                 continue
@@ -1742,7 +1763,22 @@ def load_select_tables_from_database() -> None:
                 batch_dict = {table: table_configs[table] for table in batch_tables}
                 
                 try:
-                    process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "replace")
+                    if pipeline is not None:
+                        process_tables_batch(pipeline, engine_source, engine_target, batch_dict, "replace")
+                    else:
+                        log(f"📁 Pipeline is None - using file staging for full refresh tables")
+                        # Process full refresh tables with file staging
+                        for table_name, table_config in batch_dict.items():
+                            try:
+                                log(f"Processing full refresh table with file staging: {table_name}")
+                                # For full refresh, we can use a simple approach without incremental logic
+                                if process_incremental_table_with_file(table_name, table_config, engine_source, engine_target):
+                                    log(f"✅ Full refresh table processed successfully: {table_name}")
+                                else:
+                                    log(f"❌ Full refresh table processing failed: {table_name}")
+                            except Exception as table_error:
+                                log(f"❌ Error processing full refresh table {table_name}: {table_error}")
+                                continue
                 except Exception as e:
                     log(f"Error processing full refresh batch {i//BATCH_SIZE + 1}: {e}")
                     # Continue with next batch rather than failing completely
@@ -2773,10 +2809,10 @@ def create_hybrid_pipeline(engine_target, pipeline_name, use_file_staging=True):
             pipeline, staging_dir = create_file_staging_pipeline(pipeline_name)
             return pipeline, staging_dir
         else:
-            # Fall back to regular database staging
-            log(f"🗄️  Using regular database staging")
-            pipeline = create_fresh_pipeline(engine_target, pipeline_name)
-            return pipeline, None
+            # Fall back to memory-based staging instead of SQLAlchemy destination
+            log(f"🔄 Using memory-based staging as fallback (avoiding SQLAlchemy destination)")
+            # Return None for pipeline since we'll use memory-based staging directly
+            return None, "memory_based"
             
     except Exception as pipeline_error:
         log(f"❌ Error creating hybrid pipeline: {pipeline_error}")
