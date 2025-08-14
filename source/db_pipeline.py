@@ -73,34 +73,33 @@ def validate_table_configurations():
 def run_pipeline():
     """Main pipeline execution function."""
     if config.INTERVAL > 0:
-        log(f"🔄 Running pipeline in continuous mode (interval: {config.INTERVAL} seconds)")
+        log(f"🔄 Starting continuous sync mode (interval: {config.INTERVAL}s)")
         while True:
             try:
-                log(f"\n{'='*80}")
-                log(f"🚀 Starting sync cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                log(f"\n🚀 Starting sync cycle at {time.strftime('%H:%M:%S')}")
                 
                 # Run the main sync process
                 load_select_tables_from_database()
                 
-                log(f"✅ Sync cycle completed at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                log(f"⏳ Waiting {config.INTERVAL} seconds until next sync...")
-                
+                log(f"✅ Sync cycle completed - waiting {config.INTERVAL}s until next cycle")
                 time.sleep(config.INTERVAL)
                 
             except KeyboardInterrupt:
-                log("🛑 Received interrupt signal, shutting down gracefully...")
+                log("🛑 Shutdown signal received - stopping gracefully")
                 break
             except Exception as e:
-                log(f"❌ Error in sync cycle: {e}")
-                log(f"⏳ Waiting {config.INTERVAL} seconds before retry...")
+                log(f"❌ FAILED: Sync cycle error")
+                log(f"   Error: {e}")
+                log(f"   Retrying in {config.INTERVAL}s...")
                 time.sleep(config.INTERVAL)
     else:
-        log("🔄 Running pipeline in single execution mode")
+        log("🔄 Starting single execution mode")
         try:
             load_select_tables_from_database()
             log("✅ Single execution completed successfully")
         except Exception as e:
-            log(f"❌ Error in single execution: {e}")
+            log(f"❌ FAILED: Single execution error")
+            log(f"   Error: {e}")
             sys.exit(1)
 
 def signal_handler(signum, frame):
@@ -116,46 +115,42 @@ def main():
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
-        log("🚀 Starting DLT Database Sync Pipeline")
-        log(f"🐛 Debug mode: {'ON' if config.DEBUG_MODE else 'OFF'}")
-        log(f"📊 Tables configured: {len(config.table_configs)}")
+        log("🚀 DLT Database Sync Pipeline Starting")
+        log(f"📋 Tables configured: {len(config.table_configs)}")
+        log(f"📁 File staging: {'Enabled' if config.FILE_STAGING_ENABLED else 'Disabled'}")
         
         # Validate table configurations
+        log("🔄 Validating configurations...")
         validate_table_configurations()
         
         # Initialize database engines
-        log("🔧 Initializing database connections...")
         create_engines()
         
         # Get engines for monitoring setup
         engine_source, engine_target = get_engines()
         
-        # Start HTTP health check server in background thread
-        log("🌐 Starting health check server...")
+        # Start background services
+        log("🔄 Starting background services...")
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
-        
-        # Start connection monitoring in background thread
-        log("🔍 Starting connection monitoring...")
         periodic_connection_monitoring(engine_target, interval_seconds=60)
-        
-        # Give background services time to start
         time.sleep(2)
         
         # Run the main pipeline
-        log("🚀 Starting main pipeline execution...")
+        log("🔄 Starting pipeline execution...")
         run_pipeline()
         
     except KeyboardInterrupt:
-        log("🛑 Received keyboard interrupt, shutting down...")
+        log("🛑 Keyboard interrupt - shutting down")
     except Exception as e:
-        log(f"❌ Fatal error in main: {e}")
+        log(f"❌ FATAL ERROR: Pipeline failure")
+        log(f"   Error: {e}")
         raise
     finally:
         # Clean up resources
-        log("🧹 Cleaning up resources...")
+        log("🧹 Cleaning up...")
         cleanup_engines()
-        log("👋 Pipeline shutdown complete")
+        log("👋 Shutdown complete")
 
 if __name__ == "__main__":
     main()

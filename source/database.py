@@ -10,6 +10,8 @@ from utils import log
 def create_engines():
     """Create SQLAlchemy engines with optimized connection pool settings and MySQL-specific parameters."""
     
+    log("🔧 Creating database engines...")
+    
     pool_settings = {
         'pool_size': 20,           # Configurable base pool size
         'max_overflow': 30,        # Configurable overflow limit  
@@ -29,49 +31,50 @@ def create_engines():
         'use_unicode': True,
     }
     
-    log("🔧 Creating database engines with optimized connection pool settings...")
-    log(f"🔧 Pool settings: {pool_settings}")
-    log(f"🔧 MySQL connection args: {mysql_connect_args}")
-    
     try:
+        log("🔄 Creating source database engine...")
         config.ENGINE_SOURCE = sa.create_engine(
             config.DB_SOURCE_URL,
             connect_args=mysql_connect_args,
             **pool_settings
         )
-        log(f"✅ Source engine created successfully")
         
+        log("🔄 Creating target database engine...")
         config.ENGINE_TARGET = sa.create_engine(
             config.DB_TARGET_URL,
             connect_args=mysql_connect_args,
             **pool_settings
         )
-        log(f"✅ Target engine created successfully")
         
         # Test connections
+        log("🔄 Testing source database connection...")
         with config.ENGINE_SOURCE.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
-        log("✅ Source database connection test successful")
         
+        log("🔄 Testing target database connection...")
         with config.ENGINE_TARGET.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
-        log("✅ Target database connection test successful")
+        
+        log("✅ Database engines created and tested successfully")
         
     except Exception as e:
-        log(f"❌ Error creating database engines: {e}")
+        log(f"❌ FAILED: Database engine creation error")
+        log(f"   Error: {e}")
+        log(f"   Check database connectivity and credentials")
         raise
 
 def cleanup_engines():
     """Clean up engine resources on shutdown."""
+    log("🔄 Cleaning up database engines...")
     try:
         if config.ENGINE_SOURCE:
             config.ENGINE_SOURCE.dispose()
-            log("✅ Source engine disposed")
         if config.ENGINE_TARGET:
             config.ENGINE_TARGET.dispose()
-            log("✅ Target engine disposed")
+        log("✅ Database engines cleaned up successfully")
     except Exception as e:
-        log(f"❌ Error disposing engines: {e}")
+        log(f"❌ FAILED: Engine cleanup error")
+        log(f"   Error: {e}")
 
 def get_engines():
     """Get the global database engines."""
@@ -89,31 +92,22 @@ def _execute_transaction(engine, operation_func, *args, **kwargs):
         return operation_func(connection, *args, **kwargs)
 
 def execute_with_transaction_management(engine, operation_name, operation_func, *args, **kwargs):
-    """Execute database operations with proper transaction management and lock timeout handling.
-    
-    This function:
-    1. Acquires a transaction semaphore to limit concurrent transactions
-    2. Executes the operation within a transaction context
-    3. Handles lock timeouts and connection issues
-    4. Releases the semaphore when done
-    """
-    log(f"🔄 Starting transaction for {operation_name}")
+    """Execute database operations with proper transaction management and lock timeout handling."""
     
     # Acquire semaphore to limit concurrent transactions
     config.transaction_semaphore.acquire()
     
     try:
         result = _execute_transaction(engine, operation_func, *args, **kwargs)
-        log(f"✅ Transaction completed successfully for {operation_name}")
         return result
         
     except Exception as e:
-        log(f"❌ Transaction failed for {operation_name}: {e}")
+        log(f"❌ FAILED: Transaction error for {operation_name}")
+        log(f"   Error: {e}")
         raise
     finally:
         # Always release the semaphore
         config.transaction_semaphore.release()
-        log(f"🔄 Transaction semaphore released for {operation_name}")
 
 def ensure_dlt_columns(engine_target, table_name):
     """Check if _dlt_load_id and _dlt_id exist in the target table, add them if not."""

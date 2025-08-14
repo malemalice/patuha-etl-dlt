@@ -10,6 +10,8 @@ from utils import log
 def sync_table_schema(engine_source, engine_target, table_name):
     """Sync schema from source to target, handling new, changed, and deleted columns."""
     def _sync_schema(connection):
+        log(f"🔄 Syncing schema for {table_name}...")
+        
         inspector_source = sa.inspect(engine_source)
         inspector_target = sa.inspect(engine_target)
         
@@ -22,17 +24,14 @@ def sync_table_schema(engine_source, engine_target, table_name):
                 column_type = column_info["type"]
                 alter_statements.append(f"ADD COLUMN `{column_name}` {column_type}")
         
-        # TODO: Handle _dlt_version column if not exits in target
-        # for column_name in target_columns:
-        #     if column_name not in source_columns and column_name not in ["_dlt_load_id", "_dlt_id"]:
-        #         alter_statements.append(f"DROP COLUMN `{column_name}`")
-        
         if alter_statements:
             alter_query = f"ALTER TABLE {table_name} {', '.join(alter_statements)};"
-            log(f"Syncing schema for {table_name}: {alter_query}")
             connection.execute(sa.text(alter_query))
+            log(f"✅ Schema sync SUCCESS: Added {len(alter_statements)} columns to {table_name}")
             return True
-        return False
+        else:
+            log(f"✅ Schema sync SUCCESS: {table_name} already synchronized")
+            return False
     
     return execute_with_transaction_management(
         engine_target, 

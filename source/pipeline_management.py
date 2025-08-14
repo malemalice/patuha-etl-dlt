@@ -4,10 +4,16 @@ Contains DLT pipeline operations, table processing, and sync logic.
 """
 
 import time
+import os
+import shutil
+import pandas as pd
+import threading
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 import dlt
 from dlt.sources.sql_database import sql_database
 import sqlalchemy as sa
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List, Union, Callable
 import config
 from utils import log, format_primary_key, validate_primary_key_config, log_primary_key_info
 from database import execute_with_transaction_management, ensure_dlt_columns
@@ -302,17 +308,350 @@ def create_pipeline(pipeline_name="mysql_sync", destination="mysql"):
         log(f"❌ Error creating pipeline: {e}")
         raise
 
+class StagingFileWatcher(FileSystemEventHandler):
+    """Event-driven file watcher for staging files - MODERN APPROACH."""
+    
+    def __init__(self, table_name: str, callback: Callable, target_extensions=('.parquet', '.json', '.csv', '.jsonl')):
+        self.table_name = table_name
+        self.callback = callback
+        self.target_extensions = target_extensions
+        self.found_files = []
+        self.completed = threading.Event()
+        
+    def on_created(self, event):
+        """Called when a file is created."""
+        if not event.is_directory:
+            file_path = event.src_path
+            file_name = os.path.basename(file_path)
+            
+            # Check if this is a staging file for our table
+            if (file_name.endswith(self.target_extensions) and 
+                self.table_name in file_name):
+                
+                self.found_files.append(file_path)
+                log(f"📄 Detected staging file: {file_name}")
+                
+                # Call the callback function
+                self.callback(file_path, self.found_files.copy())
+    
+    def on_modified(self, event):
+        """Called when a file is modified (file write completed)."""
+        if not event.is_directory:
+            file_path = event.src_path
+            file_name = os.path.basename(file_path)
+            
+            if (file_name.endswith(self.target_extensions) and 
+                self.table_name in file_name and 
+                file_path in self.found_files):
+                
+                log(f"✅ Staging file write completed: {file_name}")
+                # Signal that files are ready
+                self.completed.set()
+
+
+
+
+
+def process_file_staging_files(staging_dir, table_name, engine_target, primary_keys):
+    """Process staging files and load data to MySQL using custom upsert logic."""
+    try:
+        # Step 2.1: Discover staging files
+        log(f"🔍 Discovering staging files for {table_name}...")
+        staging_files = []
+        if os.path.exists(staging_dir):
+            for file in os.listdir(staging_dir):
+                if file.endswith(('.parquet', '.json', '.csv', '.jsonl')) and table_name in file:
+                    staging_files.append(os.path.join(staging_dir, file))
+        
+        if not staging_files:
+            log(f"❌ Step 2.1 FAILED: No staging files found for {table_name}")
+            return False
+        
+        log(f"✅ Step 2.1 SUCCESS: Found {len(staging_files)} files for {table_name}")
+        
+        # Step 2.2: Process each staging file
+        for file_idx, staging_file in enumerate(staging_files, 1):
+            file_name = os.path.basename(staging_file)
+            log(f"🔄 Step 2.2.{file_idx}: Processing file {file_name}...")
+            
+            # Read file in chunks
+            file_ext = os.path.splitext(staging_file)[1].lower()
+            batch_size = 10000
+            
+            try:
+                total_records = 0
+                if file_ext == '.parquet':
+                    # Read parquet file in chunks
+                    df = pd.read_parquet(staging_file)
+                    total_records = len(df)
+                    log(f"📊 Reading {total_records} records from Parquet file...")
+                    
+                    for start in range(0, len(df), batch_size):
+                        chunk = df.iloc[start:start + batch_size]
+                        records = chunk.to_dict('records')
+                        chunk_num = (start // batch_size) + 1
+                        log(f"🔄 Processing chunk {chunk_num} ({len(records)} records)...")
+                        process_data_chunk(records, table_name, engine_target, primary_keys)
+                        
+                elif file_ext in ['.json', '.jsonl']:
+                    # Read JSON lines file in chunks
+                    log(f"📊 Reading JSON lines file...")
+                    chunk_records = []
+                    chunk_num = 0
+                    
+                    with open(staging_file, 'r') as f:
+                        for line_num, line in enumerate(f, 1):
+                            if line.strip():
+                                try:
+                                    record = pd.read_json(line, typ='series').to_dict()
+                                    chunk_records.append(record)
+                                    
+                                    if len(chunk_records) >= batch_size:
+                                        chunk_num += 1
+                                        log(f"🔄 Processing chunk {chunk_num} ({len(chunk_records)} records)...")
+                                        process_data_chunk(chunk_records, table_name, engine_target, primary_keys)
+                                        total_records += len(chunk_records)
+                                        chunk_records = []
+                                except Exception as json_error:
+                                    log(f"⚠️ Skipping invalid JSON on line {line_num}: {json_error}")
+                        
+                        # Process remaining records
+                        if chunk_records:
+                            chunk_num += 1
+                            log(f"🔄 Processing final chunk {chunk_num} ({len(chunk_records)} records)...")
+                            process_data_chunk(chunk_records, table_name, engine_target, primary_keys)
+                            total_records += len(chunk_records)
+                            
+                elif file_ext == '.csv':
+                    # Read CSV file in chunks
+                    log(f"📊 Reading CSV file in chunks...")
+                    chunk_num = 0
+                    
+                    for chunk in pd.read_csv(staging_file, chunksize=batch_size):
+                        chunk_num += 1
+                        records = chunk.to_dict('records')
+                        log(f"🔄 Processing chunk {chunk_num} ({len(records)} records)...")
+                        process_data_chunk(records, table_name, engine_target, primary_keys)
+                        total_records += len(records)
+                
+                log(f"✅ Step 2.2.{file_idx} SUCCESS: Processed {total_records} records from {file_name}")
+                        
+            except Exception as file_error:
+                log(f"❌ Step 2.2.{file_idx} FAILED: Error processing {file_name}")
+                log(f"   Error: {file_error}")
+                return False
+        
+        log(f"✅ Step 2.2 SUCCESS: All files processed for {table_name}")
+        return True
+        
+    except Exception as e:
+        log(f"❌ Error in file staging processing for {table_name}: {e}")
+        return False
+
+def process_data_chunk(records, table_name, engine_target, primary_keys):
+    """Process a chunk of records using MySQL upsert logic."""
+    if not records:
+        return True
+    
+    try:
+        # Ensure primary_keys is a list
+        if isinstance(primary_keys, str):
+            primary_keys = [primary_keys]
+        
+        # Build column information
+        columns = list(records[0].keys())
+        non_pk_columns = [col for col in columns if col not in primary_keys]
+        
+        # Create efficient upsert query
+        placeholders = ', '.join(['%s'] * len(columns))
+        update_clause = ', '.join([f'{col} = VALUES({col})' for col in non_pk_columns])
+        
+        upsert_sql = f"""
+        INSERT INTO {table_name} ({', '.join(columns)})
+        VALUES ({placeholders})
+        ON DUPLICATE KEY UPDATE {update_clause}
+        """
+        
+        # Execute in small, fast transaction
+        def _execute_upsert(connection):
+            for record in records:
+                values = [record.get(col) for col in columns]
+                connection.execute(sa.text(upsert_sql), values)
+            return True
+        
+        return execute_with_transaction_management(
+            engine_target,
+            f"upsert_chunk for {table_name}",
+            _execute_upsert
+        )
+        
+    except Exception as e:
+        log(f"❌ Error processing data chunk for {table_name}: {e}")
+        return False
+
+def cleanup_staging_files(staging_dir):
+    """Clean up staging files after successful processing."""
+    try:
+        if os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir)
+            log(f"🗑️ Cleaned up staging directory: {staging_dir}")
+        return True
+    except Exception as e:
+        log(f"⚠️ Error cleaning up staging directory {staging_dir}: {e}")
+        return False
+
+def process_incremental_table_with_file(table_name, table_config, engine_source, engine_target):
+    """Process incremental table using file staging to avoid DELETE conflicts."""
+    try:
+        # Phase 1: DLT Extraction to Files
+        log(f"📁 Phase 1: DLT Extraction → Files for {table_name}")
+        
+        # Step 1.1: Create staging directory
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        staging_pipeline_name = f"staging_{table_name}_{int(time.time())}"
+        staging_dir = f"{config.FILE_STAGING_DIR}/{staging_pipeline_name}_{timestamp}"
+        os.makedirs(staging_dir, exist_ok=True)
+        
+        # Step 1.2: Create DLT pipeline with filesystem destination
+        try:
+            staging_pipeline = dlt.pipeline(
+                pipeline_name=staging_pipeline_name,
+                destination=dlt.destinations.filesystem(staging_dir),
+                dataset_name=config.TARGET_DB_NAME
+            )
+        except Exception as pipeline_error:
+            log(f"❌ Phase 1 FAILED: Pipeline creation error for {table_name}")
+            log(f"   Error: {pipeline_error}")
+            log(f"   Working directory: {staging_dir}")
+            return False
+        
+        # Step 1.3: Create DLT source with incremental logic
+        modifier_column = table_config.get("modifier")
+        primary_key = table_config["primary_key"]
+        
+        try:
+            if modifier_column:
+                # Get the latest timestamp from target for incremental sync
+                max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
+                source = sql_database(engine_source).with_resources(table_name)
+                formatted_primary_key = format_primary_key(primary_key)
+                getattr(source, table_name).apply_hints(
+                    primary_key=formatted_primary_key,
+                    incremental=dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
+                )
+            else:
+                # Full refresh
+                source = sql_database(engine_source).with_resources(table_name)
+                formatted_primary_key = format_primary_key(primary_key)
+                getattr(source, table_name).apply_hints(primary_key=formatted_primary_key)
+            
+            # Apply data sanitization transformer if enabled
+            source = source | sanitize_table_data
+            
+        except Exception as source_error:
+            log(f"❌ Phase 1 FAILED: Source creation error for {table_name}")
+            log(f"   Error: {source_error}")
+            log(f"   Modifier column: {modifier_column}")
+            log(f"   Primary key: {primary_key}")
+            cleanup_staging_files(staging_dir)
+            return False
+        
+        # Step 1.4: Start file watcher (before DLT runs)
+        log(f"⚙️ Setting up file watcher for {table_name}...")
+        timeout = int(os.getenv('FILE_STAGING_WAIT_TIMEOUT', '60'))
+        
+        # Set up callback-based file detection
+        staging_files = []
+        
+        def file_ready_callback(file_path: str, all_files: List[str]):
+            """Callback when staging files are detected and ready."""
+            nonlocal staging_files
+            staging_files = all_files
+            log(f"📄 Detected {len(all_files)} staging files for {table_name}")
+        
+        # Start file watcher
+        watcher = StagingFileWatcher(table_name, file_ready_callback)
+        observer = Observer()
+        observer.schedule(watcher, staging_dir, recursive=False)
+        observer.start()
+        
+        try:
+            # Step 1.5: Run DLT pipeline extraction
+            log(f"🔄 Extracting data from source to files for {table_name}...")
+            load_info = staging_pipeline.run(source)
+            
+            if not load_info:
+                log(f"❌ Phase 1 FAILED: No data extracted for {table_name}")
+                return False
+            
+            # Step 1.6: Wait for files to be ready
+            log(f"⏳ Waiting for staging files to be ready for {table_name}...")
+            if watcher.completed.wait(timeout):
+                staging_files = watcher.found_files
+                log(f"✅ Phase 1 SUCCESS: {len(staging_files)} files ready for {table_name}")
+            else:
+                staging_files = watcher.found_files  # Use whatever was found
+                if staging_files:
+                    log(f"⚠️ Phase 1 PARTIAL: Found {len(staging_files)} files (timeout after {timeout}s)")
+                else:
+                    log(f"❌ Phase 1 FAILED: No files detected within {timeout}s for {table_name}")
+            
+        except Exception as extraction_error:
+            log(f"❌ Phase 1 FAILED: DLT extraction error for {table_name}")
+            log(f"   Error: {extraction_error}")
+            staging_files = []
+            
+        finally:
+            # Always stop the file watcher
+            observer.stop()
+            observer.join()
+        
+        if not staging_files:
+            cleanup_staging_files(staging_dir)
+            return False
+        
+        # Phase 2: Custom File Processing to MySQL
+        log(f"🔧 Phase 2: Files → MySQL for {table_name}")
+        log(f"🔄 Processing {len(staging_files)} staging files...")
+        
+        processing_success = process_file_staging_files(staging_dir, table_name, engine_target, primary_key)
+        
+        # Clean up staging files
+        log(f"🗑️ Cleaning up staging files for {table_name}...")
+        cleanup_staging_files(staging_dir)
+        
+        if processing_success:
+            log(f"✅ Phase 2 SUCCESS: Table {table_name} processed successfully")
+            log(f"🎉 COMPLETE: {table_name} sync finished successfully")
+            return True
+        else:
+            log(f"❌ Phase 2 FAILED: File processing error for {table_name}")
+            return False
+            
+    except Exception as e:
+        log(f"❌ CRITICAL ERROR: Unexpected error processing {table_name}")
+        log(f"   Error: {e}")
+        log(f"   Cleaning up and aborting...")
+        # Clean up on error
+        cleanup_staging_files(staging_dir)
+        return False
+
 def load_select_tables_from_database():
     """Main function to load and sync configured tables from the database."""
     def _load_tables():
         from database import get_engines
         engine_source, engine_target = get_engines()
         
-        # Create DLT pipeline
-        pipeline = create_pipeline()
-        
         log(f"🚀 Starting database sync with {len(config.table_configs)} configured tables")
         log(f"📋 Configured tables: {list(config.table_configs.keys())}")
+        
+        # Check if file staging is enabled
+        if config.FILE_STAGING_ENABLED:
+            log("📁 File staging enabled - avoiding SQLAlchemy destination")
+            pipeline = None  # No MySQL pipeline created - avoids timeout issues
+        else:
+            # Create DLT pipeline for normal operation
+            pipeline = create_pipeline()
         
         # Process tables in batches
         table_items = list(config.table_configs.items())
@@ -328,9 +667,24 @@ def load_select_tables_from_database():
             
             log(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_dict)} tables)")
             
-            successful, failed = process_tables_batch(pipeline, engine_source, engine_target, batch_dict)
-            total_successful += successful
-            total_failed += failed
+            if config.FILE_STAGING_ENABLED:
+                log("📁 Using file staging for incremental tables to avoid DELETE conflicts")
+                # Process each table individually with file staging
+                for table_name, table_config in batch_dict.items():
+                    try:
+                        success = process_incremental_table_with_file(table_name, table_config, engine_source, engine_target)
+                        if success:
+                            total_successful += 1
+                        else:
+                            total_failed += 1
+                    except Exception as table_error:
+                        log(f"❌ Error processing table {table_name}: {table_error}")
+                        total_failed += 1
+            else:
+                # Use normal batch processing
+                successful, failed = process_tables_batch(pipeline, engine_source, engine_target, batch_dict)
+                total_successful += successful
+                total_failed += failed
             
             # Add delay between batches
             if i + config.BATCH_SIZE < len(table_items) and config.BATCH_DELAY > 0:
