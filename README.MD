@@ -127,7 +127,7 @@ A data synchronization pipeline built with [dlt (data load tool)](https://dlthub
 
 The `tables.json` file supports two types of table configurations:
 
-**Incremental Sync Table** (with modifier column):
+**Incremental Sync Table** (with modifier column):**
 ```json
 {
   "table": "table_name",
@@ -136,11 +136,28 @@ The `tables.json` file supports two types of table configurations:
 }
 ```
 
-**Full Refresh Table** (without modifier):
+**Full Refresh Table** (without modifier):**
 ```json
 {
   "table": "table_name",
   "primary_key": "id"
+}
+```
+
+**Multiple Primary Keys (Composite Keys):**
+```json
+{
+  "table": "order_items",
+  "primary_key": ["order_id", "product_id"],
+  "modifier": "updated_at"
+}
+```
+
+**Complex Composite Keys:**
+```json
+{
+  "table": "user_permissions",
+  "primary_key": ["user_id", "permission_id", "resource_id"]
 }
 ```
 
@@ -175,6 +192,7 @@ The `tables.json` file supports two types of table configurations:
 3. **Incremental Processing**: For tables with modifier columns, only syncs records newer than the last sync
 4. **Full Refresh**: For tables without modifiers, replaces all data
 5. **Primary Key Merging**: Uses primary keys to handle updates and prevent duplicates
+6. **Multiple Primary Key Support**: Handles both single and composite primary keys for complex table relationships
 
 ## Health Check
 
@@ -209,40 +227,142 @@ If you encounter connection pool errors:
 3. **Slow performance**: Check `POOL_RECYCLE` and database network latency
 4. **For large tables**: Consider processing them separately during off-peak hours
 
+## Multiple Primary Key Support
+
+The pipeline now supports **composite primary keys** (multiple columns that together form a unique identifier) in addition to single primary keys.
+
+### Benefits of Multiple Primary Keys
+- **Complex Relationships**: Handle tables with natural composite keys (e.g., order_id + product_id)
+- **Data Integrity**: Ensure proper deduplication across multiple identifying columns
+- **Flexibility**: Support various database design patterns and normalization levels
+
+### Configuration Examples
+
+**Simple Composite Key:**
+```json
+{
+  "table": "order_items",
+  "primary_key": ["order_id", "product_id"],
+  "modifier": "updated_at"
+}
+```
+
+**Complex Composite Key:**
+```json
+{
+  "table": "user_permissions",
+  "primary_key": ["user_id", "permission_id", "resource_id", "tenant_id"]
+}
+```
+
+**Mixed Configuration:**
+```json
+[
+  {
+    "table": "users",
+    "primary_key": "id",
+    "modifier": "updated_at"
+  },
+  {
+    "table": "order_items",
+    "primary_key": ["order_id", "product_id"],
+    "modifier": "modified_at"
+  }
+]
+```
+
+### How It Works
+1. **Single Keys**: Passed directly to DLT as `primary_key="id"`
+2. **Composite Keys**: Automatically formatted as `primary_key="order_id, product_id"`
+3. **Validation**: Configuration is validated at startup to ensure proper format
+4. **Logging**: Clear indication of which tables use single vs. composite keys
+
 ## Important Notes
 
 - **No Column Deletion**: The pipeline never deletes columns during sync operations
 - **Modifier Requirement**: Incremental sync requires a modifier column (e.g., `updated_at`) that's always updated
 - **Initial Sync**: First run will sync all data; subsequent runs sync only changes
 - **Schema Evolution**: New columns in source tables are automatically added to target tables
+- **Primary Key Flexibility**: Support for both single columns and arrays of columns as primary keys
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Connection Issues**: 
-   - Verify database credentials and network connectivity
-   - Check if database servers are running and accessible
-   - Ensure firewall rules allow connections on specified ports
+#### JSON Parsing Errors (orjson.JSONDecodeError)
 
-2. **Missing Columns**: 
-   - Ensure modifier columns exist and are properly updated
-   - Verify column names match exactly (case-sensitive)
-   - Check that modifier columns have appropriate data types (datetime, timestamp)
+If you encounter `orjson.JSONDecodeError: unexpected character: line 1 column 1 (char 0)` errors:
 
-3. **Docker Issues**: 
-   - Check container logs with `docker compose logs`
-   - Verify database containers are healthy: `docker compose ps`
-   - Ensure port mappings don't conflict with existing services
+**Cause:** This typically happens when switching MySQL modes (strict/unrestricted) or with data encoding issues.
 
-4. **Permissions**: 
-   - Ensure database users have sufficient privileges for DDL operations (ALTER TABLE)
-   - Verify users can CREATE, INSERT, UPDATE, DELETE on target tables
-   - Check that users have GRANT permissions for schema modifications
+**Solution:** The app now automatically handles both strict and unrestricted MySQL modes. When JSON errors occur:
+- The pipeline automatically retries failed tables individually  
+- Uses the same sync method (incremental/full refresh) as originally configured
+- Continues processing other tables without stopping
+- Provides detailed error logs to identify problematic tables
 
-### Connection Pool Errors
+**No manual configuration needed** - the app adapts automatically to your MySQL settings.
 
-5. **"QueuePool limit of size X overflow Y reached"**:
+**For troubleshooting:** Debug mode is **enabled by default** for easier troubleshooting:
+```bash
+# Debug modes are enabled by default
+DEBUG_MODE=true              # General detailed logging (default: true)
+DEEP_DEBUG_JSON=true         # Deep analysis of JSON errors (default: true)
+AUTO_SANITIZE_DATA=true      # Automatic data sanitization (default: true)
+
+# To disable detailed logging after fixing issues:
+DEBUG_MODE=false
+DEEP_DEBUG_JSON=false
+AUTO_SANITIZE_DATA=false
+```
+
+**Enhanced JSON Error Debugging:** With debugging enabled by default, you'll automatically see:
+- **Row-by-row analysis** - Identifies exactly which row causes JSON errors
+- **Column-by-column analysis** - Shows specific problematic values and data types
+- **Full error stack traces** - Pinpoints where in the pipeline JSON parsing fails
+- **Automatic data sanitization** - Attempts to fix common data issues automatically
+
+**Automatic Data Sanitization:** When JSON errors occur, the pipeline automatically:
+- ✅ **Converts Decimal objects** to float (MySQL DECIMAL columns → JSON compatible numbers)
+- ✅ **Removes NULL bytes** (`\x00`) from string fields
+- ✅ **Converts invalid dates** (`0000-00-00`) to NULL
+- ✅ **Handles NaN/Infinity** values in numeric fields  
+- ✅ **Truncates very large strings** (>1MB) to prevent memory issues
+- ✅ **Sanitizes problematic characters** that break JSON encoding
+
+**Example Debug Output:**
+```
+*** IMMEDIATE JSON ERROR DETECTED FOR corez_akad_qurban ***
+IMMEDIATE ANALYSIS - Found problematic data:
+  Problem: transaksi = Decimal('4000000.00')
+  Error: Type is not JSON serializable: decimal.Decimal
+
+=== COMPREHENSIVE JSON ERROR ANALYSIS FOR TABLE: corez_akad_qurban ===
+*** FOUND PROBLEMATIC DATA IN corez_akad_qurban ***
+Problem 1: Column 'transaksi' = Decimal('4000000.00')
+  Data type: Decimal
+  JSON Error: Type is not JSON serializable: decimal.Decimal
+  Raw bytes: "Decimal('4000000.00')"
+
+DEBUG: Converting Decimal to float in column transaksi: 4000000.00
+Individual sync with sanitization successful for corez_akad_qurban
+```
+
+This will show detailed information about table processing and help identify specific data issues.
+
+#### Zero Dates Handling
+
+**Zero dates** (like `'0000-00-00 00:00:00'`) are now **automatically synced** from source to destination:
+
+✅ **Source with zero dates**: Data syncs successfully  
+✅ **Preserves original data**: Zero dates are copied as-is  
+✅ **Destination handles it**: Target database applies its own rules  
+
+The pipeline uses a permissive SQL mode that allows zero dates to pass through, letting each database handle them according to its own configuration.
+
+#### Connection Pool Exhaustion
+
+1. **"QueuePool limit of size X overflow Y reached"**:
    ```env
    # Increase pool limits in .env
    POOL_SIZE=30
@@ -250,17 +370,17 @@ If you encounter connection pool errors:
    POOL_TIMEOUT=90
    ```
 
-6. **"Connection timeout"**: 
+2. **"Connection timeout"**: 
    - Increase `POOL_TIMEOUT` value
    - Check database server performance and network latency
    - Consider reducing `INTERVAL` for frequent smaller syncs
 
-7. **"Connection refused"**: 
+3. **"Connection refused"**: 
    - Verify database credentials in `.env`
    - Check database server status and network connectivity
    - Ensure database ports are correctly configured
 
-8. **Memory Issues with Large Tables**:
+4. **Memory Issues with Large Tables**:
    - Process large tables during off-peak hours
    - Consider splitting large tables into smaller batches
    - Increase system memory or use streaming processing

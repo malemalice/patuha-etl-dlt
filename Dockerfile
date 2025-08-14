@@ -19,11 +19,17 @@ WORKDIR /app
 COPY source/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install pymysql && \
-    pip install "dlt[sqlalchemy]==1.8.1" && \
-    pip install mysqlclient && \
-    pip install python-dotenv
-    
+    pip install --no-cache-dir pymysql && \
+    pip install --no-cache-dir python-dotenv
+
+# Create staging directory for Parquet files
+RUN mkdir -p /app/staging && \
+    chmod 755 /app/staging
+
+# Create log directory
+RUN mkdir -p /var/log/app && \
+    chmod 755 /var/log/app
+
 COPY source/ .
 
 # Use a command that keeps the container running for manual execution
