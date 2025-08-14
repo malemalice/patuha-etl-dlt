@@ -1,0 +1,91 @@
+"""
+Configuration module for DLT Database Sync Pipeline.
+Contains all environment variables, constants, and configuration loading.
+"""
+
+import os
+import json
+import threading
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Database Configuration
+TARGET_DB_USER = os.getenv("TARGET_DB_USER", "symuser")
+TARGET_DB_PASS = os.getenv("TARGET_DB_PASS", "sympass")
+TARGET_DB_HOST = os.getenv("TARGET_DB_HOST", "127.0.0.1")
+TARGET_DB_PORT = os.getenv("TARGET_DB_PORT", "3307")
+TARGET_DB_NAME = os.getenv("TARGET_DB_NAME", "dbzains")
+
+SOURCE_DB_USER = os.getenv("SOURCE_DB_USER", "symuser")
+SOURCE_DB_PASS = os.getenv("SOURCE_DB_PASS", "sympass")
+SOURCE_DB_HOST = os.getenv("SOURCE_DB_HOST", "127.0.0.1")
+SOURCE_DB_PORT = os.getenv("SOURCE_DB_PORT", "3306")
+SOURCE_DB_NAME = os.getenv("SOURCE_DB_NAME", "dbzains")
+
+# Pipeline Configuration
+FETCH_LIMIT = os.getenv("FETCH_LIMIT", 1)
+INTERVAL = int(os.getenv("INTERVAL", 60))  # Interval in seconds
+
+# Batch processing configuration
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 8))  # Process tables in batches of 8
+BATCH_DELAY = int(os.getenv("BATCH_DELAY", 2))  # Delay between batches in seconds
+
+# Debug mode for detailed logging
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
+DEEP_DEBUG_JSON = os.getenv("DEEP_DEBUG_JSON", "true").lower() == "true"
+AUTO_SANITIZE_DATA = os.getenv("AUTO_SANITIZE_DATA", "true").lower() == "true"
+
+# Column name preservation configuration
+PRESERVE_COLUMN_NAMES = os.getenv("PRESERVE_COLUMN_NAMES", "true").lower() == "true"
+
+# Lock timeout and retry configuration
+LOCK_TIMEOUT_RETRIES = int(os.getenv("LOCK_TIMEOUT_RETRIES", "5"))  # Max retries for lock timeouts
+LOCK_TIMEOUT_BASE_DELAY = int(os.getenv("LOCK_TIMEOUT_BASE_DELAY", "10"))  # Base delay in seconds
+LOCK_TIMEOUT_MAX_DELAY = int(os.getenv("LOCK_TIMEOUT_MAX_DELAY", "300"))  # Max delay in seconds
+LOCK_TIMEOUT_JITTER = float(os.getenv("LOCK_TIMEOUT_JITTER", "0.1"))  # Jitter factor (0.1 = 10%)
+
+# Transaction management configuration
+TRANSACTION_TIMEOUT = int(os.getenv("TRANSACTION_TIMEOUT", "300"))  # Transaction timeout in seconds
+MAX_CONCURRENT_TRANSACTIONS = int(os.getenv("MAX_CONCURRENT_TRANSACTIONS", "3"))  # Max concurrent transactions
+
+# Incremental merge optimization configuration
+MERGE_BATCH_SIZE = int(os.getenv("MERGE_BATCH_SIZE", "1000"))  # Batch size for merge operations
+MERGE_MAX_BATCH_SIZE = int(os.getenv("MERGE_MAX_BATCH_SIZE", "5000"))  # Max batch size for merge operations
+MERGE_OPTIMIZATION_ENABLED = os.getenv("MERGE_OPTIMIZATION_ENABLED", "true").lower() == "true"  # Enable merge optimizations
+CONNECTION_LOSS_RETRIES = int(os.getenv("CONNECTION_LOSS_RETRIES", "3"))  # Max retries for connection loss
+
+# Staging table isolation configuration
+STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower() == "true"  # Enable staging table isolation
+STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", "dlt_staging")  # Base prefix for staging schemas
+STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
+
+# File-based staging configuration (alternative to database staging)
+FILE_STAGING_ENABLED = os.getenv("FILE_STAGING_ENABLED", "true").lower() == "true"  # Enable file-based staging
+FILE_STAGING_DIR = os.getenv("FILE_STAGING_DIR", "staging")  # Base directory for staging files
+FILE_STAGING_RETENTION_HOURS = int(os.getenv("FILE_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
+FILE_STAGING_COMPRESSION = os.getenv("FILE_STAGING_COMPRESSION", "snappy")  # Compression algorithm
+FILE_STAGING_ADVANCED_MONITORING = os.getenv("FILE_STAGING_ADVANCED_MONITORING", "true").lower() == "true"
+
+# Database URLs
+DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
+DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
+
+# Global transaction semaphore to limit concurrent transactions
+transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
+
+# Global engine variables (will be set by database module)
+ENGINE_SOURCE = None
+ENGINE_TARGET = None
+
+def load_table_configs():
+    """Load table configurations from tables.json."""
+    TABLES_FILE = "tables.json"
+    with open(TABLES_FILE, "r") as f:
+        tables_data = json.load(f)
+    
+    return {t["table"]: t for t in tables_data}
+
+# Load table configurations
+table_configs = load_table_configs()
