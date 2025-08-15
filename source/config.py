@@ -61,12 +61,20 @@ STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower
 STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", "dlt_staging")  # Base prefix for staging schemas
 STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
 
-# File-based staging configuration (alternative to database staging)
-FILE_STAGING_ENABLED = os.getenv("FILE_STAGING_ENABLED", "true").lower() == "true"  # Enable file-based staging
+# Pipeline Mode Configuration
+PIPELINE_MODE = os.getenv("PIPELINE_MODE", "direct")  # Options: 'direct' (db-to-db) or 'file_staging' (extract to files first)
+
+# DLT Load Configuration (for direct mode)
+TRUNCATE_STAGING_DATASET = os.getenv("TRUNCATE_STAGING_DATASET", "true").lower() == "true"  # Truncate staging dataset after load
+
+# File-based staging configuration (used when PIPELINE_MODE='file_staging')
 FILE_STAGING_DIR = os.getenv("FILE_STAGING_DIR", "staging")  # Base directory for staging files
 FILE_STAGING_RETENTION_HOURS = int(os.getenv("FILE_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
 FILE_STAGING_COMPRESSION = os.getenv("FILE_STAGING_COMPRESSION", "snappy")  # Compression algorithm
 FILE_STAGING_ADVANCED_MONITORING = os.getenv("FILE_STAGING_ADVANCED_MONITORING", "true").lower() == "true"
+
+# Legacy support - maintain FILE_STAGING_ENABLED for backward compatibility
+FILE_STAGING_ENABLED = PIPELINE_MODE.lower() == "file_staging"
 
 # Database URLs
 DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
@@ -81,8 +89,23 @@ ENGINE_TARGET = None
 
 def load_table_configs():
     """Load table configurations from tables.json."""
-    TABLES_FILE = "tables.json"
-    with open(TABLES_FILE, "r") as f:
+    # Try to find tables.json in current directory or source directory
+    possible_paths = [
+        "tables.json",
+        "source/tables.json",
+        os.path.join(os.path.dirname(__file__), "tables.json")
+    ]
+    
+    tables_file = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            tables_file = path
+            break
+    
+    if not tables_file:
+        raise FileNotFoundError(f"tables.json not found. Tried paths: {possible_paths}")
+    
+    with open(tables_file, "r") as f:
         tables_data = json.load(f)
     
     return {t["table"]: t for t in tables_data}

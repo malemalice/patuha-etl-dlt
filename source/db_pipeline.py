@@ -117,7 +117,13 @@ def main():
         
         log("🚀 DLT Database Sync Pipeline Starting")
         log(f"📋 Tables configured: {len(config.table_configs)}")
-        log(f"📁 File staging: {'Enabled' if config.FILE_STAGING_ENABLED else 'Disabled'}")
+        log(f"🔧 Pipeline mode: {config.PIPELINE_MODE}")
+        if config.PIPELINE_MODE.lower() == "file_staging":
+            log("📁 Using file staging mode - extract to files first, then load to database")
+        elif config.PIPELINE_MODE.lower() == "direct":
+            log("⚡ Using direct mode - db-to-db pipeline via DLT")
+        else:
+            log(f"⚠️ Unknown pipeline mode '{config.PIPELINE_MODE}', will default to direct mode")
         
         # Validate table configurations
         log("🔄 Validating configurations...")

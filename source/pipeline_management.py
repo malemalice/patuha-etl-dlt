@@ -306,8 +306,19 @@ def create_pipeline(pipeline_name="mysql_sync", destination="mysql"):
             "dataset_name": "sync_data"
         }
         
+        # Configure normalization and load settings
+        config_dict = {}
+        
         if config.PRESERVE_COLUMN_NAMES:
-            pipeline_config["config"] = {"normalize": {"naming": "direct"}}
+            config_dict["normalize"] = {"naming": "direct"}
+        
+        # Add truncate_staging_dataset configuration if enabled and in direct mode
+        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
+            config_dict["load"] = {"truncate_staging_dataset": True}
+            log("🗑️ Staging dataset truncation enabled for direct mode")
+        
+        if config_dict:
+            pipeline_config["config"] = config_dict
         
         pipeline = dlt.pipeline(**pipeline_config)
         log(f"✅ Created DLT pipeline: {pipeline_name}")
@@ -724,13 +735,18 @@ def load_select_tables_from_database():
         
         log(f"🚀 Starting database sync with {len(config.table_configs)} configured tables")
         log(f"📋 Configured tables: {list(config.table_configs.keys())}")
+        log(f"🔧 Pipeline mode: {config.PIPELINE_MODE}")
         
-        # Check if file staging is enabled
-        if config.FILE_STAGING_ENABLED:
-            log("📁 File staging enabled - avoiding SQLAlchemy destination")
+        # Check pipeline mode
+        if config.PIPELINE_MODE.lower() == "file_staging":
+            log("📁 File staging mode enabled - extracting to files first, then loading to database")
             pipeline = None  # No MySQL pipeline created - avoids timeout issues
+        elif config.PIPELINE_MODE.lower() == "direct":
+            log("⚡ Direct mode enabled - using db-to-db pipeline via DLT")
+            # Create DLT pipeline for direct database operation
+            pipeline = create_pipeline()
         else:
-            # Create DLT pipeline for normal operation
+            log(f"⚠️ Unknown pipeline mode '{config.PIPELINE_MODE}', defaulting to direct mode")
             pipeline = create_pipeline()
         
         # Process tables in batches
@@ -747,8 +763,8 @@ def load_select_tables_from_database():
             
             log(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_dict)} tables)")
             
-            if config.FILE_STAGING_ENABLED:
-                log("📁 Using file staging for incremental tables to avoid DELETE conflicts")
+            if config.PIPELINE_MODE.lower() == "file_staging":
+                log("📁 Using file staging mode - extracting to files first, then loading to database")
                 # Process each table individually with file staging
                 for table_name, table_config in batch_dict.items():
                     try:
@@ -761,7 +777,8 @@ def load_select_tables_from_database():
                         log(f"❌ Error processing table {table_name}: {table_error}")
                         total_failed += 1
             else:
-                # Use normal batch processing
+                # Use direct db-to-db batch processing
+                log("⚡ Using direct db-to-db mode via DLT")
                 successful, failed = process_tables_batch(pipeline, engine_source, engine_target, batch_dict)
                 total_successful += successful
                 total_failed += failed
