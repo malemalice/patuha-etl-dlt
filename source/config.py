@@ -76,6 +76,17 @@ FILE_STAGING_ADVANCED_MONITORING = os.getenv("FILE_STAGING_ADVANCED_MONITORING",
 # Legacy support - maintain FILE_STAGING_ENABLED for backward compatibility
 FILE_STAGING_ENABLED = PIPELINE_MODE.lower() == "file_staging"
 
+# Connection Pool Configuration (MariaDB-optimized)
+POOL_SIZE = int(os.getenv("POOL_SIZE", "15"))  # Reduced for MariaDB stability
+MAX_OVERFLOW = int(os.getenv("MAX_OVERFLOW", "20"))  # Reduced for MariaDB stability
+POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", "30"))  # Faster timeout for MariaDB
+POOL_RECYCLE = int(os.getenv("POOL_RECYCLE", "1800"))  # More frequent recycling for MariaDB
+
+# MariaDB-specific optimizations
+MARIADB_OPTIMIZED = os.getenv("MARIADB_OPTIMIZED", "true").lower() == "true"
+CONNECTION_VALIDATION = os.getenv("CONNECTION_VALIDATION", "true").lower() == "true"
+POOL_PRE_PING = os.getenv("POOL_PRE_PING", "true").lower() == "true"
+
 # HTTP Server Configuration
 HTTP_SERVER_PORT = int(os.getenv("HTTP_SERVER_PORT", "8089"))
 HTTP_SERVER_HOST = os.getenv("HTTP_SERVER_HOST", "")  # Empty string = all interfaces

@@ -124,8 +124,25 @@ def safe_table_cleanup(engine_target, table_name, write_disposition="replace"):
         f"safe_table_cleanup for {table_name}"
     )
 
+def recover_connection_pool(engine, pool_name):
+    """Recover corrupted connection pool for MariaDB."""
+    try:
+        # Force pool recreation
+        engine.dispose()
+        
+        # Recreate engine with fresh pool
+        from database import create_engines
+        engine_source, engine_target = create_engines()
+        
+        log(f"✅ Recovered {pool_name} connection pool")
+        return engine_source if 'source' in pool_name else engine_target
+        
+    except Exception as e:
+        log(f"❌ Failed to recover {pool_name} connection pool: {e}")
+        return None
+
 def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, write_disposition="merge"):
-    """Process a batch of tables with proper connection management and lock timeout handling."""
+    """Process a batch of tables with connection pool recovery for MariaDB."""
     
     batch_start_time = time.time()
     successful_tables = []
@@ -140,6 +157,23 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             log(f"\n{'='*60}")
             log(f"🔄 Processing table: {table_name}")
             log(f"📋 Table config: {table_config}")
+            
+            # Check connection pool health before processing each table
+            if hasattr(engine_source.pool, 'overflow') and engine_source.pool.overflow() < 0:
+                log(f"⚠️ Source connection pool corrupted (overflow: {engine_source.pool.overflow()}), recovering...")
+                engine_source = recover_connection_pool(engine_source, "source")
+                if engine_source is None:
+                    log(f"❌ Failed to recover source connection pool, skipping {table_name}")
+                    failed_tables.append(table_name)
+                    continue
+                
+            if hasattr(engine_target.pool, 'overflow') and engine_target.pool.overflow() < 0:
+                log(f"⚠️ Target connection pool corrupted (overflow: {engine_target.pool.overflow()}), recovering...")
+                engine_target = recover_connection_pool(engine_target, "target")
+                if engine_target is None:
+                    log(f"❌ Failed to recover target connection pool, skipping {table_name}")
+                    failed_tables.append(table_name)
+                    continue
             
             # Validate primary key configuration
             if "primary_key" not in table_config:
@@ -197,6 +231,14 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             failed_tables.append(table_name)
             log(f"❌ Error processing table {table_name}: {table_error}")
             log_performance_metrics(f"Table {table_name} (FAILED)", table_start_time, table_end_time)
+            
+            # Force connection pool recovery on critical errors
+            log(f"🔄 Attempting connection pool recovery after critical error...")
+            try:
+                engine_source = recover_connection_pool(engine_source, "source")
+                engine_target = recover_connection_pool(engine_target, "target")
+            except Exception as recovery_error:
+                log(f"❌ Connection pool recovery failed: {recovery_error}")
     
     batch_end_time = time.time()
     log_performance_metrics(f"Batch processing", batch_start_time, batch_end_time, len(tables_dict))
@@ -768,6 +810,15 @@ def load_select_tables_from_database():
             batch_dict = dict(batch_items)
             
             log(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_dict)} tables)")
+            
+            # Monitor connection pool health before each batch
+            from monitoring import monitor_connection_pool_health
+            if not monitor_connection_pool_health(engine_source, engine_target):
+                log(f"⚠️ Connection pool health issues detected, attempting recovery...")
+                # Force engine recreation
+                from database import create_engines
+                create_engines()
+                engine_source, engine_target = get_engines()
             
             if config.PIPELINE_MODE.lower() == "file_staging":
                 log("📁 Using file staging mode - extracting to files first, then loading to database")

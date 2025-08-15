@@ -346,3 +346,33 @@ def log_performance_metrics(operation_name, start_time, end_time, record_count=N
         metrics_info += f" ({record_count} records, {rate:.1f} records/sec)"
     
     log(metrics_info)
+
+def monitor_connection_pool_health(engine_source, engine_target):
+    """Monitor connection pool health and detect corruption."""
+    try:
+        from database import check_connection_pool_health
+        
+        # Check source pool health
+        source_healthy, source_status = check_connection_pool_health(engine_source, "source")
+        if not source_healthy:
+            log(f"⚠️ Source connection pool health issue: {source_status}")
+            return False
+        
+        # Check target pool health
+        target_healthy, target_status = check_connection_pool_health(engine_target, "target")
+        if not target_healthy:
+            log(f"⚠️ Target connection pool health issue: {target_status}")
+            return False
+        
+        # Log pool status
+        source_pool_status = get_connection_pool_status(engine_source)
+        target_pool_status = get_connection_pool_status(engine_target)
+        
+        log(f"🔍 Source pool status: {source_pool_status}")
+        log(f"🔍 Target pool status: {target_pool_status}")
+        
+        return True
+        
+    except Exception as e:
+        log(f"❌ Error monitoring connection pool health: {e}")
+        return False

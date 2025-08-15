@@ -8,15 +8,17 @@ import config
 from utils import log
 
 def _get_mysql_connect_args():
-    """Get MySQL connection arguments compatible with the available driver."""
+    """Get MySQL/MariaDB connection arguments compatible with the available driver."""
     
-    # Base connection arguments compatible with most MySQL drivers
-    # Removed problematic init_command to avoid MariaDB syntax errors
+    # Base connection arguments compatible with most MySQL/MariaDB drivers
+    # Optimized for MariaDB to prevent connection pool corruption
     base_args = {
         'connect_timeout': 60,
         'autocommit': False,
         'charset': 'utf8mb4',
         'use_unicode': True,
+        # MariaDB-specific optimizations
+        'sql_mode': 'STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO',
         # init_command removed - will be handled after connection establishment
     }
     
@@ -93,11 +95,12 @@ def create_engines():
     log("🔧 Creating database engines...")
     
     pool_settings = {
-        'pool_size': 20,           # Configurable base pool size
-        'max_overflow': 30,        # Configurable overflow limit  
-        'pool_timeout': 60,        # Configurable timeout
-        'pool_recycle': 3600,      # Configurable connection recycle time
-        'pool_pre_ping': True,     # Validate connections before use
+        'pool_size': config.POOL_SIZE,           # From config for MariaDB stability
+        'max_overflow': config.MAX_OVERFLOW,     # From config to prevent corruption
+        'pool_timeout': config.POOL_TIMEOUT,     # From config for MariaDB
+        'pool_recycle': config.POOL_RECYCLE,     # From config for MariaDB
+        'pool_pre_ping': config.POOL_PRE_PING,   # From config for connection validation
+        'pool_reset_on_return': 'commit',        # Reset connections on return
     }
     
     # Note: Session configuration will be done after connection establishment
@@ -162,6 +165,39 @@ def get_engines():
         create_engines()
     
     return config.ENGINE_SOURCE, config.ENGINE_TARGET
+
+def check_connection_pool_health(engine, pool_name="database"):
+    """Check if connection pool is healthy and not corrupted."""
+    try:
+        if not hasattr(engine, 'pool'):
+            return False, "No pool attribute"
+        
+        pool = engine.pool
+        
+        # Check if pool has required methods
+        if not hasattr(pool, 'size') or not hasattr(pool, 'overflow'):
+            return False, "Pool missing required methods"
+        
+        # Check for negative overflow (indicates corruption)
+        try:
+            overflow = pool.overflow()
+            if overflow < 0:
+                return False, f"Pool corrupted (overflow: {overflow})"
+        except Exception as e:
+            return False, f"Error checking overflow: {e}"
+        
+        # Check pool size
+        try:
+            size = pool.size()
+            if size <= 0:
+                return False, f"Invalid pool size: {size}"
+        except Exception as e:
+            return False, f"Error checking pool size: {e}"
+        
+        return True, "Pool healthy"
+        
+    except Exception as e:
+        return False, f"Pool health check failed: {e}"
 
 def get_configured_connection(engine, purpose="database"):
     """Get a database connection with session configuration applied."""
