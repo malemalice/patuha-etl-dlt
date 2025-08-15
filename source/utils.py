@@ -12,18 +12,20 @@ def log(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} - {message}")
 
-def format_primary_key(primary_key: Union[str, List[str]]) -> str:
+def format_primary_key(primary_key: Union[str, List[str]]) -> Union[str, List[str]]:
     """Format primary key for DLT hints with validation."""
     if isinstance(primary_key, list):
-        # For composite keys, join with comma and validate
+        # For composite keys, validate and return as-is (don't convert to string!)
+        if len(primary_key) == 0:
+            raise ValueError(f"Invalid primary key configuration: empty list")
         if not all(isinstance(key, str) and key.strip() for key in primary_key):
             raise ValueError(f"Invalid primary key configuration: {primary_key}")
-        return ", ".join(primary_key)
+        return primary_key  # Return array as-is for DLT to handle properly
     else:
-        # For single keys, validate and return
+        # For single keys, validate and return as-is
         if not isinstance(primary_key, str) or not primary_key.strip():
             raise ValueError(f"Invalid primary key configuration: {primary_key}")
-        return primary_key
+        return primary_key  # Return string as-is
 
 def validate_primary_key_config(primary_key: Union[str, List[str]]) -> bool:
     """Enhanced validation of primary key configuration."""
