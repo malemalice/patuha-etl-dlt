@@ -212,22 +212,31 @@ def periodic_connection_monitoring(engine_target, interval_seconds=60):
             try:
                 # Monitor connection pool status
                 if hasattr(engine_target.pool, 'size'):
-                    pool_size = engine_target.pool.size()
-                    checked_out = engine_target.pool.checkedout()
-                    overflow = engine_target.pool.overflow()
-                    
-                    log(f"🔍 Connection Pool Status - Size: {pool_size}, Checked out: {checked_out}, Overflow: {overflow}")
-                    
-                    # Warning if pool utilization is high
-                    utilization = (checked_out / (pool_size + overflow)) * 100 if (pool_size + overflow) > 0 else 0
-                    if utilization > 80:
-                        log(f"⚠️ High connection pool utilization: {utilization:.1f}%")
+                    try:
+                        pool_size = engine_target.pool.size()
+                        checked_out = engine_target.pool.checkedout()
+                        overflow = engine_target.pool.overflow()
+                        
+                        log(f"🔍 Connection Pool Status - Size: {pool_size}, Checked out: {checked_out}, Overflow: {overflow}")
+                        
+                        # Warning if pool utilization is high
+                        utilization = (checked_out / (pool_size + overflow)) * 100 if (pool_size + overflow) > 0 else 0
+                        if utilization > 80:
+                            log(f"⚠️ High connection pool utilization: {utilization:.1f}%")
+                    except Exception as pool_error:
+                        log(f"⚠️ Error monitoring connection pool: {pool_error}")
                 
                 # Monitor and kill long-running queries
-                monitor_and_kill_long_queries(engine_target)
+                try:
+                    monitor_and_kill_long_queries(engine_target)
+                except Exception as query_monitor_error:
+                    log(f"⚠️ Error in query monitoring: {query_monitor_error}")
                 
             except Exception as monitor_error:
                 log(f"❌ Error in connection monitoring: {monitor_error}")
+                # Log additional debug info
+                log(f"🔍 Debug: Monitor error type: {type(monitor_error)}")
+                log(f"🔍 Debug: Monitor error details: {str(monitor_error)}")
             
             time.sleep(interval_seconds)
     
@@ -269,23 +278,38 @@ def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
                 log(f"🔍 Found {len(long_queries)} long-running queries (>{timeout_seconds}s)")
                 
                 for query_info in long_queries:
-                    query_id = query_info[0]
-                    query_time = query_info[5]
-                    query_preview = query_info[7] or "N/A"
+                    # Handle both tuple and dictionary result formats
+                    if isinstance(query_info, dict):
+                        # Dictionary format (newer SQLAlchemy versions)
+                        query_id = query_info.get('ID')
+                        query_time = query_info.get('TIME')
+                        query_preview = query_info.get('INFO_PREVIEW') or "N/A"
+                    else:
+                        # Tuple format (older SQLAlchemy versions or certain drivers)
+                        query_id = query_info[0] if len(query_info) > 0 else None
+                        query_time = query_info[5] if len(query_info) > 5 else None
+                        query_preview = query_info[7] if len(query_info) > 7 else "N/A"
                     
-                    log(f"🔍 Long query ID {query_id}: {query_time}s - {query_preview}")
-                    
-                    # Kill queries running longer than 2x timeout
-                    if query_time > timeout_seconds * 2:
-                        try:
-                            kill_query = f"KILL {query_id}"
-                            connection.execute(sa.text(kill_query))
-                            log(f"💀 Killed long-running query ID {query_id} ({query_time}s)")
-                        except Exception as kill_error:
-                            log(f"❌ Failed to kill query ID {query_id}: {kill_error}")
+                    # Validate we have the required data
+                    if query_id is not None and query_time is not None:
+                        log(f"🔍 Long query ID {query_id}: {query_time}s - {query_preview}")
+                        
+                        # Kill queries running longer than 2x timeout
+                        if query_time > timeout_seconds * 2:
+                            try:
+                                kill_query = f"KILL {query_id}"
+                                connection.execute(sa.text(kill_query))
+                                log(f"💀 Killed long-running query ID {query_id} ({query_time}s)")
+                            except Exception as kill_error:
+                                log(f"❌ Failed to kill query ID {query_id}: {kill_error}")
+                    else:
+                        log(f"⚠️ Skipping query info with missing data: {query_info}")
             
         except Exception as query_error:
             log(f"❌ Error monitoring queries: {query_error}")
+            # Log additional debug info
+            log(f"🔍 Debug: Query error type: {type(query_error)}")
+            log(f"🔍 Debug: Query error details: {str(query_error)}")
     
     try:
         from database import execute_with_transaction_management
