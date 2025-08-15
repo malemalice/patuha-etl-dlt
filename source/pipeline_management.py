@@ -224,7 +224,7 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
         
         # Create SQL database source
-        source = sql_database(engine_source).with_resources(table_name)
+        source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
         
         # Format primary key for DLT hints
         formatted_primary_key = format_primary_key(primary_key)
@@ -271,7 +271,7 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
             safe_table_cleanup(engine_target, table_name, write_disposition)
         
         # Create SQL database source
-        source = sql_database(engine_source).with_resources(table_name)
+        source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
         
         # Format primary key for DLT hints
         formatted_primary_key = format_primary_key(primary_key)
@@ -299,28 +299,25 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
 def create_pipeline(pipeline_name="mysql_sync", destination="mysql"):
     """Create a DLT pipeline with proper configuration."""
     try:
-        # Configure DLT pipeline
-        pipeline_config = {
+        # Configure DLT pipeline with correct syntax
+        # DLT expects config parameters to be passed directly, not nested under 'config' key
+        pipeline_kwargs = {
             "pipeline_name": pipeline_name,
             "destination": destination,
             "dataset_name": "sync_data"
         }
         
-        # Configure normalization and load settings
-        config_dict = {}
-        
+        # Add normalization settings directly to pipeline kwargs
         if config.PRESERVE_COLUMN_NAMES:
-            config_dict["normalize"] = {"naming": "direct"}
+            pipeline_kwargs["normalize"] = {"naming": "direct"}
         
-        # Add truncate_staging_dataset configuration if enabled and in direct mode
+        # Add load settings directly to pipeline kwargs
         if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
-            config_dict["load"] = {"truncate_staging_dataset": True}
+            pipeline_kwargs["load"] = {"truncate_staging_dataset": True}
             log("🗑️ Staging dataset truncation enabled for direct mode")
         
-        if config_dict:
-            pipeline_config["config"] = config_dict
-        
-        pipeline = dlt.pipeline(**pipeline_config)
+        # Create pipeline with correct DLT syntax
+        pipeline = dlt.pipeline(**pipeline_kwargs)
         log(f"✅ Created DLT pipeline: {pipeline_name}")
         return pipeline
         
