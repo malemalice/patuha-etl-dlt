@@ -247,8 +247,15 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         # Apply data sanitization transformer if enabled
         source = source | sanitize_table_data
         
-        # Run the pipeline
-        load_info = pipeline.run(source, write_disposition="merge")
+        # Run the pipeline with proper configuration for DLT 1.15.0
+        # Handle truncate_staging_dataset through write_disposition and table replacement
+        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
+            # For truncate_staging_dataset, we need to use replace disposition
+            # This will clear the table before loading new data
+            load_info = pipeline.run(source, write_disposition="replace")
+            log("🗑️ Using replace disposition to clear staging dataset")
+        else:
+            load_info = pipeline.run(source, write_disposition="merge")
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
@@ -282,8 +289,15 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         # Apply data sanitization transformer if enabled
         source = source | sanitize_table_data
         
-        # Run the pipeline
-        load_info = pipeline.run(source, write_disposition=write_disposition)
+        # Run the pipeline with proper configuration for DLT 1.15.0
+        # Handle truncate_staging_dataset through write_disposition
+        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
+            # For truncate_staging_dataset, we need to use replace disposition
+            # This will clear the table before loading new data
+            load_info = pipeline.run(source, write_disposition="replace")
+            log("🗑️ Using replace disposition to clear staging dataset")
+        else:
+            load_info = pipeline.run(source, write_disposition=write_disposition)
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
@@ -296,28 +310,26 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         log(f"❌ Error in full refresh processing for {table_name}: {e}")
         return False
 
-def create_pipeline(pipeline_name="mysql_sync", destination="mysql"):
+def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
     """Create a DLT pipeline with proper configuration."""
     try:
-        # Configure DLT pipeline with correct syntax
-        # DLT expects config parameters to be passed directly, not nested under 'config' key
+        # Configure DLT pipeline with correct syntax for DLT 1.15.0
+        # Use sqlalchemy destination for MySQL compatibility
         pipeline_kwargs = {
             "pipeline_name": pipeline_name,
-            "destination": destination,
+            "destination": dlt.destinations.sqlalchemy(config.DB_TARGET_URL),
             "dataset_name": "sync_data"
         }
         
-        # Add normalization settings directly to pipeline kwargs
-        if config.PRESERVE_COLUMN_NAMES:
-            pipeline_kwargs["normalize"] = {"naming": "direct"}
-        
-        # Add load settings directly to pipeline kwargs
-        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
-            pipeline_kwargs["load"] = {"truncate_staging_dataset": True}
-            log("🗑️ Staging dataset truncation enabled for direct mode")
-        
-        # Create pipeline with correct DLT syntax
+        # Create pipeline with basic parameters first
         pipeline = dlt.pipeline(**pipeline_kwargs)
+        
+        # Apply configuration after pipeline creation if needed
+        # Note: DLT 1.15.0 handles normalization and load settings differently
+        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
+            log("🗑️ Staging dataset truncation enabled for direct mode")
+            # The truncate_staging_dataset will be handled in the pipeline.run() calls
+        
         log(f"✅ Created DLT pipeline: {pipeline_name}")
         return pipeline
         

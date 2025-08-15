@@ -18,9 +18,7 @@ WORKDIR /app
 # Copy the dependency file and install Python dependencies
 COPY source/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir pymysql && \
-    pip install --no-cache-dir python-dotenv
+    pip install --no-cache-dir -r requirements.txt
 
 # Create staging directory for Parquet files
 RUN mkdir -p /app/staging && \

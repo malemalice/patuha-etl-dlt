@@ -1,9 +1,9 @@
 dlt[sqlalchemy]>=1.15.0
-# MySQL drivers - using mysqlclient as primary driver for better performance
-mysqlclient>=2.1.0
-# Keep pymysql as fallback pure Python driver
-pymysql
-# mysql-connector-python can cause conflicts with mysqlclient, commenting out
+# MySQL drivers - use pymysql as primary (more compatible, fewer conflicts)
+pymysql>=1.1.0
+# mysqlclient can cause installation issues, removed to avoid conflicts
+# mysqlclient>=2.1.0
+# mysql-connector-python can cause conflicts, removed
 # mysql-connector-python
 sqlalchemy
 setuptools<81
@@ -12,3 +12,5 @@ pyarrow>=10.0.0
 watchdog>=3.0.0
 python-dotenv
 pytz>=2023.3
+# Add missing orjson package for high-performance JSON processing
+orjson>=3.9.0
