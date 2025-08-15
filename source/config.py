@@ -76,6 +76,14 @@ FILE_STAGING_ADVANCED_MONITORING = os.getenv("FILE_STAGING_ADVANCED_MONITORING",
 # Legacy support - maintain FILE_STAGING_ENABLED for backward compatibility
 FILE_STAGING_ENABLED = PIPELINE_MODE.lower() == "file_staging"
 
+# HTTP Server Configuration
+HTTP_SERVER_PORT = int(os.getenv("HTTP_SERVER_PORT", "8089"))
+HTTP_SERVER_HOST = os.getenv("HTTP_SERVER_HOST", "")  # Empty string = all interfaces
+HTTP_SERVER_TIMEOUT = int(os.getenv("HTTP_SERVER_TIMEOUT", "30"))  # Request timeout in seconds
+HTTP_SERVER_MAX_REQUESTS = int(os.getenv("HTTP_SERVER_MAX_REQUESTS", "1000"))  # Max requests before restart
+HTTP_SERVER_ENABLE_KEEPALIVE = os.getenv("HTTP_SERVER_ENABLE_KEEPALIVE", "true").lower() == "true"
+HTTP_SERVER_ENABLE_REUSEADDR = os.getenv("HTTP_SERVER_ENABLE_REUSEADDR", "true").lower() == "true"
+
 # Database URLs with intelligent driver selection
 def _get_mysql_driver_url_prefix():
     """Get the appropriate MySQL URL prefix based on available drivers."""
