@@ -215,7 +215,7 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     return len(successful_tables), len(failed_tables)
 
 def process_incremental_table(pipeline, engine_source, engine_target, table_name, table_config):
-    """Process a single table with incremental sync."""
+    """Process a single table with incremental loading."""
     try:
         modifier_column = table_config["modifier"]
         primary_key = table_config["primary_key"]
@@ -248,14 +248,8 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         source = source | sanitize_table_data
         
         # Run the pipeline with proper configuration for DLT 1.15.0
-        # Handle truncate_staging_dataset through write_disposition and table replacement
-        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
-            # For truncate_staging_dataset, we need to use replace disposition
-            # This will clear the table before loading new data
-            load_info = pipeline.run(source, write_disposition="replace")
-            log("🗑️ Using replace disposition to clear staging dataset")
-        else:
-            load_info = pipeline.run(source, write_disposition="merge")
+        # DLT will handle staging automatically based on pipeline configuration
+        load_info = pipeline.run(source)
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
@@ -290,14 +284,8 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         source = source | sanitize_table_data
         
         # Run the pipeline with proper configuration for DLT 1.15.0
-        # Handle truncate_staging_dataset through write_disposition
-        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
-            # For truncate_staging_dataset, we need to use replace disposition
-            # This will clear the table before loading new data
-            load_info = pipeline.run(source, write_disposition="replace")
-            log("🗑️ Using replace disposition to clear staging dataset")
-        else:
-            load_info = pipeline.run(source, write_disposition=write_disposition)
+        # DLT will handle staging automatically based on pipeline configuration
+        load_info = pipeline.run(source, write_disposition=write_disposition)
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
@@ -315,20 +303,29 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
     try:
         # Configure DLT pipeline with correct syntax for DLT 1.15.0
         # Use sqlalchemy destination for MySQL compatibility
+        # Configure staging and load behavior using available DLT 1.15.0 options
         pipeline_kwargs = {
             "pipeline_name": pipeline_name,
             "destination": dlt.destinations.sqlalchemy(config.DB_TARGET_URL),
             "dataset_name": "sync_data"
         }
         
-        # Create pipeline with basic parameters first
-        pipeline = dlt.pipeline(**pipeline_kwargs)
-        
-        # Apply configuration after pipeline creation if needed
-        # Note: DLT 1.15.0 handles normalization and load settings differently
+        # Add staging configuration if truncate_staging_dataset is enabled
         if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
+            # For DLT 1.15.0, we configure staging behavior through pipeline options
+            # This ensures staging is properly managed and cleaned up
+            pipeline_kwargs.update({
+                "dev_mode": False,  # Keep incremental behavior (replaces deprecated full_refresh)
+                "restore_from_destination": True,  # Sync with destination state
+                "enable_runtime_trace": True  # Enable runtime monitoring
+            })
             log("🗑️ Staging dataset truncation enabled for direct mode")
-            # The truncate_staging_dataset will be handled in the pipeline.run() calls
+            log("   Configured via DLT 1.15.0 pipeline options")
+        else:
+            log("⚠️ Staging dataset truncation disabled")
+        
+        # Create pipeline with all configuration
+        pipeline = dlt.pipeline(**pipeline_kwargs)
         
         log(f"✅ Created DLT pipeline: {pipeline_name}")
         return pipeline

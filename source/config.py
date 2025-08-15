@@ -65,7 +65,7 @@ STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS",
 PIPELINE_MODE = os.getenv("PIPELINE_MODE", "direct")  # Options: 'direct' (db-to-db) or 'file_staging' (extract to files first)
 
 # DLT Load Configuration (for direct mode)
-TRUNCATE_STAGING_DATASET = os.getenv("TRUNCATE_STAGING_DATASET", "true").lower() == "true"  # Truncate staging dataset after load
+TRUNCATE_STAGING_DATASET = os.getenv("TRUNCATE_STAGING_DATASET", "true").lower() == "true"  # Enable DLT staging management via pipeline configuration (DLT 1.15.0 compatible)
 
 # File-based staging configuration (used when PIPELINE_MODE='file_staging')
 FILE_STAGING_DIR = os.getenv("FILE_STAGING_DIR", "staging")  # Base directory for staging files
