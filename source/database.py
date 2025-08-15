@@ -11,20 +11,13 @@ def _get_mysql_connect_args():
     """Get MySQL connection arguments compatible with the available driver."""
     
     # Base connection arguments compatible with most MySQL drivers
+    # Removed problematic init_command to avoid MariaDB syntax errors
     base_args = {
         'connect_timeout': 60,
         'autocommit': False,
         'charset': 'utf8mb4',
         'use_unicode': True,
-        'init_command': """
-            SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''));
-            SET SESSION innodb_lock_wait_timeout=120;
-            SET SESSION lock_wait_timeout=120;
-            SET SESSION wait_timeout=3600;
-            SET SESSION interactive_timeout=3600;
-            SET SESSION net_read_timeout=600;
-            SET SESSION net_write_timeout=600;
-        """.strip().replace('\n', ' '),
+        # init_command removed - will be handled after connection establishment
     }
     
     # Try to detect which MySQL driver is available and add driver-specific arguments
@@ -68,6 +61,32 @@ def _get_mysql_connect_args():
                 log("⚠️ No MySQL driver detected, using base arguments")
                 return base_args
 
+def _configure_database_session(connection):
+    """Configure database session with optimal settings after connection establishment."""
+    try:
+        # Execute session configuration commands individually to avoid syntax errors
+        session_commands = [
+            "SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))",
+            "SET SESSION innodb_lock_wait_timeout=120",
+            "SET SESSION lock_wait_timeout=120", 
+            "SET SESSION wait_timeout=3600",
+            "SET SESSION interactive_timeout=3600",
+            "SET SESSION net_read_timeout=600",
+            "SET SESSION net_write_timeout=600"
+        ]
+        
+        for command in session_commands:
+            try:
+                connection.execute(sa.text(command))
+                log(f"✅ Session configured: {command}")
+            except Exception as cmd_error:
+                # Log warning but don't fail - some commands might not be supported
+                log(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
+                
+    except Exception as e:
+        log(f"⚠️ Session configuration failed (non-critical): {e}")
+        # Don't raise - this is not critical for basic functionality
+
 def create_engines():
     """Create SQLAlchemy engines with optimized connection pool settings and MySQL-specific parameters."""
     
@@ -80,6 +99,9 @@ def create_engines():
         'pool_recycle': 3600,      # Configurable connection recycle time
         'pool_pre_ping': True,     # Validate connections before use
     }
+    
+    # Note: Session configuration will be done after connection establishment
+    # This is more reliable than connection event listeners
     
     # Detect available MySQL driver and use appropriate connection arguments
     mysql_connect_args = _get_mysql_connect_args()
@@ -100,14 +122,18 @@ def create_engines():
             **pool_settings
         )
         
-        # Test connections
+        # Test connections and configure sessions
         log("🔄 Testing source database connection...")
         with config.ENGINE_SOURCE.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
+            # Configure session settings after successful connection
+            _configure_database_session(conn)
         
         log("🔄 Testing target database connection...")
         with config.ENGINE_TARGET.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
+            # Configure session settings after successful connection
+            _configure_database_session(conn)
         
         log("✅ Database engines created and tested successfully")
         
@@ -137,12 +163,23 @@ def get_engines():
     
     return config.ENGINE_SOURCE, config.ENGINE_TARGET
 
+def get_configured_connection(engine, purpose="database"):
+    """Get a database connection with session configuration applied."""
+    try:
+        connection = engine.connect()
+        # Configure session settings
+        _configure_database_session(connection)
+        log(f"✅ {purpose} connection established and configured")
+        return connection
+    except Exception as e:
+        log(f"❌ Failed to get configured {purpose} connection: {e}")
+        raise
+
 def _execute_transaction(engine, operation_func, *args, **kwargs):
     """Internal function to execute operations within a transaction context."""
     with engine.begin() as connection:
-        # Set transaction timeout
-        connection.execute(sa.text(f"SET SESSION innodb_lock_wait_timeout = {config.TRANSACTION_TIMEOUT}"))
-        connection.execute(sa.text(f"SET SESSION lock_wait_timeout = {config.TRANSACTION_TIMEOUT}"))
+        # Configure session settings for this transaction
+        _configure_database_session(connection)
         return operation_func(connection, *args, **kwargs)
 
 def execute_with_transaction_management(engine, operation_name, operation_func, *args, **kwargs):
