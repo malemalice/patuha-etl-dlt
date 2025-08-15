@@ -76,9 +76,47 @@ FILE_STAGING_ADVANCED_MONITORING = os.getenv("FILE_STAGING_ADVANCED_MONITORING",
 # Legacy support - maintain FILE_STAGING_ENABLED for backward compatibility
 FILE_STAGING_ENABLED = PIPELINE_MODE.lower() == "file_staging"
 
-# Database URLs
-DB_SOURCE_URL = f"mysql://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
-DB_TARGET_URL = f"mysql://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
+# Database URLs with intelligent driver selection
+def _get_mysql_driver_url_prefix():
+    """Get the appropriate MySQL URL prefix based on available drivers."""
+    try:
+        # Check if MySQLdb (mysqlclient) is available
+        import MySQLdb
+        return "mysql"  # Use default mysql:// for MySQLdb
+    except ImportError:
+        try:
+            # Check if mysql.connector is available
+            import mysql.connector
+            return "mysql+mysqlconnector"
+        except ImportError:
+            try:
+                # Check if pymysql is available
+                import pymysql
+                return "mysql+pymysql"
+            except ImportError:
+                # Fallback to default
+                return "mysql"
+
+# Get the appropriate driver prefix
+_MYSQL_DRIVER_PREFIX = _get_mysql_driver_url_prefix()
+
+# Log the selected driver for debugging
+def _log_driver_selection():
+    """Log which MySQL driver prefix was selected."""
+    # Import log here to avoid circular imports
+    try:
+        from utils import log
+        log(f"🔧 Using MySQL driver URL prefix: {_MYSQL_DRIVER_PREFIX}://")
+    except ImportError:
+        # utils module not available during config loading
+        pass
+
+# Construct database URLs with the correct driver
+DB_SOURCE_URL = f"{_MYSQL_DRIVER_PREFIX}://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
+DB_TARGET_URL = f"{_MYSQL_DRIVER_PREFIX}://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
+
+# Log driver selection when config is loaded (will be called later by main pipeline)
+_log_driver_selection()
 
 # Global transaction semaphore to limit concurrent transactions
 transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)

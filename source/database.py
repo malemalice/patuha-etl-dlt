@@ -7,6 +7,67 @@ import sqlalchemy as sa
 import config
 from utils import log
 
+def _get_mysql_connect_args():
+    """Get MySQL connection arguments compatible with the available driver."""
+    
+    # Base connection arguments compatible with most MySQL drivers
+    base_args = {
+        'connect_timeout': 60,
+        'autocommit': False,
+        'charset': 'utf8mb4',
+        'use_unicode': True,
+        'init_command': """
+            SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''));
+            SET SESSION innodb_lock_wait_timeout=120;
+            SET SESSION lock_wait_timeout=120;
+            SET SESSION wait_timeout=3600;
+            SET SESSION interactive_timeout=3600;
+            SET SESSION net_read_timeout=600;
+            SET SESSION net_write_timeout=600;
+        """.strip().replace('\n', ' '),
+    }
+    
+    # Try to detect which MySQL driver is available and add driver-specific arguments
+    try:
+        # Check if MySQLdb (mysqlclient) is available
+        import MySQLdb
+        log("🔧 Detected MySQLdb/mysqlclient driver")
+        # MySQLdb-specific arguments
+        base_args.update({
+            'read_timeout': 300,
+            'write_timeout': 300,
+        })
+        return base_args
+        
+    except ImportError:
+        try:
+            # Check if mysql.connector (mysql-connector-python) is available
+            import mysql.connector
+            log("🔧 Detected mysql-connector-python driver")
+            # mysql-connector-python specific arguments
+            base_args.update({
+                'use_pure': False,
+                'buffered': True,
+                'consume_results': True,
+            })
+            return base_args
+            
+        except ImportError:
+            try:
+                # Check if pymysql is available
+                import pymysql
+                log("🔧 Detected pymysql driver")
+                # PyMySQL-specific arguments
+                base_args.update({
+                    'read_timeout': 300,
+                    'write_timeout': 300,
+                })
+                return base_args
+                
+            except ImportError:
+                log("⚠️ No MySQL driver detected, using base arguments")
+                return base_args
+
 def create_engines():
     """Create SQLAlchemy engines with optimized connection pool settings and MySQL-specific parameters."""
     
@@ -20,28 +81,9 @@ def create_engines():
         'pool_pre_ping': True,     # Validate connections before use
     }
     
-    # MySQL-specific connection arguments to handle timeouts and connection stability
-    mysql_connect_args = {
-        'connect_timeout': 60,
-        'read_timeout': 300,
-        'write_timeout': 300,
-        'autocommit': False,  # Better transaction control
-        'charset': 'utf8mb4',
-        'init_command': """
-            SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''));
-            SET SESSION innodb_lock_wait_timeout=120;
-            SET SESSION lock_wait_timeout=120;
-            SET SESSION wait_timeout=3600;
-            SET SESSION interactive_timeout=3600;
-            SET SESSION net_read_timeout=600;
-            SET SESSION net_write_timeout=600;
-        """.strip().replace('\n', ' '),
-        'use_unicode': True,
-        # Fix for "Commands out of sync" error
-        'use_pure': False,  # Use C extension for better performance
-        'buffered': True,   # Buffer all results to prevent sync issues
-        'consume_results': True,  # Consume all results to prevent sync issues
-    }
+    # Detect available MySQL driver and use appropriate connection arguments
+    mysql_connect_args = _get_mysql_connect_args()
+    log(f"🔧 Using MySQL connection arguments: {list(mysql_connect_args.keys())}")
     
     try:
         log("🔄 Creating source database engine...")

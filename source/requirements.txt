@@ -1,9 +1,12 @@
 dlt[sqlalchemy]>=1.15.0
-mysql-connector-python
+# MySQL drivers - using mysqlclient as primary driver for better performance
+mysqlclient>=2.1.0
+# Keep pymysql as fallback pure Python driver
 pymysql
+# mysql-connector-python can cause conflicts with mysqlclient, commenting out
+# mysql-connector-python
 sqlalchemy
 setuptools<81
-mysqlclient>=2.1.0
 pandas>=1.5.0
 pyarrow>=10.0.0
 watchdog>=3.0.0
