@@ -122,7 +122,7 @@ def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
             ORDER BY TIME DESC
             """
             
-            result = connection.execute(sa.text(query), (timeout_seconds,))
+            result = connection.execute(sa.text(query), [timeout_seconds])
             long_queries = result.fetchall()
             
             if long_queries:

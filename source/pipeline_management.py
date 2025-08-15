@@ -229,7 +229,16 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         # Format primary key for DLT hints
         formatted_primary_key = format_primary_key(primary_key)
         
-        # Apply hints for incremental loading
+        # Apply hints for incremental loading with timezone-aware handling
+        from datetime import datetime
+        import pytz
+        
+        # Convert max_timestamp to timezone-aware datetime if needed
+        if max_timestamp is not None and isinstance(max_timestamp, datetime):
+            if max_timestamp.tzinfo is None:
+                # Add UTC timezone to naive datetime to prevent DLT warnings
+                max_timestamp = pytz.UTC.localize(max_timestamp)
+        
         getattr(source, table_name).apply_hints(
             primary_key=formatted_primary_key,
             incremental=dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
@@ -355,16 +364,33 @@ class StagingFileWatcher(FileSystemEventHandler):
 def process_file_staging_files(staging_dir, table_name, engine_target, primary_keys):
     """Process staging files and load data to MySQL using custom upsert logic."""
     try:
-        # Step 2.1: Discover staging files
+        # Step 2.1: Discover staging files with improved detection
         log(f"🔍 Discovering staging files for {table_name}...")
         staging_files = []
         if os.path.exists(staging_dir):
             for file in os.listdir(staging_dir):
-                if file.endswith(('.parquet', '.json', '.csv', '.jsonl')) and table_name in file:
-                    staging_files.append(os.path.join(staging_dir, file))
+                file_path = os.path.join(staging_dir, file)
+                # Improved file detection logic
+                if (file.endswith(('.parquet', '.json', '.csv', '.jsonl')) and 
+                    (table_name in file or file.startswith('data') or file.startswith(table_name)) and
+                    os.path.isfile(file_path) and os.path.getsize(file_path) > 0):
+                    staging_files.append(file_path)
+                    log(f"📄 Found staging file: {file} ({os.path.getsize(file_path)} bytes)")
+        
+        if not staging_files:
+            # Try alternative file patterns
+            log(f"🔍 No files found with table name, checking for generic DLT files...")
+            if os.path.exists(staging_dir):
+                for file in os.listdir(staging_dir):
+                    file_path = os.path.join(staging_dir, file)
+                    if (file.endswith(('.parquet', '.json', '.csv', '.jsonl')) and
+                        os.path.isfile(file_path) and os.path.getsize(file_path) > 0):
+                        staging_files.append(file_path)
+                        log(f"📄 Found generic staging file: {file} ({os.path.getsize(file_path)} bytes)")
         
         if not staging_files:
             log(f"❌ Step 2.1 FAILED: No staging files found for {table_name}")
+            log(f"   Directory contents: {os.listdir(staging_dir) if os.path.exists(staging_dir) else 'Directory does not exist'}")
             return False
         
         log(f"✅ Step 2.1 SUCCESS: Found {len(staging_files)} files for {table_name}")
@@ -533,7 +559,27 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
             if modifier_column:
                 # Get the latest timestamp from target for incremental sync
                 max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
-                source = sql_database(engine_source).with_resources(table_name)
+                
+                # Convert max_timestamp to timezone-aware datetime if needed
+                from datetime import datetime
+                import pytz
+                
+                if max_timestamp is not None and isinstance(max_timestamp, datetime):
+                    if max_timestamp.tzinfo is None:
+                        # Add UTC timezone to naive datetime to prevent DLT warnings
+                        max_timestamp = pytz.UTC.localize(max_timestamp)
+                
+                # Create source with connection recovery
+                try:
+                    source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
+                except Exception as conn_error:
+                    log(f"⚠️ Connection error creating source, retrying: {conn_error}")
+                    # Force recreate engines to fix "Commands out of sync" issue
+                    from database import create_engines, get_engines
+                    create_engines()
+                    engine_source, _ = get_engines()
+                    source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
+                
                 formatted_primary_key = format_primary_key(primary_key)
                 getattr(source, table_name).apply_hints(
                     primary_key=formatted_primary_key,
@@ -541,7 +587,16 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
                 )
             else:
                 # Full refresh
-                source = sql_database(engine_source).with_resources(table_name)
+                try:
+                    source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
+                except Exception as conn_error:
+                    log(f"⚠️ Connection error creating source, retrying: {conn_error}")
+                    # Force recreate engines to fix "Commands out of sync" issue
+                    from database import create_engines, get_engines
+                    create_engines()
+                    engine_source, _ = get_engines()
+                    source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
+                
                 formatted_primary_key = format_primary_key(primary_key)
                 getattr(source, table_name).apply_hints(primary_key=formatted_primary_key)
             
@@ -584,17 +639,42 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
                 log(f"❌ Phase 1 FAILED: No data extracted for {table_name}")
                 return False
             
-            # Step 1.6: Wait for files to be ready
+            # Step 1.6: Wait for files to be ready with improved detection
             log(f"⏳ Waiting for staging files to be ready for {table_name}...")
-            if watcher.completed.wait(timeout):
+            
+            # Give DLT some time to write files before starting the wait
+            time.sleep(2)
+            
+            # Check for files manually first (fallback mechanism)
+            manual_files = []
+            if os.path.exists(staging_dir):
+                for file in os.listdir(staging_dir):
+                    file_path = os.path.join(staging_dir, file)
+                    if (file.endswith(('.parquet', '.json', '.csv', '.jsonl')) and
+                        os.path.isfile(file_path) and os.path.getsize(file_path) > 0):
+                        manual_files.append(file_path)
+            
+            if manual_files:
+                staging_files = manual_files
+                log(f"✅ Phase 1 SUCCESS: Found {len(staging_files)} files immediately for {table_name}")
+            elif watcher.completed.wait(timeout):
                 staging_files = watcher.found_files
-                log(f"✅ Phase 1 SUCCESS: {len(staging_files)} files ready for {table_name}")
+                log(f"✅ Phase 1 SUCCESS: {len(staging_files)} files ready via watcher for {table_name}")
             else:
-                staging_files = watcher.found_files  # Use whatever was found
+                # Final fallback check
+                staging_files = []
+                if os.path.exists(staging_dir):
+                    for file in os.listdir(staging_dir):
+                        file_path = os.path.join(staging_dir, file)
+                        if (file.endswith(('.parquet', '.json', '.csv', '.jsonl')) and
+                            os.path.isfile(file_path) and os.path.getsize(file_path) > 0):
+                            staging_files.append(file_path)
+                
                 if staging_files:
-                    log(f"⚠️ Phase 1 PARTIAL: Found {len(staging_files)} files (timeout after {timeout}s)")
+                    log(f"⚠️ Phase 1 PARTIAL: Found {len(staging_files)} files via fallback (timeout after {timeout}s)")
                 else:
                     log(f"❌ Phase 1 FAILED: No files detected within {timeout}s for {table_name}")
+                    log(f"   Directory contents: {os.listdir(staging_dir) if os.path.exists(staging_dir) else 'Directory does not exist'}")
             
         except Exception as extraction_error:
             log(f"❌ Phase 1 FAILED: DLT extraction error for {table_name}")

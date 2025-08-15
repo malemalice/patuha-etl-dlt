@@ -27,8 +27,20 @@ def create_engines():
         'write_timeout': 300,
         'autocommit': False,  # Better transaction control
         'charset': 'utf8mb4',
-        'init_command': "SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY','')); SET SESSION innodb_lock_wait_timeout=120; SET SESSION lock_wait_timeout=120",
+        'init_command': """
+            SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''));
+            SET SESSION innodb_lock_wait_timeout=120;
+            SET SESSION lock_wait_timeout=120;
+            SET SESSION wait_timeout=3600;
+            SET SESSION interactive_timeout=3600;
+            SET SESSION net_read_timeout=600;
+            SET SESSION net_write_timeout=600;
+        """.strip().replace('\n', ' '),
         'use_unicode': True,
+        # Fix for "Commands out of sync" error
+        'use_pure': False,  # Use C extension for better performance
+        'buffered': True,   # Buffer all results to prevent sync issues
+        'consume_results': True,  # Consume all results to prevent sync issues
     }
     
     try:

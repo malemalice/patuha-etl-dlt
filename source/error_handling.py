@@ -54,6 +54,12 @@ def retry_on_connection_error(func: Callable, db_type: str = "unknown", *args, *
             ]):
                 error_type = "Connection pool"
                 
+            elif any(keyword in error_message for keyword in [
+                'commands out of sync', 'you can\'t run this command now',
+                'mysql protocol out of sync'
+            ]):
+                error_type = "MySQL protocol sync"
+                
             else:
                 log(f"❌ FAILED: Non-retryable error for {db_type}")
                 log(f"   Error: {e}")
