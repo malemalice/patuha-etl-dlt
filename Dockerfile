@@ -30,6 +30,11 @@ RUN mkdir -p /var/log/app && \
 
 COPY source/ .
 
+# Clean up Python cache files to ensure fresh code execution
+RUN find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
+    find . -name "*.pyc" -delete 2>/dev/null || true && \
+    find . -name "*.pyo" -delete 2>/dev/null || true
+
 # Use a command that keeps the container running for manual execution
 # CMD ["tail", "-f", "/dev/null"]
 

@@ -80,7 +80,6 @@ def _configure_database_session(connection):
         for command in session_commands:
             try:
                 connection.execute(sa.text(command))
-                log(f"✅ Session configured: {command}")
             except Exception as cmd_error:
                 # Log warning but don't fail - some commands might not be supported
                 log(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
