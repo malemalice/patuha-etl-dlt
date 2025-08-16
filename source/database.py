@@ -166,6 +166,74 @@ def get_engines():
     
     return config.ENGINE_SOURCE, config.ENGINE_TARGET
 
+def create_source_engine():
+    """Create only the source database engine."""
+    try:
+        log("🔄 Creating source database engine only...")
+        
+        pool_settings = {
+            'pool_size': config.POOL_SIZE,
+            'max_overflow': config.MAX_OVERFLOW,
+            'pool_timeout': config.POOL_TIMEOUT,
+            'pool_recycle': config.POOL_RECYCLE,
+            'pool_pre_ping': config.POOL_PRE_PING,
+            'pool_reset_on_return': 'commit',
+        }
+        
+        mysql_connect_args = _get_mysql_connect_args()
+        
+        engine = sa.create_engine(
+            config.DB_SOURCE_URL,
+            connect_args=mysql_connect_args,
+            **pool_settings
+        )
+        
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(sa.text("SELECT 1"))
+            _configure_database_session(conn)
+        
+        log("✅ Source database engine created successfully")
+        return engine
+        
+    except Exception as e:
+        log(f"❌ Failed to create source engine: {e}")
+        return None
+
+def create_target_engine():
+    """Create only the target database engine."""
+    try:
+        log("🔄 Creating target database engine only...")
+        
+        pool_settings = {
+            'pool_size': config.POOL_SIZE,
+            'max_overflow': config.MAX_OVERFLOW,
+            'pool_timeout': config.POOL_TIMEOUT,
+            'pool_recycle': config.POOL_RECYCLE,
+            'pool_pre_ping': config.POOL_PRE_PING,
+            'pool_reset_on_return': 'commit',
+        }
+        
+        mysql_connect_args = _get_mysql_connect_args()
+        
+        engine = sa.create_engine(
+            config.DB_TARGET_URL,
+            connect_args=mysql_connect_args,
+            **pool_settings
+        )
+        
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(sa.text("SELECT 1"))
+            _configure_database_session(conn)
+        
+        log("✅ Target database engine created successfully")
+        return engine
+        
+    except Exception as e:
+        log(f"❌ Failed to create target engine: {e}")
+        return None
+
 def check_connection_pool_health(engine, pool_name="database"):
     """Check if connection pool is healthy and not corrupted."""
     try:
@@ -194,7 +262,13 @@ def check_connection_pool_health(engine, pool_name="database"):
         except Exception as e:
             return False, f"Error checking pool size: {e}"
         
-        return True, "Pool healthy"
+        # Test actual connection to ensure it's working
+        try:
+            with engine.connect() as conn:
+                conn.execute(sa.text("SELECT 1"))
+            return True, "Pool healthy"
+        except Exception as conn_error:
+            return False, f"Connection test failed: {conn_error}"
         
     except Exception as e:
         return False, f"Pool health check failed: {e}"
@@ -202,7 +276,20 @@ def check_connection_pool_health(engine, pool_name="database"):
 def get_configured_connection(engine, purpose="database"):
     """Get a database connection with session configuration applied."""
     try:
+        # Test connection before using it
+        if engine is None:
+            raise Exception("Engine is None")
+            
         connection = engine.connect()
+        
+        # Test if connection is actually working
+        try:
+            connection.execute(sa.text("SELECT 1"))
+        except Exception as test_error:
+            log(f"⚠️ Connection test failed: {test_error}")
+            connection.close()
+            raise Exception(f"Connection test failed: {test_error}")
+        
         # Configure session settings
         _configure_database_session(connection)
         log(f"✅ {purpose} connection established and configured")

@@ -139,8 +139,19 @@ def recover_connection_pool(engine, pool_name):
         
     except Exception as e:
         log(f"❌ Failed to recover {pool_name} connection pool: {e}")
-        # Return the original engine instead of None to prevent unpacking errors
-        return engine
+        # Try to create a single engine instead of recreating both
+        try:
+            log(f"🔄 Attempting single engine recovery for {pool_name}...")
+            if 'source' in pool_name:
+                from database import create_source_engine
+                return create_source_engine()
+            else:
+                from database import create_target_engine
+                return create_target_engine()
+        except Exception as single_engine_error:
+            log(f"❌ Single engine recovery also failed: {single_engine_error}")
+            # Return None to indicate complete failure - this will be handled by caller
+            return None
 
 def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, write_disposition="merge"):
     """Process a batch of tables with connection pool recovery for MariaDB."""
@@ -163,8 +174,14 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             if hasattr(engine_source.pool, 'overflow') and engine_source.pool.overflow() < 0:
                 log(f"⚠️ Source connection pool corrupted (overflow: {engine_source.pool.overflow()}), recovering...")
                 try:
-                    engine_source = recover_connection_pool(engine_source, "source")
-                    log(f"✅ Source connection pool recovery completed")
+                    recovered_engine = recover_connection_pool(engine_source, "source")
+                    if recovered_engine is not None:
+                        engine_source = recovered_engine
+                        log(f"✅ Source connection pool recovery completed")
+                    else:
+                        log(f"❌ Source connection pool recovery failed completely, skipping {table_name}")
+                        failed_tables.append(table_name)
+                        continue
                 except Exception as recovery_error:
                     log(f"❌ Source connection pool recovery failed: {recovery_error}")
                     failed_tables.append(table_name)
@@ -173,8 +190,14 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             if hasattr(engine_target.pool, 'overflow') and engine_target.pool.overflow() < 0:
                 log(f"⚠️ Target connection pool corrupted (overflow: {engine_target.pool.overflow()}), recovering...")
                 try:
-                    engine_target = recover_connection_pool(engine_target, "target")
-                    log(f"✅ Target connection pool recovery completed")
+                    recovered_engine = recover_connection_pool(engine_target, "target")
+                    if recovered_engine is not None:
+                        engine_target = recovered_engine
+                        log(f"✅ Target connection pool recovery completed")
+                    else:
+                        log(f"❌ Target connection pool recovery failed completely, skipping {table_name}")
+                        failed_tables.append(table_name)
+                        continue
                 except Exception as recovery_error:
                     log(f"❌ Target connection pool recovery failed: {recovery_error}")
                     failed_tables.append(table_name)
@@ -240,14 +263,22 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             # Force connection pool recovery on critical errors
             log(f"🔄 Attempting connection pool recovery after critical error...")
             try:
-                engine_source = recover_connection_pool(engine_source, "source")
-                log(f"✅ Source pool recovery after critical error completed")
+                recovered_source = recover_connection_pool(engine_source, "source")
+                if recovered_source is not None:
+                    engine_source = recovered_source
+                    log(f"✅ Source pool recovery after critical error completed")
+                else:
+                    log(f"❌ Source pool recovery after critical error failed completely")
             except Exception as recovery_error:
                 log(f"❌ Source pool recovery after critical error failed: {recovery_error}")
                 
             try:
-                engine_target = recover_connection_pool(engine_target, "target")
-                log(f"✅ Target pool recovery after critical error completed")
+                recovered_target = recover_connection_pool(engine_target, "target")
+                if recovered_target is not None:
+                    engine_target = recovered_target
+                    log(f"✅ Target pool recovery after critical error completed")
+                else:
+                    log(f"❌ Target pool recovery after critical error failed completely")
             except Exception as recovery_error:
                 log(f"❌ Target pool recovery after critical error failed: {recovery_error}")
     
