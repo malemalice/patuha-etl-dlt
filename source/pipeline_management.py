@@ -50,6 +50,58 @@ def get_max_timestamp(engine_target, table_name, column_name):
         _get_timestamp
     )
 
+def get_table_row_count(engine, table_name):
+    """Get the total row count for a table."""
+    def _get_count(connection):
+        try:
+            query = f"SELECT COUNT(*) FROM {table_name}"
+            result = connection.execute(sa.text(query))
+            count = result.scalar()
+            return count or 0
+        except Exception as e:
+            log(f"❌ Error getting row count for {table_name}: {e}")
+            return 0
+    
+    return retry_on_lock_timeout(
+        execute_with_transaction_management,
+        "target" if "target" in str(engine) else "source",
+        f"get_row_count for {table_name}",
+        engine,
+        f"get_row_count for {table_name}",
+        _get_count
+    )
+
+def get_new_records_count(engine, table_name, modifier_column, since_timestamp):
+    """Get the count of new records since a specific timestamp."""
+    def _get_new_count(connection):
+        try:
+            if since_timestamp is None:
+                # If no timestamp, get all records
+                query = f"SELECT COUNT(*) FROM {table_name}"
+            else:
+                # Get records newer than the timestamp
+                query = f"SELECT COUNT(*) FROM {table_name} WHERE {modifier_column} > %s"
+            
+            if since_timestamp is None:
+                result = connection.execute(sa.text(query))
+            else:
+                result = connection.execute(sa.text(query), [since_timestamp])
+            
+            count = result.scalar()
+            return count or 0
+        except Exception as e:
+            log(f"❌ Error getting new records count for {table_name}: {e}")
+            return 0
+    
+    return retry_on_lock_timeout(
+        execute_with_transaction_management,
+        "source",
+        f"get_new_records_count for {table_name}",
+        engine,
+        f"get_new_records_count for {table_name}",
+        _get_new_count
+    )
+
 def force_table_clear(engine_target, table_name):
     """Force clear a table completely to prevent DLT from generating complex DELETE statements.
     
@@ -307,6 +359,17 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         # Get the latest timestamp from target
         max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
         
+        # Log the incremental sync details
+        log(f"📅 Incremental sync for {table_name}:")
+        log(f"   Modifier column: {modifier_column}")
+        log(f"   Latest timestamp in target: {max_timestamp}")
+        
+        # Get source table row count for comparison
+        source_count = get_table_row_count(engine_source, table_name)
+        target_count = get_table_row_count(engine_target, table_name)
+        
+        log(f"📊 Row counts - Source: {source_count}, Target: {target_count}")
+        
         # Create SQL database source
         source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
         
@@ -323,21 +386,64 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 # Add UTC timezone to naive datetime to prevent DLT warnings
                 max_timestamp = pytz.UTC.localize(max_timestamp)
         
-        getattr(source, table_name).apply_hints(
+        # Apply incremental hints
+        table_source = getattr(source, table_name)
+        
+        # Debug incremental configuration
+        log(f"🔧 Applying incremental hints for {table_name}:")
+        log(f"   Primary key: {formatted_primary_key}")
+        log(f"   Modifier column: {modifier_column}")
+        log(f"   Initial value: {max_timestamp}")
+        
+        # Create incremental configuration
+        incremental_config = dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
+        
+        # Apply hints
+        table_source.apply_hints(
             primary_key=formatted_primary_key,
-            incremental=dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
+            incremental=incremental_config
         )
+        
+        log(f"✅ Incremental hints applied successfully")
         
         # Apply data sanitization transformer if enabled
         source = source | sanitize_table_data
         
         # Run the pipeline with proper configuration for DLT 1.15.0
-        # DLT will handle staging automatically based on pipeline configuration
+        log(f"🔄 Running DLT pipeline for {table_name}...")
         load_info = pipeline.run(source)
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
-            return True
+            
+            # Verify data was actually synced
+            new_target_count = get_table_row_count(engine_target, table_name)
+            rows_synced = new_target_count - target_count
+            
+            log(f"📊 Sync verification - Rows synced: {rows_synced}")
+            
+            if rows_synced > 0:
+                log(f"✅ Incremental sync successful: {rows_synced} rows synced")
+                return True
+            else:
+                log(f"⚠️ No rows were synced despite successful load info")
+                log(f"   This might indicate an incremental sync issue")
+                
+                # Check if there are actually new records in source
+                if max_timestamp is not None:
+                    new_source_count = get_new_records_count(engine_source, table_name, modifier_column, max_timestamp)
+                    log(f"🔍 New records in source since {max_timestamp}: {new_source_count}")
+                    
+                    if new_source_count > 0:
+                        log(f"⚠️ Source has {new_source_count} new records but none were synced")
+                        log(f"   This indicates an incremental sync configuration issue")
+                        return False
+                    else:
+                        log(f"✅ No new records in source - sync is working correctly")
+                        return True
+                else:
+                    log(f"✅ No timestamp comparison - sync is working correctly")
+                    return True
         else:
             log(f"⚠️ No load info returned for {table_name}")
             return False
@@ -401,10 +507,12 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
             pipeline_kwargs.update({
                 "dev_mode": False,  # Keep incremental behavior (replaces deprecated full_refresh)
                 "restore_from_destination": True,  # Sync with destination state
-                "enable_runtime_trace": True  # Enable runtime monitoring
+                "enable_runtime_trace": True,  # Enable runtime monitoring
+                "write_disposition": "merge"  # Ensure merge mode for incremental syncs
             })
             log("🗑️ Staging dataset truncation enabled for direct mode")
             log("   Configured via DLT 1.15.0 pipeline options")
+            log("   Write disposition: merge (for incremental syncs)")
         else:
             log("⚠️ Staging dataset truncation disabled")
         
@@ -412,6 +520,10 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         pipeline = dlt.pipeline(**pipeline_kwargs)
         
         log(f"✅ Created DLT pipeline: {pipeline_name}")
+        log(f"   Destination: {destination}")
+        log(f"   Dataset: sync_data")
+        log(f"   Mode: incremental with merge disposition")
+        
         return pipeline
         
     except Exception as e:
