@@ -270,6 +270,14 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             # Log primary key information
             log_primary_key_info(table_name, primary_key)
             
+            # Log table configuration details
+            log(f"📋 Table configuration details:")
+            log(f"   Primary key: {primary_key}")
+            log(f"   Has modifier: {'modifier' in table_config}")
+            if 'modifier' in table_config:
+                log(f"   Modifier column: {table_config['modifier']}")
+            log(f"   Write disposition: {write_disposition}")
+            
             # Validate table data
             if not validate_table_data(engine_source, table_name):
                 log(f"❌ Table data validation failed for {table_name}, attempting to debug...")
@@ -290,10 +298,17 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             if "modifier" in table_config and write_disposition == "merge":
                 # Incremental sync
                 log(f"📈 Processing incremental sync for {table_name}")
+                log(f"   Table has modifier column: {table_config['modifier']}")
+                log(f"   Using merge disposition for incremental sync")
                 success = process_incremental_table(pipeline, engine_source, engine_target, table_name, table_config)
             else:
                 # Full refresh
                 log(f"🔄 Processing full refresh for {table_name}")
+                if "modifier" not in table_config:
+                    log(f"   Table has no modifier column - using full refresh")
+                else:
+                    log(f"   Table has modifier but write_disposition is not merge - using full refresh")
+                log(f"   Using {write_disposition} disposition for full refresh")
                 success = process_full_refresh_table(pipeline, engine_source, engine_target, table_name, table_config, write_disposition)
             
             table_end_time = time.time()
@@ -411,6 +426,9 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         
         # Run the pipeline with proper configuration for DLT 1.15.0
         log(f"🔄 Running DLT pipeline for {table_name}...")
+        log(f"   Using write_disposition: merge (incremental sync)")
+        log(f"   Will merge new/changed data with existing target table")
+        
         load_info = pipeline.run(source)
         
         if load_info:
@@ -457,9 +475,25 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
     try:
         primary_key = table_config["primary_key"]
         
+        # Log the full refresh details
+        log(f"🔄 Full refresh for {table_name}:")
+        log(f"   Primary key: {primary_key}")
+        log(f"   Write disposition: {write_disposition}")
+        
+        # Get source table row count for comparison
+        source_count = get_table_row_count(engine_source, table_name)
+        target_count_before = get_table_row_count(engine_target, table_name)
+        
+        log(f"📊 Row counts before sync - Source: {source_count}, Target: {target_count_before}")
+        
         # Clean up target table if using replace mode
         if write_disposition == "replace":
+            log(f"🧹 Cleaning up target table {table_name} for full refresh...")
             safe_table_cleanup(engine_target, table_name, write_disposition)
+            
+            # Verify cleanup
+            target_count_after_cleanup = get_table_row_count(engine_target, table_name)
+            log(f"📊 Target table after cleanup: {target_count_after_cleanup} rows")
         
         # Create SQL database source
         source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
@@ -467,19 +501,57 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         # Format primary key for DLT hints
         formatted_primary_key = format_primary_key(primary_key)
         
+        # Debug full refresh configuration
+        log(f"🔧 Applying full refresh hints for {table_name}:")
+        log(f"   Primary key: {formatted_primary_key}")
+        log(f"   Write disposition: {write_disposition}")
+        
         # Apply hints
-        getattr(source, table_name).apply_hints(primary_key=formatted_primary_key)
+        table_source = getattr(source, table_name)
+        table_source.apply_hints(primary_key=formatted_primary_key)
         
         # Apply data sanitization transformer if enabled
         source = source | sanitize_table_data
         
         # Run the pipeline with proper configuration for DLT 1.15.0
-        # DLT will handle staging automatically based on pipeline configuration
+        log(f"🔄 Running DLT pipeline for {table_name} (full refresh)...")
+        log(f"   Using write_disposition: {write_disposition}")
+        
+        # Ensure write_disposition is properly passed
+        if write_disposition == "replace":
+            log(f"   Full refresh mode: Will replace all data in target table")
+        elif write_disposition == "merge":
+            log(f"   Merge mode: Will merge data with existing target table")
+        else:
+            log(f"   Append mode: Will add data to existing target table")
+        
         load_info = pipeline.run(source, write_disposition=write_disposition)
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
-            return True
+            
+            # Verify data was actually synced
+            target_count_after = get_table_row_count(engine_target, table_name)
+            rows_synced = target_count_after - target_count_before
+            
+            log(f"📊 Sync verification - Rows synced: {rows_synced}")
+            log(f"   Target before: {target_count_before}, Target after: {target_count_after}")
+            
+            if rows_synced > 0 or (write_disposition == "replace" and target_count_after > 0):
+                log(f"✅ Full refresh successful: {target_count_after} rows in target")
+                return True
+            else:
+                log(f"⚠️ No rows were synced despite successful load info")
+                log(f"   This indicates a full refresh configuration issue")
+                
+                # Check if source actually has data
+                if source_count > 0:
+                    log(f"⚠️ Source has {source_count} rows but target has {target_count_after} rows")
+                    log(f"   This indicates a full refresh processing issue")
+                    return False
+                else:
+                    log(f"✅ Source has no data - sync is working correctly")
+                    return True
         else:
             log(f"⚠️ No load info returned for {table_name}")
             return False
@@ -508,11 +580,11 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
                 "dev_mode": False,  # Keep incremental behavior (replaces deprecated full_refresh)
                 "restore_from_destination": True,  # Sync with destination state
                 "enable_runtime_trace": True,  # Enable runtime monitoring
-                "write_disposition": "merge"  # Ensure merge mode for incremental syncs
+                # Note: write_disposition is set per-table, not globally
             })
             log("🗑️ Staging dataset truncation enabled for direct mode")
             log("   Configured via DLT 1.15.0 pipeline options")
-            log("   Write disposition: merge (for incremental syncs)")
+            log("   Write disposition: Set per-table (merge for incremental, replace for full refresh)")
         else:
             log("⚠️ Staging dataset truncation disabled")
         
