@@ -507,6 +507,20 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 incremental=incremental_config
             )
             log(f"✅ Applied incremental hints with config: {incremental_config}")
+            
+            # CRITICAL FIX: Force DLT to re-evaluate incremental state by clearing cached state
+            # This ensures DLT doesn't use stale cached state that prevents proper sync
+            try:
+                if hasattr(table_source, '_incremental'):
+                    if hasattr(table_source._incremental, '_cached_state'):
+                        table_source._incremental._cached_state = None
+                        log(f"🔧 Cleared DLT cached incremental state for {table_name}")
+                    if hasattr(table_source._incremental, 'last_value'):
+                        # Force reset to match database state
+                        table_source._incremental.last_value = max_timestamp
+                        log(f"🔧 Reset DLT incremental last_value to: {max_timestamp}")
+            except Exception as cache_clear_error:
+                log(f"⚠️ Could not clear DLT cached state: {cache_clear_error}")
         else:
             table_source.apply_hints(
                 primary_key=formatted_primary_key
@@ -554,31 +568,64 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         except Exception as debug_error:
             log(f"⚠️ Debug info unavailable: {debug_error}")
         
+        # CRITICAL FIX: Reset DLT pipeline state to fix incremental sync mismatch
+        # The issue is that DLT pipeline state has a newer timestamp than the actual target database
+        # This causes DLT to think it has already processed newer data when it hasn't
+        try:
+            if hasattr(pipeline, 'state') and pipeline.state and 'sources' in pipeline.state:
+                if 'sql_database' in pipeline.state['sources']:
+                    if 'resources' in pipeline.state['sources']['sql_database']:
+                        if table_name in pipeline.state['sources']['sql_database']['resources']:
+                            resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
+                            if 'incremental' in resource_state and modifier_column in resource_state['incremental']:
+                                pipeline_last_value = resource_state['incremental'][modifier_column].get('last_value')
+                                log(f"🔍 Pipeline state shows last_value: {pipeline_last_value}")
+                                log(f"🔍 Target database shows max timestamp: {max_timestamp}")
+                                
+                                # Check if pipeline state is ahead of database state
+                                if pipeline_last_value and max_timestamp:
+                                    # Convert both to UTC for comparison
+                                    from datetime import datetime
+                                    import pytz
+                                    
+                                    if hasattr(pipeline_last_value, 'astimezone'):
+                                        pipeline_utc = pipeline_last_value.astimezone(pytz.UTC)
+                                    else:
+                                        pipeline_utc = pipeline_last_value
+                                    
+                                    if hasattr(max_timestamp, 'astimezone'):
+                                        db_utc = max_timestamp.astimezone(pytz.UTC)
+                                    elif isinstance(max_timestamp, str):
+                                        db_utc = datetime.fromisoformat(max_timestamp.replace('Z', '+00:00'))
+                                    else:
+                                        db_utc = max_timestamp
+                                        # If it's a naive datetime, assume UTC
+                                        if hasattr(db_utc, 'tzinfo') and db_utc.tzinfo is None:
+                                            db_utc = pytz.UTC.localize(db_utc)
+                                    
+                                    if pipeline_utc > db_utc:
+                                        log(f"🚨 CRITICAL: Pipeline state is ahead of database!")
+                                        log(f"   Pipeline: {pipeline_utc} > Database: {db_utc}")
+                                        log(f"🔧 Resetting pipeline state to match database...")
+                                        
+                                        # Reset the pipeline state to match the database
+                                        resource_state['incremental'][modifier_column]['last_value'] = max_timestamp
+                                        resource_state['incremental'][modifier_column]['initial_value'] = max_timestamp
+                                        
+                                        log(f"✅ Pipeline state reset to: {max_timestamp}")
+                                    else:
+                                        log(f"✅ Pipeline state is in sync with database")
+        except Exception as state_fix_error:
+            log(f"⚠️ Could not fix pipeline state: {state_fix_error}")
+        
         # Debug: Check pipeline state before run
         try:
-            if hasattr(pipeline, 'state'):
-                log(f"🔍 Pipeline state before run: {pipeline.state}")
-            if hasattr(pipeline, 'defaults'):
-                log(f"🔍 Pipeline defaults: {pipeline.defaults}")
-            # Check if pipeline has any existing state that might prevent incremental sync
-            if hasattr(pipeline, 'pipeline_name'):
-                log(f"🔍 Pipeline name: {pipeline.pipeline_name}")
-            # Check destination configuration
-            if hasattr(pipeline, 'destination'):
-                log(f"🔍 Pipeline destination: {pipeline.destination}")
-                if hasattr(pipeline.destination, 'config'):
-                    log(f"🔍 Destination config: {pipeline.destination.config}")
-            # Check if pipeline has any existing state that might prevent incremental sync
-            if hasattr(pipeline, 'state') and pipeline.state:
-                log(f"🔍 Warning: Pipeline has existing state - this might prevent incremental sync")
-                log(f"🔍 Existing state keys: {list(pipeline.state.keys()) if isinstance(pipeline.state, dict) else 'Not a dict'}")
-            # Check pipeline configuration
-            if hasattr(pipeline, 'config'):
-                log(f"🔍 Pipeline config: {pipeline.config}")
-            # Check if pipeline has any existing state that might prevent incremental sync
-            if hasattr(pipeline, 'state') and pipeline.state:
-                log(f"🔍 Warning: Pipeline has existing state - this might prevent incremental sync")
-                log(f"🔍 Existing state keys: {list(pipeline.state.keys()) if isinstance(pipeline.state, dict) else 'Not a dict'}")
+            if hasattr(pipeline, 'state') and pipeline.state and 'sources' in pipeline.state:
+                if 'sql_database' in pipeline.state['sources']:
+                    if 'resources' in pipeline.state['sources']['sql_database']:
+                        if table_name in pipeline.state['sources']['sql_database']['resources']:
+                            resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
+                            log(f"🔍 Final pipeline state for {table_name}: {resource_state}")
         except Exception as state_error:
             log(f"⚠️ Pipeline state info unavailable: {state_error}")
         
