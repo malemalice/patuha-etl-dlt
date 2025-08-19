@@ -488,11 +488,16 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                     max_timestamp = None
             
             if max_timestamp is not None:
-                # CRITICAL FIX: Use the SOURCE timestamp as the starting point for incremental sync
+                # CRITICAL FIX: Use the TARGET timestamp as the starting point for incremental sync
                 # This ensures DLT processes records newer than what's in the target database
-                log(f"🔧 Creating incremental config with source timestamp: {max_timestamp}")
+                log(f"🔧 Creating incremental config with target timestamp: {max_timestamp}")
                 incremental_config = dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
-                log(f"🔧 Applied incremental sync with source timestamp: {max_timestamp}")
+                log(f"🔧 Applied incremental sync with target timestamp: {max_timestamp}")
+                
+                # CRITICAL: Force DLT to use the exact timestamp we specify
+                if hasattr(incremental_config, 'initial_value'):
+                    incremental_config.initial_value = max_timestamp
+                    log(f"🔧 Forced incremental config initial_value to: {max_timestamp}")
             else:
                 # Fallback to no incremental (will sync all data)
                 incremental_config = None
@@ -531,6 +536,16 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                     if hasattr(table_source._incremental, '_state'):
                         table_source._incremental._state = None
                         log(f"🔧 Cleared DLT incremental internal state for {table_name}")
+                        
+                    # CRITICAL: Force DLT to re-evaluate the incremental configuration by clearing all cached values
+                    if hasattr(table_source._incremental, '_last_value_func'):
+                        table_source._incremental._last_value_func = None
+                        log(f"🔧 Cleared DLT incremental last_value_func for {table_name}")
+                        
+                    # Force DLT to re-evaluate the incremental configuration by clearing all cached values
+                    if hasattr(table_source._incremental, '_initial_value_func'):
+                        table_source._incremental._initial_value_func = None
+                        log(f"🔧 Cleared DLT incremental initial_value_func for {table_name}")
                         
             except Exception as cache_clear_error:
                 log(f"⚠️ Could not clear DLT cached state: {cache_clear_error}")
@@ -604,6 +619,13 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                                     newer_records += 1
                         
                         log(f"🔍 Sample data analysis: {newer_records}/{len(sample_data)} records are newer than threshold {threshold}")
+                        
+                        # CRITICAL: If no newer records in sample, this might indicate the incremental config is wrong
+                        if newer_records == 0:
+                            log(f"⚠️ WARNING: No newer records found in sample data!")
+                            log(f"   This suggests the incremental configuration might be incorrect")
+                            log(f"   Threshold: {threshold}")
+                            log(f"   Sample timestamps: {[record.get(modifier_column) for record in sample_data if modifier_column in record]}")
                 else:
                     log(f"⚠️ Warning: Modifier column '{modifier_column}' not found in sample data")
         except Exception as debug_error:
@@ -646,25 +668,27 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 if source_utc > target_utc:
                     log(f"✅ Source has newer data: {source_utc} > {target_utc}")
                     
-                    # CRITICAL FIX: Reset DLT pipeline state to use SOURCE timestamp as starting point
-                    # This ensures DLT processes the newer records from source
+                    # CRITICAL FIX: Reset DLT pipeline state to use TARGET timestamp as starting point
+                    # This ensures DLT processes records newer than what's in the target database
                     if hasattr(pipeline, 'state') and pipeline.state and 'sources' in pipeline.state:
                         if 'sql_database' in pipeline.state['sources']:
-                            if 'resources' in pipeline.state['sources']['sql_database']:
+                            if 'resources' in pipeline.state['sql_database']:
                                 if table_name in pipeline.state['sources']['sql_database']['resources']:
                                     resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
                                     if 'incremental' in resource_state and modifier_column in resource_state['incremental']:
-                                        log(f"🔧 Resetting pipeline state to use source timestamp: {source_max_timestamp}")
+                                        log(f"🔧 Resetting pipeline state to use target timestamp: {max_timestamp}")
                                         
-                                        # Use the SOURCE timestamp as the starting point for incremental sync
-                                        resource_state['incremental'][modifier_column]['last_value'] = source_max_timestamp
-                                        resource_state['incremental'][modifier_column]['initial_value'] = source_max_timestamp
+                                        # CRITICAL FIX: Reset BOTH initial_value and last_value to target database timestamp
+                                        # This ensures DLT processes records newer than what's in the target database
+                                        target_timestamp = max_timestamp  # Keep the original target timestamp
+                                        resource_state['incremental'][modifier_column]['last_value'] = target_timestamp
+                                        resource_state['incremental'][modifier_column]['initial_value'] = target_timestamp
                                         
-                                        log(f"✅ Pipeline state reset to source timestamp: {source_max_timestamp}")
+                                        log(f"✅ Pipeline state reset to target timestamp: {target_timestamp}")
+                                        log(f"🔧 This will sync records newer than: {target_timestamp}")
                                         
-                                        # Also update the max_timestamp variable to use source timestamp
-                                        max_timestamp = source_max_timestamp
-                                        log(f"🔧 Updated max_timestamp to source value: {max_timestamp}")
+                                        # Keep max_timestamp as the target timestamp (don't change it)
+                                        log(f"🔧 Using target timestamp for incremental sync: {max_timestamp}")
                 else:
                     log(f"⚠️ Source does not have newer data: {source_utc} <= {target_utc}")
                     
