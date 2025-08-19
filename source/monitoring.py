@@ -340,12 +340,22 @@ def log_performance_metrics(operation_name, start_time, end_time, record_count=N
     """Log performance metrics for operations."""
     duration = end_time - start_time
     
-    metrics_info = f"⏱️ {operation_name} completed in {duration:.2f}s"
-    if record_count is not None:
-        rate = record_count / duration if duration > 0 else 0
-        metrics_info += f" ({record_count} records, {rate:.1f} records/sec)"
-    
-    log(metrics_info)
+    if "Batch processing" in operation_name:
+        # For batch processing, show tables and records separately
+        if record_count is not None:
+            rate = record_count / duration if duration > 0 else 0
+            log(f"⏱️ {operation_name} completed in {duration:.2f}s")
+            log(f"📊 Performance: {record_count:,} records processed at {rate:.1f} records/sec")
+        else:
+            log(f"⏱️ {operation_name} completed in {duration:.2f}s")
+    else:
+        # For other operations
+        metrics_info = f"⏱️ {operation_name} completed in {duration:.2f}s"
+        if record_count is not None:
+            rate = record_count / duration if duration > 0 else 0
+            metrics_info += f" ({record_count:,} records, {rate:.1f} records/sec)"
+        
+        log(metrics_info)
 
 def monitor_connection_pool_health(engine_source, engine_target):
     """Monitor connection pool health and detect corruption."""

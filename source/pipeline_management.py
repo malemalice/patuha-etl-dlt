@@ -319,8 +319,31 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             
             if success:
                 successful_tables.append(table_name)
-                log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time)
-                log(f"✅ Successfully processed table: {table_name}")
+                
+                # Get actual record count for this table
+                try:
+                    if "modifier" in table_config:
+                        # For incremental sync, get new records count
+                        modifier_column = table_config["modifier"]
+                        max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
+                        if max_timestamp is not None:
+                            new_records = get_new_records_count(engine_source, table_name, modifier_column, max_timestamp)
+                            log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time, new_records)
+                            log(f"✅ Successfully processed table: {table_name} ({new_records} new records)")
+                        else:
+                            # First time sync
+                            source_count = get_table_row_count(engine_source, table_name)
+                            log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time, source_count)
+                            log(f"✅ Successfully processed table: {table_name} ({source_count} records, first time)")
+                    else:
+                        # For full refresh, get total source count
+                        source_count = get_table_row_count(engine_source, table_name)
+                        log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time, source_count)
+                        log(f"✅ Successfully processed table: {table_name} ({source_count} records, full refresh)")
+                except Exception as e:
+                    log(f"⚠️ Could not get record count for {table_name}: {e}")
+                    log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time)
+                    log(f"✅ Successfully processed table: {table_name}")
             else:
                 failed_tables.append(table_name)
                 log(f"❌ Failed to process table: {table_name}")
@@ -354,13 +377,46 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 log(f"❌ Target pool recovery after critical error failed: {recovery_error}")
     
     batch_end_time = time.time()
-    log_performance_metrics(f"Batch processing", batch_start_time, batch_end_time, len(tables_dict))
+    
+    # Calculate actual records processed for this batch
+    total_records_processed = 0
+    for table_name in successful_tables:
+        try:
+            # Get the actual record count that was synced for each table
+            if table_name in tables_dict:
+                table_config = tables_dict[table_name]
+                if "modifier" in table_config:
+                    # For incremental sync, get the count of new records
+                    modifier_column = table_config["modifier"]
+                    # Get the latest timestamp from target to calculate new records
+                    from database import get_engines
+                    _, engine_target = get_engines()
+                    max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
+                    if max_timestamp is not None:
+                        new_records = get_new_records_count(engine_source, table_name, modifier_column, max_timestamp)
+                        total_records_processed += new_records
+                        log(f"📊 Table {table_name}: {new_records} new records synced")
+                    else:
+                        # First time sync, get total source count
+                        source_count = get_table_row_count(engine_source, table_name)
+                        total_records_processed += source_count
+                        log(f"📊 Table {table_name}: {source_count} records synced (first time)")
+                else:
+                    # For full refresh, get total source count
+                    source_count = get_table_row_count(engine_source, table_name)
+                    total_records_processed += source_count
+                    log(f"📊 Table {table_name}: {source_count} records synced (full refresh)")
+        except Exception as e:
+            log(f"⚠️ Could not get record count for {table_name}: {e}")
+    
+    log_performance_metrics(f"Batch processing", batch_start_time, batch_end_time, total_records_processed)
     
     # Summary
     log(f"\n{'='*60}")
     log(f"📊 Batch processing summary:")
     log(f"✅ Successful: {len(successful_tables)} tables")
     log(f"❌ Failed: {len(failed_tables)} tables")
+    log(f"📈 Total records processed: {total_records_processed:,}")
     
     if successful_tables:
         log(f"✅ Successful tables: {', '.join(successful_tables)}")
@@ -1040,6 +1096,7 @@ def load_select_tables_from_database():
             batch_dict = dict(batch_items)
             
             log(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_dict)} tables)")
+            log(f"📋 Batch configuration: BATCH_SIZE={config.BATCH_SIZE}, BATCH_DELAY={config.BATCH_DELAY}s")
             
             # Monitor connection pool health before each batch
             from monitoring import monitor_connection_pool_health
