@@ -82,17 +82,21 @@ def get_new_records_count(engine, table_name, modifier_column, since_timestamp):
                 query = f"SELECT COUNT(*) FROM {table_name}"
             else:
                 # Get records newer than the timestamp
-                query = f"SELECT COUNT(*) FROM {table_name} WHERE {modifier_column} > %s"
+                query = f"SELECT COUNT(*) FROM {table_name} WHERE {modifier_column} > :since_timestamp"
             
             if since_timestamp is None:
                 result = connection.execute(sa.text(query))
             else:
-                result = connection.execute(sa.text(query), [since_timestamp])
+                # Use the correct SQLAlchemy 2.0+ parameter binding syntax
+                result = connection.execute(sa.text(query), {"since_timestamp": since_timestamp})
             
             count = result.scalar()
             return count or 0
         except Exception as e:
             log(f"❌ Error getting new records count for {table_name}: {e}")
+            log(f"🔍 Debug: Query: {query}")
+            log(f"🔍 Debug: Parameters: {since_timestamp}")
+            log(f"🔍 Debug: Error type: {type(e)}")
             return 0
     
     try:
@@ -470,16 +474,61 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         log(f"   Modifier column: {modifier_column}")
         log(f"   Initial value: {max_timestamp}")
         
-        # Create incremental configuration
-        incremental_config = dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
+        # Create incremental configuration with proper handling
+        if max_timestamp is not None:
+            # Ensure timestamp is in the correct format for DLT
+            if isinstance(max_timestamp, str):
+                try:
+                    # Parse string timestamp to datetime
+                    from datetime import datetime
+                    import pytz
+                    max_timestamp = datetime.fromisoformat(max_timestamp.replace('Z', '+00:00'))
+                except Exception as parse_error:
+                    log(f"⚠️ Warning: Could not parse timestamp {max_timestamp}: {parse_error}")
+                    max_timestamp = None
+            
+            if max_timestamp is not None:
+                # Create incremental configuration with valid timestamp
+                incremental_config = dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
+                log(f"🔧 Applied incremental sync with timestamp: {max_timestamp}")
+            else:
+                # Fallback to no incremental (will sync all data)
+                incremental_config = None
+                log(f"⚠️ Warning: Using fallback sync (no incremental) for {table_name}")
+        else:
+            # No timestamp available, sync all data
+            incremental_config = None
+            log(f"📝 No previous timestamp found - syncing all data for {table_name}")
         
         # Apply hints
-        table_source.apply_hints(
-            primary_key=formatted_primary_key,
-            incremental=incremental_config
-        )
+        if incremental_config is not None:
+            table_source.apply_hints(
+                primary_key=formatted_primary_key,
+                incremental=incremental_config
+            )
+            log(f"✅ Applied incremental hints with config: {incremental_config}")
+        else:
+            table_source.apply_hints(
+                primary_key=formatted_primary_key
+            )
+            log(f"✅ Applied primary key hints only (no incremental)")
         
         log(f"✅ Incremental hints applied successfully")
+        
+        # Debug: Verify hints were applied
+        try:
+            if hasattr(table_source, 'hints'):
+                log(f"🔍 Applied hints: {table_source.hints}")
+            # Check if the incremental configuration was applied correctly
+            if incremental_config is not None:
+                log(f"🔍 Incremental config type: {type(incremental_config)}")
+                log(f"🔍 Incremental config: {incremental_config}")
+                if hasattr(incremental_config, 'cursor_path'):
+                    log(f"🔍 Cursor path: {incremental_config.cursor_path}")
+                if hasattr(incremental_config, 'initial_value'):
+                    log(f"🔍 Initial value: {incremental_config.initial_value}")
+        except Exception as hint_error:
+            log(f"⚠️ Hint verification unavailable: {hint_error}")
         
         # Apply data sanitization transformer if enabled
         source = source | sanitize_table_data
@@ -489,16 +538,76 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         log(f"   Using write_disposition: merge (incremental sync)")
         log(f"   Will merge new/changed data with existing target table")
         
+        # Debug: Check what data DLT will process
+        try:
+            # Get a sample of the data that DLT will process
+            sample_data = list(source[table_name].read(limit=5))
+            log(f"🔍 DLT will process sample data: {len(sample_data)} records available")
+            if sample_data:
+                log(f"🔍 Sample record keys: {list(sample_data[0].keys()) if sample_data else 'None'}")
+                # Check if the modifier column exists in the sample data
+                if modifier_column in sample_data[0]:
+                    log(f"🔍 Modifier column '{modifier_column}' found in sample data")
+                    log(f"🔍 Sample modifier value: {sample_data[0][modifier_column]}")
+                else:
+                    log(f"⚠️ Warning: Modifier column '{modifier_column}' not found in sample data")
+        except Exception as debug_error:
+            log(f"⚠️ Debug info unavailable: {debug_error}")
+        
+        # Debug: Check pipeline state before run
+        try:
+            if hasattr(pipeline, 'state'):
+                log(f"🔍 Pipeline state before run: {pipeline.state}")
+            if hasattr(pipeline, 'defaults'):
+                log(f"🔍 Pipeline defaults: {pipeline.defaults}")
+            # Check if pipeline has any existing state that might prevent incremental sync
+            if hasattr(pipeline, 'pipeline_name'):
+                log(f"🔍 Pipeline name: {pipeline.pipeline_name}")
+            # Check destination configuration
+            if hasattr(pipeline, 'destination'):
+                log(f"🔍 Pipeline destination: {pipeline.destination}")
+                if hasattr(pipeline.destination, 'config'):
+                    log(f"🔍 Destination config: {pipeline.destination.config}")
+            # Check if pipeline has any existing state that might prevent incremental sync
+            if hasattr(pipeline, 'state') and pipeline.state:
+                log(f"🔍 Warning: Pipeline has existing state - this might prevent incremental sync")
+                log(f"🔍 Existing state keys: {list(pipeline.state.keys()) if isinstance(pipeline.state, dict) else 'Not a dict'}")
+            # Check pipeline configuration
+            if hasattr(pipeline, 'config'):
+                log(f"🔍 Pipeline config: {pipeline.config}")
+            # Check if pipeline has any existing state that might prevent incremental sync
+            if hasattr(pipeline, 'state') and pipeline.state:
+                log(f"🔍 Warning: Pipeline has existing state - this might prevent incremental sync")
+                log(f"🔍 Existing state keys: {list(pipeline.state.keys()) if isinstance(pipeline.state, dict) else 'Not a dict'}")
+        except Exception as state_error:
+            log(f"⚠️ Pipeline state info unavailable: {state_error}")
+        
         load_info = pipeline.run(source)
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
+            
+            # Debug: Check pipeline state and load details
+            try:
+                if hasattr(load_info, 'loads_ids'):
+                    log(f"🔍 Load IDs: {load_info.loads_ids}")
+                if hasattr(load_info, 'load_packages'):
+                    log(f"🔍 Load packages: {len(load_info.load_packages)}")
+                    for pkg in load_info.load_packages:
+                        if hasattr(pkg, 'jobs'):
+                            log(f"🔍 Jobs in package: {len(pkg.jobs)}")
+                            for job in pkg.jobs:
+                                if hasattr(job, 'status'):
+                                    log(f"🔍 Job status: {job.status}")
+            except Exception as debug_error:
+                log(f"⚠️ Debug info unavailable: {debug_error}")
             
             # Verify data was actually synced
             new_target_count = get_table_row_count(engine_target, table_name)
             rows_synced = new_target_count - target_count
             
             log(f"📊 Sync verification - Rows synced: {rows_synced}")
+            log(f"   Target before: {target_count}, Target after: {new_target_count}")
             
             if rows_synced > 0:
                 log(f"✅ Incremental sync successful: {rows_synced} rows synced")
