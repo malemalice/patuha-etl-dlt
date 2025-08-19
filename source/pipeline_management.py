@@ -488,9 +488,11 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                     max_timestamp = None
             
             if max_timestamp is not None:
-                # Create incremental configuration with valid timestamp
+                # CRITICAL FIX: Use the SOURCE timestamp as the starting point for incremental sync
+                # This ensures DLT processes records newer than what's in the target database
+                log(f"🔧 Creating incremental config with source timestamp: {max_timestamp}")
                 incremental_config = dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
-                log(f"🔧 Applied incremental sync with timestamp: {max_timestamp}")
+                log(f"🔧 Applied incremental sync with source timestamp: {max_timestamp}")
             else:
                 # Fallback to no incremental (will sync all data)
                 incremental_config = None
@@ -519,6 +521,17 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                         # Force reset to match database state
                         table_source._incremental.last_value = max_timestamp
                         log(f"🔧 Reset DLT incremental last_value to: {max_timestamp}")
+                        
+                    # CRITICAL: Force DLT to re-evaluate the incremental configuration
+                    if hasattr(table_source._incremental, 'initial_value'):
+                        table_source._incremental.initial_value = max_timestamp
+                        log(f"🔧 Reset DLT incremental initial_value to: {max_timestamp}")
+                        
+                    # Force DLT to clear any internal state
+                    if hasattr(table_source._incremental, '_state'):
+                        table_source._incremental._state = None
+                        log(f"🔧 Cleared DLT incremental internal state for {table_name}")
+                        
             except Exception as cache_clear_error:
                 log(f"⚠️ Could not clear DLT cached state: {cache_clear_error}")
         else:
@@ -541,6 +554,12 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                     log(f"🔍 Cursor path: {incremental_config.cursor_path}")
                 if hasattr(incremental_config, 'initial_value'):
                     log(f"🔍 Initial value: {incremental_config.initial_value}")
+                    
+                    # CRITICAL DEBUG: Show what DLT will actually process
+                    log(f"🔍 DLT will process records newer than: {incremental_config.initial_value}")
+                    if hasattr(incremental_config.initial_value, 'astimezone'):
+                        utc_value = incremental_config.initial_value.astimezone(pytz.UTC)
+                        log(f"🔍 DLT initial value (UTC): {utc_value}")
         except Exception as hint_error:
             log(f"⚠️ Hint verification unavailable: {hint_error}")
         
@@ -563,6 +582,28 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 if modifier_column in sample_data[0]:
                     log(f"🔍 Modifier column '{modifier_column}' found in sample data")
                     log(f"🔍 Sample modifier value: {sample_data[0][modifier_column]}")
+                    
+                    # CRITICAL DEBUG: Check if the sample data has timestamps newer than our incremental threshold
+                    if incremental_config and hasattr(incremental_config, 'initial_value'):
+                        threshold = incremental_config.initial_value
+                        newer_records = 0
+                        for record in sample_data:
+                            if modifier_column in record and record[modifier_column]:
+                                record_time = record[modifier_column]
+                                if hasattr(record_time, 'astimezone'):
+                                    record_utc = record_time.astimezone(pytz.UTC)
+                                else:
+                                    record_utc = record_time
+                                
+                                if hasattr(threshold, 'astimezone'):
+                                    threshold_utc = threshold.astimezone(pytz.UTC)
+                                else:
+                                    threshold_utc = threshold
+                                
+                                if record_utc > threshold_utc:
+                                    newer_records += 1
+                        
+                        log(f"🔍 Sample data analysis: {newer_records}/{len(sample_data)} records are newer than threshold {threshold}")
                 else:
                     log(f"⚠️ Warning: Modifier column '{modifier_column}' not found in sample data")
         except Exception as debug_error:
@@ -572,51 +613,63 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         # The issue is that DLT pipeline state has a newer timestamp than the actual target database
         # This causes DLT to think it has already processed newer data when it hasn't
         try:
-            if hasattr(pipeline, 'state') and pipeline.state and 'sources' in pipeline.state:
-                if 'sql_database' in pipeline.state['sources']:
-                    if 'resources' in pipeline.state['sources']['sql_database']:
-                        if table_name in pipeline.state['sources']['sql_database']['resources']:
-                            resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
-                            if 'incremental' in resource_state and modifier_column in resource_state['incremental']:
-                                pipeline_last_value = resource_state['incremental'][modifier_column].get('last_value')
-                                log(f"🔍 Pipeline state shows last_value: {pipeline_last_value}")
-                                log(f"🔍 Target database shows max timestamp: {max_timestamp}")
-                                
-                                # Check if pipeline state is ahead of database state
-                                if pipeline_last_value and max_timestamp:
-                                    # Convert both to UTC for comparison
-                                    from datetime import datetime
-                                    import pytz
-                                    
-                                    if hasattr(pipeline_last_value, 'astimezone'):
-                                        pipeline_utc = pipeline_last_value.astimezone(pytz.UTC)
-                                    else:
-                                        pipeline_utc = pipeline_last_value
-                                    
-                                    if hasattr(max_timestamp, 'astimezone'):
-                                        db_utc = max_timestamp.astimezone(pytz.UTC)
-                                    elif isinstance(max_timestamp, str):
-                                        db_utc = datetime.fromisoformat(max_timestamp.replace('Z', '+00:00'))
-                                    else:
-                                        db_utc = max_timestamp
-                                        # If it's a naive datetime, assume UTC
-                                        if hasattr(db_utc, 'tzinfo') and db_utc.tzinfo is None:
-                                            db_utc = pytz.UTC.localize(db_utc)
-                                    
-                                    if pipeline_utc > db_utc:
-                                        log(f"🚨 CRITICAL: Pipeline state is ahead of database!")
-                                        log(f"   Pipeline: {pipeline_utc} > Database: {db_utc}")
-                                        log(f"🔧 Resetting pipeline state to match database...")
+            log(f"🔍 Checking source database for newer records...")
+            
+            # Get the max timestamp from SOURCE database
+            source_max_timestamp = get_max_timestamp(engine_source, table_name, modifier_column)
+            log(f"🔍 Source database max timestamp: {source_max_timestamp}")
+            log(f"🔍 Target database max timestamp: {max_timestamp}")
+            
+            if source_max_timestamp and max_timestamp:
+                # Convert both to UTC for comparison
+                from datetime import datetime
+                import pytz
+                
+                if hasattr(source_max_timestamp, 'astimezone'):
+                    source_utc = source_max_timestamp.astimezone(pytz.UTC)
+                else:
+                    source_utc = source_max_timestamp
+                
+                if hasattr(max_timestamp, 'astimezone'):
+                    target_utc = max_timestamp.astimezone(pytz.UTC)
+                elif isinstance(max_timestamp, str):
+                    target_utc = datetime.fromisoformat(max_timestamp.replace('Z', '+00:00'))
+                else:
+                    target_utc = max_timestamp
+                    # If it's a naive datetime, assume UTC
+                    if hasattr(target_utc, 'tzinfo') and target_utc.tzinfo is None:
+                        target_utc = pytz.UTC.localize(target_utc)
+                
+                log(f"🔍 Source UTC: {source_utc}")
+                log(f"🔍 Target UTC: {target_utc}")
+                
+                if source_utc > target_utc:
+                    log(f"✅ Source has newer data: {source_utc} > {target_utc}")
+                    
+                    # CRITICAL FIX: Reset DLT pipeline state to use SOURCE timestamp as starting point
+                    # This ensures DLT processes the newer records from source
+                    if hasattr(pipeline, 'state') and pipeline.state and 'sources' in pipeline.state:
+                        if 'sql_database' in pipeline.state['sources']:
+                            if 'resources' in pipeline.state['sources']['sql_database']:
+                                if table_name in pipeline.state['sources']['sql_database']['resources']:
+                                    resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
+                                    if 'incremental' in resource_state and modifier_column in resource_state['incremental']:
+                                        log(f"🔧 Resetting pipeline state to use source timestamp: {source_max_timestamp}")
                                         
-                                        # Reset the pipeline state to match the database
-                                        resource_state['incremental'][modifier_column]['last_value'] = max_timestamp
-                                        resource_state['incremental'][modifier_column]['initial_value'] = max_timestamp
+                                        # Use the SOURCE timestamp as the starting point for incremental sync
+                                        resource_state['incremental'][modifier_column]['last_value'] = source_max_timestamp
+                                        resource_state['incremental'][modifier_column]['initial_value'] = source_max_timestamp
                                         
-                                        log(f"✅ Pipeline state reset to: {max_timestamp}")
-                                    else:
-                                        log(f"✅ Pipeline state is in sync with database")
-        except Exception as state_fix_error:
-            log(f"⚠️ Could not fix pipeline state: {state_fix_error}")
+                                        log(f"✅ Pipeline state reset to source timestamp: {source_max_timestamp}")
+                                        
+                                        # Also update the max_timestamp variable to use source timestamp
+                                        max_timestamp = source_max_timestamp
+                                        log(f"🔧 Updated max_timestamp to source value: {max_timestamp}")
+                else:
+                    log(f"⚠️ Source does not have newer data: {source_utc} <= {target_utc}")
+                    
+        except Exception as source_check_error:
+            log(f"⚠️ Could not check source database: {source_check_error}")
         
         # Debug: Check pipeline state before run
         try:
@@ -626,6 +679,20 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                         if table_name in pipeline.state['sources']['sql_database']['resources']:
                             resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
                             log(f"🔍 Final pipeline state for {table_name}: {resource_state}")
+                            
+                            # CRITICAL DEBUG: Verify the incremental configuration in pipeline state
+                            if 'incremental' in resource_state and modifier_column in resource_state['incremental']:
+                                inc_state = resource_state['incremental'][modifier_column]
+                                log(f"🔍 Pipeline incremental state:")
+                                log(f"   - initial_value: {inc_state.get('initial_value')}")
+                                log(f"   - last_value: {inc_state.get('last_value')}")
+                                log(f"   - unique_hashes: {inc_state.get('unique_hashes', [])}")
+                                
+                                # Verify that the state matches our expected configuration
+                                if inc_state.get('initial_value') == max_timestamp:
+                                    log(f"✅ Pipeline state correctly configured with source timestamp")
+                                else:
+                                    log(f"⚠️ Pipeline state mismatch - expected: {max_timestamp}, got: {inc_state.get('initial_value')}")
         except Exception as state_error:
             log(f"⚠️ Pipeline state info unavailable: {state_error}")
         
