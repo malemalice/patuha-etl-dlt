@@ -41,14 +41,15 @@ def get_max_timestamp(engine_target, table_name, column_name):
             log(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
             return None
     
-    return retry_on_lock_timeout(
-        execute_with_transaction_management,
-        "target",
-        f"get_max_timestamp for {table_name}.{column_name}",
-        engine_target,
-        f"get_max_timestamp for {table_name}.{column_name}",
-        _get_timestamp
-    )
+    try:
+        return execute_with_transaction_management(
+            engine_target,
+            f"get_max_timestamp for {table_name}.{column_name}",
+            _get_timestamp
+        )
+    except Exception as e:
+        log(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
+        return None
 
 def get_table_row_count(engine, table_name):
     """Get the total row count for a table."""
@@ -62,14 +63,15 @@ def get_table_row_count(engine, table_name):
             log(f"❌ Error getting row count for {table_name}: {e}")
             return 0
     
-    return retry_on_lock_timeout(
-        execute_with_transaction_management,
-        "target" if "target" in str(engine) else "source",
-        f"get_row_count for {table_name}",
-        engine,
-        f"get_row_count for {table_name}",
-        _get_count
-    )
+    try:
+        return execute_with_transaction_management(
+            engine,
+            f"get_row_count for {table_name}",
+            _get_count
+        )
+    except Exception as e:
+        log(f"❌ Error getting row count for {table_name}: {e}")
+        return 0
 
 def get_new_records_count(engine, table_name, modifier_column, since_timestamp):
     """Get the count of new records since a specific timestamp."""
@@ -93,14 +95,15 @@ def get_new_records_count(engine, table_name, modifier_column, since_timestamp):
             log(f"❌ Error getting new records count for {table_name}: {e}")
             return 0
     
-    return retry_on_lock_timeout(
-        execute_with_transaction_management,
-        "source",
-        f"get_new_records_count for {table_name}",
-        engine,
-        f"get_new_records_count for {table_name}",
-        _get_new_count
-    )
+    try:
+        return execute_with_transaction_management(
+            engine,
+            f"get_new_records_count for {table_name}",
+            _get_new_count
+        )
+    except Exception as e:
+        log(f"❌ Error getting new records count for {table_name}: {e}")
+        return 0
 
 def force_table_clear(engine_target, table_name):
     """Force clear a table completely to prevent DLT from generating complex DELETE statements.
@@ -139,14 +142,15 @@ def force_table_clear(engine_target, table_name):
                 log(f"❌ TRUNCATE failed for {table_name}: {truncate_error}")
                 return False
     
-    return retry_on_lock_timeout(
-        execute_with_transaction_management,
-        "target",
-        f"force_table_clear for {table_name}",
-        engine_target,
-        f"force_table_clear for {table_name}",
-        _clear_table
-    )
+    try:
+        return execute_with_transaction_management(
+            engine_target,
+            f"force_table_clear for {table_name}",
+            _clear_table
+        )
+    except Exception as e:
+        log(f"❌ Error in force_table_clear for {table_name}: {e}")
+        return False
 
 def safe_table_cleanup(engine_target, table_name, write_disposition="replace"):
     """Safely clean up table data based on write disposition with lock timeout handling.
