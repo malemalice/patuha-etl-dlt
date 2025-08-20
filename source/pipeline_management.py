@@ -438,10 +438,18 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         # Get the latest timestamp from target
         max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
         
-        # Log the incremental sync details
-        log(f"📅 Incremental sync for {table_name}:")
-        log(f"   Modifier column: {modifier_column}")
-        log(f"   Latest timestamp in target: {max_timestamp}")
+        # CRITICAL FIX: Apply same timezone handling as old_db_pipeline.py (line 665-666)
+        # This ensures consistent timezone handling to fix the incremental sync issue
+        if max_timestamp is not None:
+            try:
+                from dlt.common import pendulum
+                max_timestamp = pendulum.instance(max_timestamp).in_tz("Asia/Bangkok")
+                log(f"🔧 Applied timezone conversion (Asia/Bangkok): {max_timestamp}")
+            except Exception as tz_error:
+                log(f"⚠️ Warning: Could not apply timezone conversion: {tz_error}")
+                # Keep the original timestamp if conversion fails
+        
+        log(f"📅 Incremental sync - Target timestamp: {max_timestamp}")
         
         # Get source table row count for comparison
         source_count = get_table_row_count(engine_source, table_name)
@@ -578,159 +586,135 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         except Exception as hint_error:
             log(f"⚠️ Hint verification unavailable: {hint_error}")
         
-        # Apply data sanitization transformer if enabled
-        source = source | sanitize_table_data
+        # CRITICAL FIX: Create completely fresh pipeline like old_db_pipeline.py
+        # The issue is that DLT's pipeline state is corrupted - we need a fresh pipeline
+        log(f"🔧 Creating fresh pipeline and source (like old working code)...")
+        try:
+            # Create a fresh pipeline with a unique name to avoid state conflicts
+            import time
+            fresh_pipeline_name = f"mysql_sync_fresh_{table_name}_{int(time.time())}"
+            
+            # CRITICAL FIX: Use connection string directly to avoid _conn_lock error
+            target_url = f"mysql+pymysql://{config.TARGET_DB_USER}:{config.TARGET_DB_PASS}@{config.TARGET_DB_HOST}:{config.TARGET_DB_PORT}/{config.TARGET_DB_NAME}"
+            
+            fresh_pipeline = dlt.pipeline(
+                pipeline_name=fresh_pipeline_name,
+                destination=dlt.destinations.sqlalchemy(target_url),
+                dataset_name=config.TARGET_DB_NAME
+            )
+            log(f"✅ Created fresh pipeline: {fresh_pipeline_name}")
+            
+            # Create fresh source like old_db_pipeline.py line 659
+            fresh_source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
+            
+            # Apply incremental hints exactly like old_db_pipeline.py lines 667-671
+            log(f"🔧 Setting incremental for table {table_name} on column {modifier_column}")
+            log(f"🔧 Setting incremental for table {table_name} with initial value {max_timestamp}")
+            
+            getattr(fresh_source, table_name).apply_hints(
+                primary_key=formatted_primary_key,
+                incremental=dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
+            )
+            
+            # CRITICAL FIX: Don't apply sanitization transformer to fresh pipeline
+            # The transformer creates a separate table that confuses DLT's merge logic
+            
+            # Use the fresh pipeline and source
+            pipeline = fresh_pipeline
+            source = fresh_source
+            log(f"✅ Fresh pipeline and source created successfully")
+            
+        except Exception as fresh_error:
+            log(f"⚠️ Failed to create fresh pipeline: {fresh_error}")
+            # Fallback to original approach
+            source = source | sanitize_table_data
         
         # Run the pipeline with proper configuration for DLT 1.15.0
         log(f"🔄 Running DLT pipeline for {table_name}...")
         log(f"   Using write_disposition: merge (incremental sync)")
         log(f"   Will merge new/changed data with existing target table")
         
-        # Debug: Check what data DLT will process
+        # Verify new records count
         try:
-            # Get a sample of the data that DLT will process
-            sample_data = list(source[table_name].read(limit=5))
-            log(f"🔍 DLT will process sample data: {len(sample_data)} records available")
-            if sample_data:
-                log(f"🔍 Sample record keys: {list(sample_data[0].keys()) if sample_data else 'None'}")
-                # Check if the modifier column exists in the sample data
-                if modifier_column in sample_data[0]:
-                    log(f"🔍 Modifier column '{modifier_column}' found in sample data")
-                    log(f"🔍 Sample modifier value: {sample_data[0][modifier_column]}")
-                    
-                    # CRITICAL DEBUG: Check if the sample data has timestamps newer than our incremental threshold
-                    if incremental_config and hasattr(incremental_config, 'initial_value'):
-                        threshold = incremental_config.initial_value
-                        newer_records = 0
-                        for record in sample_data:
-                            if modifier_column in record and record[modifier_column]:
-                                record_time = record[modifier_column]
-                                if hasattr(record_time, 'astimezone'):
-                                    record_utc = record_time.astimezone(pytz.UTC)
-                                else:
-                                    record_utc = record_time
-                                
-                                if hasattr(threshold, 'astimezone'):
-                                    threshold_utc = threshold.astimezone(pytz.UTC)
-                                else:
-                                    threshold_utc = threshold
-                                
-                                if record_utc > threshold_utc:
-                                    newer_records += 1
-                        
-                        log(f"🔍 Sample data analysis: {newer_records}/{len(sample_data)} records are newer than threshold {threshold}")
-                        
-                        # CRITICAL: If no newer records in sample, this might indicate the incremental config is wrong
-                        if newer_records == 0:
-                            log(f"⚠️ WARNING: No newer records found in sample data!")
-                            log(f"   This suggests the incremental configuration might be incorrect")
-                            log(f"   Threshold: {threshold}")
-                            log(f"   Sample timestamps: {[record.get(modifier_column) for record in sample_data if modifier_column in record]}")
-                else:
-                    log(f"⚠️ Warning: Modifier column '{modifier_column}' not found in sample data")
-        except Exception as debug_error:
-            log(f"⚠️ Debug info unavailable: {debug_error}")
+            new_records_count = get_new_records_count(engine_source, table_name, modifier_column, max_timestamp)
+            log(f"🔍 Source has {new_records_count} new records since {max_timestamp}")
+        except Exception as count_error:
+            log(f"⚠️ Could not verify new records count: {count_error}")
+            new_records_count = 0
         
-        # CRITICAL FIX: Reset DLT pipeline state to fix incremental sync mismatch
-        # The issue is that DLT pipeline state has a newer timestamp than the actual target database
-        # This causes DLT to think it has already processed newer data when it hasn't
+        # Run pipeline like old_db_pipeline.py
+        log(f"🔧 Running DLT pipeline...")
+        
         try:
-            log(f"🔍 Checking source database for newer records...")
+            # Run pipeline exactly like old_db_pipeline.py line 678
+            load_info = pipeline.run(source, write_disposition="merge")
+            log(f"✅ Pipeline run completed")
+        except Exception as pipeline_error:
+            log(f"❌ Pipeline run failed: {pipeline_error}")
             
-            # Get the max timestamp from SOURCE database
-            source_max_timestamp = get_max_timestamp(engine_source, table_name, modifier_column)
-            log(f"🔍 Source database max timestamp: {source_max_timestamp}")
-            log(f"🔍 Target database max timestamp: {max_timestamp}")
-            
-            if source_max_timestamp and max_timestamp:
-                # Convert both to UTC for comparison
-                from datetime import datetime
-                import pytz
+            # CRITICAL FIX: If pipeline fails, try without incremental configuration
+            log(f"🔧 Attempting fallback: running pipeline without incremental configuration...")
+            try:
+                # Remove incremental configuration
+                if hasattr(table_source, '_incremental'):
+                    table_source._incremental = None
+                    log(f"🔧 Removed incremental configuration for fallback")
                 
-                if hasattr(source_max_timestamp, 'astimezone'):
-                    source_utc = source_max_timestamp.astimezone(pytz.UTC)
-                else:
-                    source_utc = source_max_timestamp
+                # Re-apply hints without incremental
+                table_source.apply_hints(primary_key=formatted_primary_key)
+                log(f"🔧 Applied hints without incremental for fallback")
                 
-                if hasattr(max_timestamp, 'astimezone'):
-                    target_utc = max_timestamp.astimezone(pytz.UTC)
-                elif isinstance(max_timestamp, str):
-                    target_utc = datetime.fromisoformat(max_timestamp.replace('Z', '+00:00'))
-                else:
-                    target_utc = max_timestamp
-                    # If it's a naive datetime, assume UTC
-                    if hasattr(target_utc, 'tzinfo') and target_utc.tzinfo is None:
-                        target_utc = pytz.UTC.localize(target_utc)
+                # Try pipeline run again
+                load_info = pipeline.run(source)
+                log(f"✅ Fallback pipeline run successful")
                 
-                log(f"🔍 Source UTC: {source_utc}")
-                log(f"🔍 Target UTC: {target_utc}")
-                
-                if source_utc > target_utc:
-                    log(f"✅ Source has newer data: {source_utc} > {target_utc}")
-                    
-                    # CRITICAL FIX: Reset DLT pipeline state to use TARGET timestamp as starting point
-                    # This ensures DLT processes records newer than what's in the target database
-                    if hasattr(pipeline, 'state') and pipeline.state and 'sources' in pipeline.state:
-                        if 'sql_database' in pipeline.state['sources']:
-                            if 'resources' in pipeline.state['sql_database']:
-                                if table_name in pipeline.state['sources']['sql_database']['resources']:
-                                    resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
-                                    if 'incremental' in resource_state and modifier_column in resource_state['incremental']:
-                                        log(f"🔧 Resetting pipeline state to use target timestamp: {max_timestamp}")
-                                        
-                                        # CRITICAL FIX: Reset BOTH initial_value and last_value to target database timestamp
-                                        # This ensures DLT processes records newer than what's in the target database
-                                        target_timestamp = max_timestamp  # Keep the original target timestamp
-                                        resource_state['incremental'][modifier_column]['last_value'] = target_timestamp
-                                        resource_state['incremental'][modifier_column]['initial_value'] = target_timestamp
-                                        
-                                        log(f"✅ Pipeline state reset to target timestamp: {target_timestamp}")
-                                        log(f"🔧 This will sync records newer than: {target_timestamp}")
-                                        
-                                        # Keep max_timestamp as the target timestamp (don't change it)
-                                        log(f"🔧 Using target timestamp for incremental sync: {max_timestamp}")
-                else:
-                    log(f"⚠️ Source does not have newer data: {source_utc} <= {target_utc}")
-                    
-        except Exception as source_check_error:
-            log(f"⚠️ Could not check source database: {source_check_error}")
-        
-        # Debug: Check pipeline state before run
-        try:
-            if hasattr(pipeline, 'state') and pipeline.state and 'sources' in pipeline.state:
-                if 'sql_database' in pipeline.state['sources']:
-                    if 'resources' in pipeline.state['sources']['sql_database']:
-                        if table_name in pipeline.state['sources']['sql_database']['resources']:
-                            resource_state = pipeline.state['sources']['sql_database']['resources'][table_name]
-                            log(f"🔍 Final pipeline state for {table_name}: {resource_state}")
-                            
-                            # CRITICAL DEBUG: Verify the incremental configuration in pipeline state
-                            if 'incremental' in resource_state and modifier_column in resource_state['incremental']:
-                                inc_state = resource_state['incremental'][modifier_column]
-                                log(f"🔍 Pipeline incremental state:")
-                                log(f"   - initial_value: {inc_state.get('initial_value')}")
-                                log(f"   - last_value: {inc_state.get('last_value')}")
-                                log(f"   - unique_hashes: {inc_state.get('unique_hashes', [])}")
-                                
-                                # Verify that the state matches our expected configuration
-                                if inc_state.get('initial_value') == max_timestamp:
-                                    log(f"✅ Pipeline state correctly configured with source timestamp")
-                                else:
-                                    log(f"⚠️ Pipeline state mismatch - expected: {max_timestamp}, got: {inc_state.get('initial_value')}")
-        except Exception as state_error:
-            log(f"⚠️ Pipeline state info unavailable: {state_error}")
-        
-        load_info = pipeline.run(source)
+            except Exception as fallback_error:
+                log(f"❌ Fallback pipeline run also failed: {fallback_error}")
+                load_info = None
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
             
-            # Debug: Check pipeline state and load details
+            # CRITICAL: Validate that DLT actually created load packages
             try:
                 if hasattr(load_info, 'loads_ids'):
                     log(f"🔍 Load IDs: {load_info.loads_ids}")
                 if hasattr(load_info, 'load_packages'):
                     log(f"🔍 Load packages: {len(load_info.load_packages)}")
+                    
+                    # CRITICAL CHECK: If no load packages, this indicates DLT didn't process any data
+                    if len(load_info.load_packages) == 0:
+                        log(f"🚨 CRITICAL: DLT created 0 load packages!")
+                        log(f"   This means DLT thinks there's no new data to process")
+                        log(f"   But we know there are {new_records_count} new records in source")
+                        
+                        # CRITICAL FIX: Force DLT to process data by removing incremental configuration
+                        log(f"🔧 Forcing DLT to process data by removing incremental configuration...")
+                        try:
+                            # Create a new source without incremental configuration
+                            fallback_source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
+                            fallback_table = getattr(fallback_source, table_name)
+                            fallback_table.apply_hints(primary_key=formatted_primary_key)
+                            
+                            # Apply sanitization
+                            fallback_source = fallback_source | sanitize_table_data
+                            
+                            log(f"🔧 Running fallback pipeline without incremental configuration...")
+                            fallback_load_info = pipeline.run(fallback_source)
+                            
+                            if fallback_load_info and hasattr(fallback_load_info, 'load_packages'):
+                                log(f"✅ Fallback pipeline created {len(fallback_load_info.load_packages)} load packages")
+                                # Use the fallback result
+                                load_info = fallback_load_info
+                            else:
+                                log(f"❌ Fallback pipeline also failed to create load packages")
+                                
+                        except Exception as fallback_force_error:
+                            log(f"❌ Fallback force processing failed: {fallback_force_error}")
+                    else:
+                        log(f"✅ DLT created {len(load_info.load_packages)} load packages")
+                    
+                    # Show package details
                     for pkg in load_info.load_packages:
                         if hasattr(pkg, 'jobs'):
                             log(f"🔍 Jobs in package: {len(pkg.jobs)}")
@@ -793,14 +777,54 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         
         log(f"📊 Row counts before sync - Source: {source_count}, Target: {target_count_before}")
         
+        # CRITICAL FIX: Full refresh tables MUST use "replace" disposition
+        # The issue is that full refresh tables are being processed with "merge" which prevents data sync
+        if write_disposition != "replace":
+            log(f"🚨 CRITICAL: Full refresh table {table_name} was given wrong write_disposition: {write_disposition}")
+            log(f"🔧 Forcing write_disposition to 'replace' for full refresh table")
+            write_disposition = "replace"
+        
         # Clean up target table if using replace mode
         if write_disposition == "replace":
             log(f"🧹 Cleaning up target table {table_name} for full refresh...")
-            safe_table_cleanup(engine_target, table_name, write_disposition)
             
-            # Verify cleanup
-            target_count_after_cleanup = get_table_row_count(engine_target, table_name)
-            log(f"📊 Target table after cleanup: {target_count_after_cleanup} rows")
+            # CRITICAL: Force aggressive cleanup for full refresh tables
+            # This ensures the target table is completely empty before loading new data
+            try:
+                with engine_target.connect() as connection:
+                    # First try TRUNCATE (fastest)
+                    try:
+                        log(f"🧹 Attempting TRUNCATE for {table_name}")
+                        connection.execute(sa.text(f"TRUNCATE TABLE {table_name}"))
+                        connection.commit()
+                        log(f"✅ TRUNCATE successful for {table_name}")
+                    except Exception as truncate_error:
+                        log(f"⚠️ TRUNCATE failed for {table_name}: {truncate_error}")
+                        # Fallback to DELETE
+                        try:
+                            log(f"🧹 Attempting DELETE for {table_name}")
+                            connection.execute(sa.text(f"DELETE FROM {table_name}"))
+                            connection.commit()
+                            log(f"✅ DELETE successful for {table_name}")
+                        except Exception as delete_error:
+                            log(f"❌ DELETE also failed for {table_name}: {delete_error}")
+                            # Last resort: use safe_table_cleanup
+                            log(f"🔄 Using safe_table_cleanup as last resort")
+                            safe_table_cleanup(engine_target, table_name, write_disposition)
+                
+                # Verify cleanup
+                target_count_after_cleanup = get_table_row_count(engine_target, table_name)
+                log(f"📊 Target table after cleanup: {target_count_after_cleanup} rows")
+                
+                if target_count_after_cleanup > 0:
+                    log(f"⚠️ Warning: Target table still has {target_count_after_cleanup} rows after cleanup")
+                    log(f"   This might prevent proper full refresh sync")
+                else:
+                    log(f"✅ Target table successfully cleared for full refresh")
+                    
+            except Exception as cleanup_error:
+                log(f"❌ Critical cleanup error for {table_name}: {cleanup_error}")
+                log(f"   Full refresh may fail due to unclean target table")
         
         # Create SQL database source
         source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
@@ -817,6 +841,15 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         table_source = getattr(source, table_name)
         table_source.apply_hints(primary_key=formatted_primary_key)
         
+        # CRITICAL: For full refresh tables, ensure we don't apply incremental hints
+        # This prevents DLT from thinking it's doing incremental sync
+        if write_disposition == "replace":
+            log(f"🔧 Full refresh mode: No incremental hints applied")
+            # Ensure the table source doesn't have any incremental configuration
+            if hasattr(table_source, '_incremental'):
+                table_source._incremental = None
+                log(f"🔧 Cleared any existing incremental configuration for full refresh")
+        
         # Apply data sanitization transformer if enabled
         source = source | sanitize_table_data
         
@@ -832,7 +865,20 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         else:
             log(f"   Append mode: Will add data to existing target table")
         
-        load_info = pipeline.run(source, write_disposition=write_disposition)
+        # CRITICAL: Ensure we pass the correct write_disposition to pipeline.run()
+        # This is essential for full refresh tables to work correctly
+        log(f"🔧 Executing pipeline.run() with write_disposition: {write_disposition}")
+        
+        if write_disposition == "replace":
+            log(f"   Full refresh mode: Will replace all data in target table")
+            # Force the write_disposition to be respected
+            load_info = pipeline.run(source, write_disposition="replace")
+        elif write_disposition == "merge":
+            log(f"   Merge mode: Will merge data with existing target table")
+            load_info = pipeline.run(source, write_disposition="merge")
+        else:
+            log(f"   Append mode: Will add data to existing target table")
+            load_info = pipeline.run(source, write_disposition=write_disposition)
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
@@ -874,7 +920,7 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         # Use sqlalchemy destination for MySQL compatibility
         # Configure staging and load behavior using available DLT 1.15.0 options
         pipeline_kwargs = {
-            "pipeline_name": pipeline_name,
+            "pipeline_name": pipeline_name+"v1",
             "destination": dlt.destinations.sqlalchemy(config.DB_TARGET_URL),
             "dataset_name": "sync_data"
         }
@@ -1152,14 +1198,15 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
                 # Get the latest timestamp from target for incremental sync
                 max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
                 
-                # Convert max_timestamp to timezone-aware datetime if needed
-                from datetime import datetime
-                import pytz
-                
-                if max_timestamp is not None and isinstance(max_timestamp, datetime):
-                    if max_timestamp.tzinfo is None:
-                        # Add UTC timezone to naive datetime to prevent DLT warnings
-                        max_timestamp = pytz.UTC.localize(max_timestamp)
+                # CRITICAL FIX: Apply same timezone handling as old_db_pipeline.py
+                if max_timestamp is not None:
+                    try:
+                        from dlt.common import pendulum
+                        max_timestamp = pendulum.instance(max_timestamp).in_tz("Asia/Bangkok")
+                        log(f"🔧 Applied timezone conversion (Asia/Bangkok): {max_timestamp}")
+                    except Exception as tz_error:
+                        log(f"⚠️ Warning: Could not apply timezone conversion: {tz_error}")
+                        # Fallback: keep original timestamp
                 
                 # Create source with connection recovery
                 try:
@@ -1397,9 +1444,35 @@ def load_select_tables_from_database():
             else:
                 # Use direct db-to-db batch processing
                 log("⚡ Using direct db-to-db mode via DLT")
-                successful, failed = process_tables_batch(pipeline, engine_source, engine_target, batch_dict)
-                total_successful += successful
-                total_failed += failed
+                
+                # CRITICAL FIX: Separate incremental and full refresh tables
+                # This ensures they use the correct write_disposition
+                incremental_tables = {}
+                full_refresh_tables = {}
+                
+                for table_name, table_config in batch_dict.items():
+                    if "modifier" in table_config:
+                        # Incremental tables use "merge" disposition
+                        incremental_tables[table_name] = table_config
+                    else:
+                        # Full refresh tables use "replace" disposition
+                        full_refresh_tables[table_name] = table_config
+                
+                log(f"📊 Batch breakdown: {len(incremental_tables)} incremental, {len(full_refresh_tables)} full refresh")
+                
+                # Process incremental tables with "merge" disposition
+                if incremental_tables:
+                    log(f"🔄 Processing {len(incremental_tables)} incremental tables with merge disposition")
+                    successful, failed = process_tables_batch(pipeline, engine_source, engine_target, incremental_tables, "merge")
+                    total_successful += successful
+                    total_failed += failed
+                
+                # Process full refresh tables with "replace" disposition
+                if full_refresh_tables:
+                    log(f"🔄 Processing {len(full_refresh_tables)} full refresh tables with replace disposition")
+                    successful, failed = process_tables_batch(pipeline, engine_source, engine_target, full_refresh_tables, "replace")
+                    total_successful += successful
+                    total_failed += failed
             
             # Add delay between batches
             if i + config.BATCH_SIZE < len(table_items) and config.BATCH_DELAY > 0:
