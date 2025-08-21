@@ -24,16 +24,17 @@ from schema_management import sync_table_schema
 if config.TRUNCATE_STAGING_DATASET:
     # DEEP THINKING: Use ONLY DLT's supported environment variables
     # These are the actual environment variables that DLT 1.15.0 recognizes
-    os.environ["DLT_LOAD__TRUNCATE_STAGING_DATASET"] = "true"  # ✅ SUPPORTED: Clear staging after each load
-    os.environ["DLT_LOAD__STAGING_DATASET_CLEANUP"] = "true"   # ✅ SUPPORTED: Enable staging cleanup
-    os.environ["DLT_LOAD__WORKERS"] = "1"  # ✅ SUPPORTED: Single worker
-    os.environ["DLT_EXTRACT__WORKERS"] = "1"  # ✅ SUPPORTED: Single worker
+    os.environ["DLT_LOAD_TRUNCATE_STAGING_DATASET"] = "true"  # ✅ SUPPORTED: Clear staging after each load
+    os.environ["DLT_LOAD_STAGING_DATASET_CLEANUP"] = "true"   # ✅ SUPPORTED: Enable staging cleanup
+    os.environ["DLT_LOAD_WORKERS"] = "1"  # ✅ SUPPORTED: Single worker
+    os.environ["DLT_EXTRACT_WORKERS"] = "1"  # ✅ SUPPORTED: Single worker
     log("🔧 DEEP THINKING: DLT staging optimization enabled using SUPPORTED parameters")
     log("   Using ONLY DLT 1.15.0 recognized environment variables")
     log("   Staging tables will be automatically cleaned up after each load")
 from data_processing import validate_table_data, sanitize_table_data, debug_problematic_rows
 from error_handling import retry_on_connection_error, retry_on_lock_timeout
 from monitoring import log_performance_metrics
+from index_management import optimize_table_for_dlt, cleanup_table_indexes, wait_and_optimize_staging_table
 
 def get_max_timestamp(engine_target, table_name, column_name):
     """Get the maximum timestamp value from the target table with lock timeout handling."""
@@ -316,6 +317,22 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 failed_tables.append(table_name)
                 continue
             
+            # CRITICAL: Optimize indexes for DLT operations BEFORE running pipeline
+            if config.ENABLE_INDEX_OPTIMIZATION:
+                try:
+                    log(f"🔧 Optimizing indexes for DLT operations on {table_name}...")
+                    index_optimization_success = optimize_table_for_dlt(table_name, table_config, engine_source, engine_target)
+                    if index_optimization_success:
+                        log(f"✅ Index optimization completed for {table_name}")
+                    else:
+                        log(f"⚠️ Index optimization had issues for {table_name}, but continuing...")
+                except Exception as index_error:
+                    log(f"⚠️ Index optimization failed for {table_name}: {index_error}")
+                    log(f"   Continuing without index optimization...")
+                    # Don't fail the table processing due to index issues
+            else:
+                log(f"ℹ️ Index optimization disabled for {table_name} (ENABLE_INDEX_OPTIMIZATION=false)")
+            
             # CRITICAL: Handle different sync strategies with strict method separation
             if "modifier" in table_config and write_disposition == "merge":
                 # Incremental sync - ONLY for tables with modifier column and merge disposition
@@ -339,6 +356,21 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             
             if success:
                 successful_tables.append(table_name)
+                
+                # CRITICAL: Clean up temporary indexes after successful DLT operation
+                if config.CLEANUP_TEMPORARY_INDEXES and config.ENABLE_INDEX_OPTIMIZATION:
+                    try:
+                        log(f"🧹 Cleaning up temporary indexes for {table_name}...")
+                        cleanup_success = cleanup_table_indexes(table_name, engine_target)
+                        if cleanup_success:
+                            log(f"✅ Index cleanup completed for {table_name}")
+                        else:
+                            log(f"⚠️ Index cleanup had issues for {table_name}")
+                    except Exception as cleanup_error:
+                        log(f"⚠️ Index cleanup failed for {table_name}: {cleanup_error}")
+                        # Don't fail the table processing due to cleanup issues
+                else:
+                    log(f"ℹ️ Index cleanup disabled for {table_name}")
                 
                 # Get actual record count for this table
                 try:
@@ -661,7 +693,7 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
             log(f"🔧 Setting incremental for table {table_name} with initial value {max_timestamp}")
             
             getattr(fresh_source, table_name).apply_hints(
-            primary_key=formatted_primary_key,
+                primary_key=formatted_primary_key,
                 incremental=dlt.sources.incremental(modifier_column, initial_value=max_timestamp)
             )
             
@@ -676,7 +708,7 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         except Exception as fresh_error:
             log(f"⚠️ Failed to create fresh pipeline: {fresh_error}")
             # Fallback to original approach
-        source = source | sanitize_table_data
+            source = source | sanitize_table_data
         
         # Run the pipeline with proper configuration for DLT 1.15.0
         log(f"🔄 Running DLT pipeline for {table_name}...")
@@ -694,6 +726,46 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         # Run pipeline like old_db_pipeline.py
         log(f"🔧 Running DLT pipeline...")
         
+        # CRITICAL DISCOVERY: DLT SQLAlchemy destination DOES use staging tables for merge operations!
+        # We need to optimize BOTH the target table AND the staging tables that DLT creates
+        
+        if config.ENABLE_INDEX_OPTIMIZATION:
+            try:
+                log(f"🚨 CORRECTED: DLT IS using staging tables - optimizing BOTH target and staging tables")
+                log(f"🔧 Creating optimized indexes on target table {table_name} for DLT operations")
+                
+                # Optimize the target table directly for DLT's operations
+                from index_management import optimize_table_for_dlt
+                optimization_success = optimize_table_for_dlt(table_name, table_config, engine_source, engine_target)
+                
+                if optimization_success:
+                    log(f"✅ Target table optimization completed for {table_name}")
+                else:
+                    log(f"⚠️ Target table optimization had issues for {table_name}")
+                
+                # CRITICAL: Start staging table optimization in parallel thread
+                # This will wait for DLT to create staging tables and immediately optimize them
+                import threading
+                staging_optimization_thread = None
+                try:
+                    log(f"🚀 Starting staging table optimization thread for {table_name}...")
+                    from index_management import wait_and_optimize_staging_table
+                    staging_optimization_thread = threading.Thread(
+                        target=wait_and_optimize_staging_table,
+                        args=(table_name, table_config, engine_source, engine_target, config.INDEX_OPTIMIZATION_TIMEOUT),
+                        daemon=True
+                    )
+                    staging_optimization_thread.start()
+                    log(f"✅ Staging table optimization thread started for {table_name}")
+                    log(f"   This will create indexes on staging tables as soon as DLT creates them")
+                except Exception as thread_error:
+                    log(f"⚠️ Could not start staging optimization thread: {thread_error}")
+                    
+            except Exception as optimization_error:
+                log(f"⚠️ Could not optimize target table: {optimization_error}")
+        else:
+            log(f"ℹ️ Table optimization disabled for {table_name}")
+        
         try:
             # CRITICAL FIX: Use DLT's built-in staging management
             # DLT 1.15.0 automatically handles staging cleanup when properly configured
@@ -705,6 +777,23 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
             # Run pipeline with DLT staging optimization (fast DELETE operations)
             load_info = pipeline.run(source, write_disposition="merge")
             log(f"✅ Pipeline run completed")
+            
+            # CRITICAL: Force staging cleanup after pipeline run
+            if config.TRUNCATE_STAGING_DATASET:
+                try:
+                    log("🧹 CRITICAL: Forcing staging cleanup after pipeline run...")
+                    # Force DLT to clean up staging tables immediately
+                    if hasattr(pipeline, 'destination') and hasattr(pipeline.destination, 'truncate_staging_dataset'):
+                        pipeline.destination.truncate_staging_dataset = True
+                        log("✅ Staging cleanup forced on destination")
+                    
+                    # Also force pipeline-level staging cleanup
+                    dlt.config["load.truncate_staging_dataset"] = True
+                    dlt.config["load.staging_dataset_cleanup"] = True
+                    log("✅ Staging cleanup forced on pipeline")
+                    
+                except Exception as cleanup_error:
+                    log(f"⚠️ Could not force staging cleanup: {cleanup_error}")
         except Exception as pipeline_error:
             log(f"❌ Incremental pipeline run failed: {pipeline_error}")
             
@@ -920,6 +1009,45 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         # This is essential for full refresh tables to work correctly
         log(f"🔧 Executing pipeline.run() with write_disposition: {write_disposition}")
         
+        # CRITICAL: For full refresh, optimize target table AND staging tables
+        # DLT replace operations also use staging tables for data loading
+        
+        if config.ENABLE_INDEX_OPTIMIZATION:
+            try:
+                log(f"🔧 Optimizing target table {table_name} for DLT replace operations")
+                
+                # Optimize the target table for DLT operations
+                from index_management import optimize_table_for_dlt
+                optimization_success = optimize_table_for_dlt(table_name, table_config, engine_source, engine_target)
+                
+                if optimization_success:
+                    log(f"✅ Target table optimization completed for {table_name}")
+                else:
+                    log(f"⚠️ Target table optimization had issues for {table_name}")
+                
+                # CRITICAL: Start staging table optimization in parallel thread for full refresh
+                # This will wait for DLT to create staging tables and immediately optimize them
+                import threading
+                staging_optimization_thread = None
+                try:
+                    log(f"🚀 Starting staging table optimization thread for {table_name} (full refresh)...")
+                    from index_management import wait_and_optimize_staging_table
+                    staging_optimization_thread = threading.Thread(
+                        target=wait_and_optimize_staging_table,
+                        args=(table_name, table_config, engine_source, engine_target, config.INDEX_OPTIMIZATION_TIMEOUT),
+                        daemon=True
+                    )
+                    staging_optimization_thread.start()
+                    log(f"✅ Staging table optimization thread started for {table_name}")
+                    log(f"   This will create indexes on staging tables as soon as DLT creates them")
+                except Exception as thread_error:
+                    log(f"⚠️ Could not start staging optimization thread: {thread_error}")
+                    
+            except Exception as optimization_error:
+                log(f"⚠️ Could not optimize target table: {optimization_error}")
+        else:
+            log(f"ℹ️ Table optimization disabled for {table_name}")
+        
         # CRITICAL FIX: DLT staging OPTIMIZATION is enabled for direct database operations
         if config.TRUNCATE_STAGING_DATASET:
             log(f"🗑️ DLT staging OPTIMIZATION enabled - fast operations with automatic cleanup")
@@ -930,12 +1058,44 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
             log(f"   Full refresh mode: Will replace all data in target table")
             # Force the write_disposition to be respected
             load_info = pipeline.run(source, write_disposition="replace")
+            
+            # CRITICAL: Force staging cleanup after full refresh
+            if config.TRUNCATE_STAGING_DATASET:
+                try:
+                    log("🧹 CRITICAL: Forcing staging cleanup after full refresh...")
+                    dlt.config["load.truncate_staging_dataset"] = True
+                    dlt.config["load.staging_dataset_cleanup"] = True
+                    log("✅ Staging cleanup forced after full refresh")
+                except Exception as cleanup_error:
+                    log(f"⚠️ Could not force staging cleanup: {cleanup_error}")
+                    
         elif write_disposition == "merge":
             log(f"   Merge mode: Will merge data with existing target table")
             load_info = pipeline.run(source, write_disposition="merge")
+            
+            # CRITICAL: Force staging cleanup after merge
+            if config.TRUNCATE_STAGING_DATASET:
+                try:
+                    log("🧹 CRITICAL: Forcing staging cleanup after merge...")
+                    dlt.config["load.truncate_staging_dataset"] = True
+                    dlt.config["load.staging_dataset_cleanup"] = True
+                    log("✅ Staging cleanup forced after merge")
+                except Exception as cleanup_error:
+                    log(f"⚠️ Could not force staging cleanup: {cleanup_error}")
+                    
         else:
             log(f"   Append mode: Will add data to existing target table")
             load_info = pipeline.run(source, write_disposition=write_disposition)
+            
+            # CRITICAL: Force staging cleanup after append
+            if config.TRUNCATE_STAGING_DATASET:
+                try:
+                    log("🧹 CRITICAL: Forcing staging cleanup after append...")
+                    dlt.config["load.truncate_staging_dataset"] = True
+                    dlt.config["load.staging_dataset_cleanup"] = True
+                    log("✅ Staging cleanup forced after append")
+                except Exception as cleanup_error:
+                    log(f"⚠️ Could not force staging cleanup: {cleanup_error}")
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
@@ -988,57 +1148,59 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         # CRITICAL FIX: DLT 1.15.0 doesn't automatically load config.toml from subdirectories
         # We need to set the configuration programmatically using environment variables
         
-        pipeline_kwargs = {
-            "pipeline_name": pipeline_name+"v1",
-            "destination": dlt.destinations.sqlalchemy(config.DB_TARGET_URL),
-            "dataset_name": "sync_data"
-        }
-        
-        # CRITICAL FIX: Configure DLT 1.15.0 staging behavior BEFORE pipeline creation
-        # DLT 1.15.0 SQLAlchemy destination always creates staging tables for merge operations
-        # We need to use DLT's built-in staging optimization to make DELETE operations fast
+        # CRITICAL DISCOVERY: DLT SQLAlchemy destination DOES use staging tables for merge operations!
+        # Our approach: Optimize BOTH target tables AND staging tables that DLT creates
         
         if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
-            # CRITICAL: Set DLT configuration BEFORE pipeline creation
             try:
-                # DEEP THINKING: DLT SQLAlchemy destination has LIMITED staging configuration
-                # The real staging management happens at PIPELINE level with supported parameters
+                log("🚨 CORRECTED DISCOVERY: DLT IS using staging tables")
+                log("   SQLAlchemy destination creates staging tables for merge operations")
+                log("   Solution: Optimize target tables AND staging tables for fast DELETE operations")
                 
-                # CRITICAL: Use ONLY DLT's supported configuration parameters
-                # These are the actual parameters that DLT 1.15.0 recognizes and applies
-                dlt.config["load.truncate_staging_dataset"] = True  # ✅ SUPPORTED: Clear staging after each load
-                dlt.config["load.staging_dataset_cleanup"] = True   # ✅ SUPPORTED: Enable staging cleanup
+                # Create basic SQLAlchemy destination with staging optimization
+                optimized_destination = dlt.destinations.sqlalchemy(config.DB_TARGET_URL)
+                
+                # Set pipeline-level configuration for better performance
                 dlt.config["load.workers"] = 1  # ✅ SUPPORTED: Single worker to avoid conflicts
                 dlt.config["extract.workers"] = 1  # ✅ SUPPORTED: Single worker
                 
-                # CRITICAL: Configure pipeline-level staging management
-                # These are the ONLY parameters that actually affect SQLAlchemy destination behavior
-                dlt.config["pipeline.truncate_staging_dataset"] = True  # ✅ SUPPORTED: Pipeline-level staging cleanup
-                dlt.config["pipeline.staging_dataset_cleanup"] = True   # ✅ SUPPORTED: Pipeline-level cleanup
+                # Set environment variables for DLT configuration
+                os.environ["DLT_LOAD_WORKERS"] = "1"
+                os.environ["DLT_EXTRACT_WORKERS"] = "1"
                 
-                log("🔧 DEEP THINKING: Applied ONLY DLT-supported staging configuration")
-                log("   load.truncate_staging_dataset: True (clear staging after each load)")
-                log("   load.staging_dataset_cleanup: True (automatic cleanup)")
-                log("   pipeline.truncate_staging_dataset: True (pipeline-level staging management)")
-                log("   pipeline.staging_dataset_cleanup: True (pipeline-level cleanup)")
-                log("   workers: 1 (single worker to avoid conflicts)")
-                log("   Using ONLY DLT 1.15.0 supported parameters")
-            except Exception as staging_config_error:
-                log(f"⚠️ Could not apply DLT configuration: {staging_config_error}")
-            
-            # Configure pipeline with staging optimization
+                log("🔧 CORRECTED APPROACH: Optimizing target tables AND staging tables for DLT operations")
+                log("   Workers: 1 (single worker to avoid conflicts)")
+                log("   Index optimization: ENABLED (will optimize both target and staging tables)")
+                log("   This should eliminate slow DELETE queries by optimizing all tables")
+                
+            except Exception as config_error:
+                log(f"⚠️ Could not apply configuration: {config_error}")
+                # Fallback to basic destination
+                optimized_destination = dlt.destinations.sqlalchemy(config.DB_TARGET_URL)
+        else:
+            # Basic destination without optimization
+            optimized_destination = dlt.destinations.sqlalchemy(config.DB_TARGET_URL)
+        
+        # Use the destination
+        pipeline_kwargs = {
+            "pipeline_name": pipeline_name+"v1",
+            "destination": optimized_destination,
+            "dataset_name": "sync_data"
+        }
+        
+        # Configure pipeline for optimal performance
+        if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
             pipeline_kwargs.update({
                 "dev_mode": False,  # Keep incremental behavior
                 "restore_from_destination": True,  # Sync with destination state
                 "enable_runtime_trace": True,  # Enable runtime monitoring
             })
             
-            log("🗑️ DLT staging OPTIMIZATION enabled for direct database operations")
-            log("   DLT will use staging tables but with optimized DELETE operations")
-            log("   Staging tables will be automatically cleaned up after each load")
-            log("   Complex EXISTS subqueries will be avoided for better performance")
+            log("🎯 CORRECTED APPROACH: Target table AND staging table optimization for DLT operations")
+            log("   DLT creates staging tables - we optimize both target and staging tables")
+            log("   This should eliminate slow DELETE queries")
         else:
-            log("⚠️ DLT staging optimization not configured")
+            log("⚠️ Table optimization not configured")
             log("   Default DLT behavior may create slow DELETE operations")
         
         # Create pipeline with all configuration

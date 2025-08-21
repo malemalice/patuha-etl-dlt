@@ -54,6 +54,11 @@ PIPELINE_MODE = os.getenv("PIPELINE_MODE", "direct")  # Options: 'direct' (db-to
 # DLT Load Configuration (for direct mode)
 TRUNCATE_STAGING_DATASET = os.getenv("TRUNCATE_STAGING_DATASET", "true").lower() == "true"  # Enable DLT staging management via pipeline configuration (DLT 1.15.0 compatible)
 
+# Index Management Configuration
+ENABLE_INDEX_OPTIMIZATION = os.getenv("ENABLE_INDEX_OPTIMIZATION", "true").lower() == "true"  # Enable automatic index creation for DLT operations
+INDEX_OPTIMIZATION_TIMEOUT = int(os.getenv("INDEX_OPTIMIZATION_TIMEOUT", "45"))  # Timeout for staging table index creation (seconds)
+CLEANUP_TEMPORARY_INDEXES = os.getenv("CLEANUP_TEMPORARY_INDEXES", "true").lower() == "true"  # Clean up temporary indexes after operations
+
 # File-based staging configuration (used when PIPELINE_MODE='file_staging')
 FILE_STAGING_DIR = os.getenv("FILE_STAGING_DIR", "staging")  # Base directory for staging files
 FILE_STAGING_RETENTION_HOURS = int(os.getenv("FILE_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
