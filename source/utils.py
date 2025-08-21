@@ -6,11 +6,38 @@ Contains logging, debugging, and common helper functions.
 from datetime import datetime
 from typing import Any, Union, List
 import json
+import config
 
-def log(message):
-    """Log a message with timestamp."""
+def log(message, level="INFO"):
+    """Log a message with timestamp and level control."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{timestamp} - {message}")
+    
+    # Only show essential logs unless it's an error or debug is enabled
+    if level == "ERROR" or level == "DEBUG" or level == "CONFIG" or level == "PHASE" or level == "STATUS":
+        print(f"{timestamp} - {message}")
+    elif level == "INFO" and config.DEBUG_MODE:
+        print(f"{timestamp} - {message}")
+
+def log_config(message):
+    """Log configuration-related messages."""
+    log(message, "CONFIG")
+
+def log_phase(message):
+    """Log phase/status messages."""
+    log(message, "PHASE")
+
+def log_status(message):
+    """Log status messages."""
+    log(message, "STATUS")
+
+def log_error(message):
+    """Log error messages."""
+    log(message, "ERROR")
+
+def log_debug(message):
+    """Log debug messages (only when debug mode is enabled)."""
+    if config.DEBUG_MODE:
+        log(message, "DEBUG")
 
 def format_primary_key(primary_key: Union[str, List[str]]) -> Union[str, List[str]]:
     """Format primary key for DLT hints with validation."""

@@ -32,7 +32,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", 8))  # Process tables in batches of 8
 BATCH_DELAY = int(os.getenv("BATCH_DELAY", 2))  # Delay between batches in seconds
 
 # Debug mode for detailed logging
-DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 DEEP_DEBUG_JSON = os.getenv("DEEP_DEBUG_JSON", "true").lower() == "true"
 AUTO_SANITIZE_DATA = os.getenv("AUTO_SANITIZE_DATA", "true").lower() == "true"
 

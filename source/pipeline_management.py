@@ -15,7 +15,7 @@ from dlt.sources.sql_database import sql_database
 import sqlalchemy as sa
 from typing import Dict, Any, List, Union, Callable
 import config
-from utils import log, format_primary_key, validate_primary_key_config, log_primary_key_info
+from utils import log, log_config, log_phase, log_status, log_error, log_debug, format_primary_key, validate_primary_key_config, log_primary_key_info
 from database import execute_with_transaction_management, ensure_dlt_columns
 from schema_management import sync_table_schema
 
@@ -28,13 +28,13 @@ if config.TRUNCATE_STAGING_DATASET:
     os.environ["DLT_LOAD_STAGING_DATASET_CLEANUP"] = "true"   # ✅ SUPPORTED: Enable staging cleanup
     os.environ["DLT_LOAD_WORKERS"] = "1"  # ✅ SUPPORTED: Single worker
     os.environ["DLT_EXTRACT_WORKERS"] = "1"  # ✅ SUPPORTED: Single worker
-    log("🔧 DEEP THINKING: DLT staging optimization enabled using SUPPORTED parameters")
-    log("   Using ONLY DLT 1.15.0 recognized environment variables")
-    log("   Staging tables will be automatically cleaned up after each load")
+    log_debug("🔧 DEEP THINKING: DLT staging optimization enabled using SUPPORTED parameters")
+    log_debug("   Using ONLY DLT 1.15.0 recognized environment variables")
+    log_debug("   Staging tables will be automatically cleaned up after each load")
 from data_processing import validate_table_data, sanitize_table_data, debug_problematic_rows
 from error_handling import retry_on_connection_error, retry_on_lock_timeout
 from monitoring import log_performance_metrics
-from index_management import optimize_table_for_dlt, cleanup_table_indexes, wait_and_optimize_staging_table
+from index_management import optimize_table_for_dlt, cleanup_table_indexes, wait_and_optimize_staging_table, monitor_dataset_staging_tables
 
 def get_max_timestamp(engine_target, table_name, column_name):
     """Get the maximum timestamp value from the target table with lock timeout handling."""
@@ -45,14 +45,14 @@ def get_max_timestamp(engine_target, table_name, column_name):
             max_value = result.scalar()
             
             if max_value is None:
-                log(f"📅 No existing data in target table {table_name}, starting from beginning")
+                log_debug(f"📅 No existing data in target table {table_name}, starting from beginning")
                 return None
             else:
-                log(f"📅 Latest {column_name} in target table {table_name}: {max_value}")
+                log_debug(f"📅 Latest {column_name} in target table {table_name}: {max_value}")
                 return max_value
                 
         except Exception as e:
-            log(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
+            log_error(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
             return None
     
     try:
@@ -62,7 +62,7 @@ def get_max_timestamp(engine_target, table_name, column_name):
             _get_timestamp
         )
     except Exception as e:
-        log(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
+        log_error(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
         return None
 
 def get_table_row_count(engine, table_name):
@@ -74,7 +74,7 @@ def get_table_row_count(engine, table_name):
             count = result.scalar()
             return count or 0
         except Exception as e:
-            log(f"❌ Error getting row count for {table_name}: {e}")
+            log_error(f"❌ Error getting row count for {table_name}: {e}")
             return 0
     
     try:
@@ -84,7 +84,7 @@ def get_table_row_count(engine, table_name):
             _get_count
         )
     except Exception as e:
-        log(f"❌ Error getting row count for {table_name}: {e}")
+        log_error(f"❌ Error getting row count for {table_name}: {e}")
         return 0
 
 def get_new_records_count(engine, table_name, modifier_column, since_timestamp):
@@ -235,58 +235,58 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     successful_tables = []
     failed_tables = []
     
-    log(f"🔄 Processing batch of {len(tables_dict)} tables with {write_disposition} disposition")
+    log_phase(f"🔄 Processing batch of {len(tables_dict)} tables with {write_disposition} disposition")
     
     for table_name, table_config in tables_dict.items():
         table_start_time = time.time()
         
         try:
-            log(f"\n{'='*60}")
-            log(f"🔄 Processing table: {table_name}")
-            log(f"📋 Table config: {table_config}")
+            log_phase(f"\n{'='*60}")
+            log_phase(f"🔄 Processing table: {table_name}")
+            log_debug(f"📋 Table config: {table_config}")
             
             # Check connection pool health before processing each table
             if hasattr(engine_source.pool, 'overflow') and engine_source.pool.overflow() < 0:
-                log(f"⚠️ Source connection pool corrupted (overflow: {engine_source.pool.overflow()}), recovering...")
+                log_debug(f"⚠️ Source connection pool corrupted (overflow: {engine_source.pool.overflow()}), recovering...")
                 try:
                     recovered_engine = recover_connection_pool(engine_source, "source")
                     if recovered_engine is not None:
                         engine_source = recovered_engine
-                        log(f"✅ Source connection pool recovery completed")
+                        log_debug(f"✅ Source connection pool recovery completed")
                     else:
-                        log(f"❌ Source connection pool recovery failed completely, skipping {table_name}")
+                        log_error(f"❌ Source connection pool recovery failed completely, skipping {table_name}")
                         failed_tables.append(table_name)
                         continue
                 except Exception as recovery_error:
-                    log(f"❌ Source connection pool recovery failed: {recovery_error}")
+                    log_error(f"❌ Source connection pool recovery failed: {recovery_error}")
                     failed_tables.append(table_name)
                     continue
                 
             if hasattr(engine_target.pool, 'overflow') and engine_target.pool.overflow() < 0:
-                log(f"⚠️ Target connection pool corrupted (overflow: {engine_target.pool.overflow()}), recovering...")
+                log_debug(f"⚠️ Target connection pool corrupted (overflow: {engine_target.pool.overflow()}), recovering...")
                 try:
                     recovered_engine = recover_connection_pool(engine_target, "target")
                     if recovered_engine is not None:
                         engine_target = recovered_engine
-                        log(f"✅ Target connection pool recovery completed")
+                        log_debug(f"✅ Target connection pool recovery completed")
                     else:
-                        log(f"❌ Target connection pool recovery failed completely, skipping {table_name}")
+                        log_error(f"❌ Target connection pool recovery failed completely, skipping {table_name}")
                         failed_tables.append(table_name)
                         continue
                 except Exception as recovery_error:
-                    log(f"❌ Target connection pool recovery failed: {recovery_error}")
+                    log_error(f"❌ Target connection pool recovery failed: {recovery_error}")
                     failed_tables.append(table_name)
                     continue
             
             # Validate primary key configuration
             if "primary_key" not in table_config:
-                log(f"❌ Table '{table_name}' missing primary_key configuration, skipping")
+                log_error(f"❌ Table '{table_name}' missing primary_key configuration, skipping")
                 failed_tables.append(table_name)
                 continue
                 
             primary_key = table_config["primary_key"]
             if not validate_primary_key_config(primary_key):
-                log(f"❌ Table '{table_name}' has invalid primary_key configuration: {primary_key}, skipping")
+                log_error(f"❌ Table '{table_name}' has invalid primary_key configuration: {primary_key}, skipping")
                 failed_tables.append(table_name)
                 continue
             
@@ -294,16 +294,16 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             log_primary_key_info(table_name, primary_key)
             
             # Log table configuration details
-            log(f"📋 Table configuration details:")
-            log(f"   Primary key: {primary_key}")
-            log(f"   Has modifier: {'modifier' in table_config}")
+            log_debug(f"📋 Table configuration details:")
+            log_debug(f"   Primary key: {primary_key}")
+            log_debug(f"   Has modifier: {'modifier' in table_config}")
             if 'modifier' in table_config:
-                log(f"   Modifier column: {table_config['modifier']}")
-            log(f"   Write disposition: {write_disposition}")
+                log_debug(f"   Modifier column: {table_config['modifier']}")
+            log_debug(f"   Write disposition: {write_disposition}")
             
             # Validate table data
             if not validate_table_data(engine_source, table_name):
-                log(f"❌ Table data validation failed for {table_name}, attempting to debug...")
+                log_error(f"❌ Table data validation failed for {table_name}, attempting to debug...")
                 debug_problematic_rows(engine_source, table_name, limit=5)
                 failed_tables.append(table_name)
                 continue
@@ -313,7 +313,7 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 sync_table_schema(engine_source, engine_target, table_name)
                 ensure_dlt_columns(engine_target, table_name)
             except Exception as schema_error:
-                log(f"❌ Schema sync failed for {table_name}: {schema_error}")
+                log_error(f"❌ Schema sync failed for {table_name}: {schema_error}")
                 failed_tables.append(table_name)
                 continue
             
@@ -321,39 +321,39 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             # ONLY for incremental tables (those with modifier column and merge disposition)
             if config.ENABLE_INDEX_OPTIMIZATION and "modifier" in table_config and write_disposition == "merge":
                 try:
-                    log(f"🔧 Optimizing indexes for DLT operations on {table_name} (incremental table)...")
+                    log_debug(f"🔧 Optimizing indexes for DLT operations on {table_name} (incremental table)...")
                     index_optimization_success = optimize_table_for_dlt(table_name, table_config, engine_source, engine_target)
                     if index_optimization_success:
-                        log(f"✅ Index optimization completed for incremental table {table_name}")
+                        log_debug(f"✅ Index optimization completed for incremental table {table_name}")
                     else:
-                        log(f"⚠️ Index optimization had issues for incremental table {table_name}, but continuing...")
+                        log_debug(f"⚠️ Index optimization had issues for incremental table {table_name}, but continuing...")
                 except Exception as index_error:
-                    log(f"⚠️ Index optimization failed for incremental table {table_name}: {index_error}")
-                    log(f"   Continuing without index optimization...")
+                    log_debug(f"⚠️ Index optimization failed for incremental table {table_name}: {index_error}")
+                    log_debug(f"   Continuing without index optimization...")
                     # Don't fail the table processing due to index issues
             elif config.ENABLE_INDEX_OPTIMIZATION:
-                log(f"ℹ️ Skipping index optimization for {table_name} (not an incremental table)")
-                log(f"   Table uses full refresh method - indexes not needed for DLT operations")
+                log_debug(f"ℹ️ Skipping index optimization for {table_name} (not an incremental table)")
+                log_debug(f"   Table uses full refresh method - indexes not needed for DLT operations")
             else:
-                log(f"ℹ️ Index optimization disabled globally (ENABLE_INDEX_OPTIMIZATION=false)")
+                log_debug(f"ℹ️ Index optimization disabled globally (ENABLE_INDEX_OPTIMIZATION=false)")
             
             # CRITICAL: Handle different sync strategies with strict method separation
             if "modifier" in table_config and write_disposition == "merge":
                 # Incremental sync - ONLY for tables with modifier column and merge disposition
-                log(f"📈 Processing incremental sync for {table_name}")
-                log(f"   Table has modifier column: {table_config['modifier']}")
-                log(f"   Using merge disposition for incremental sync")
-                log(f"   CRITICAL: Incremental method - NO fallback to full refresh")
+                log_phase(f"📈 Processing incremental sync for {table_name}")
+                log_debug(f"   Table has modifier column: {table_config['modifier']}")
+                log_debug(f"   Using merge disposition for incremental sync")
+                log_debug(f"   CRITICAL: Incremental method - NO fallback to full refresh")
                 success = process_incremental_table(pipeline, engine_source, engine_target, table_name, table_config)
             else:
                 # Full refresh - for tables without modifier OR with non-merge disposition
-                log(f"🔄 Processing full refresh for {table_name}")
+                log_phase(f"🔄 Processing full refresh for {table_name}")
                 if "modifier" not in table_config:
-                    log(f"   Table has no modifier column - using full refresh")
+                    log_debug(f"   Table has no modifier column - using full refresh")
                 else:
-                    log(f"   Table has modifier but write_disposition is not merge - using full refresh")
-                log(f"   Using {write_disposition} disposition for full refresh")
-                log(f"   CRITICAL: Full refresh method - NO incremental logic")
+                    log_debug(f"   Table has modifier but write_disposition is not merge - using full refresh")
+                log_debug(f"   Using {write_disposition} disposition for full refresh")
+                log_debug(f"   CRITICAL: Full refresh method - NO incremental logic")
                 success = process_full_refresh_table(pipeline, engine_source, engine_target, table_name, table_config, write_disposition)
             
             table_end_time = time.time()
@@ -365,20 +365,20 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 # ONLY for incremental tables (those with modifier column and merge disposition)
                 if config.CLEANUP_TEMPORARY_INDEXES and config.ENABLE_INDEX_OPTIMIZATION and "modifier" in table_config and write_disposition == "merge":
                     try:
-                        log(f"🧹 Cleaning up temporary indexes for incremental table {table_name}...")
+                        log_debug(f"🧹 Cleaning up temporary indexes for incremental table {table_name}...")
                         cleanup_success = cleanup_table_indexes(table_name, engine_target)
                         if cleanup_success:
-                            log(f"✅ Index cleanup completed for incremental table {table_name}")
+                            log_debug(f"✅ Index cleanup completed for incremental table {table_name}")
                         else:
-                            log(f"⚠️ Index cleanup had issues for incremental table {table_name}")
+                            log_debug(f"⚠️ Index cleanup had issues for incremental table {table_name}")
                     except Exception as cleanup_error:
-                        log(f"⚠️ Index cleanup failed for incremental table {table_name}: {cleanup_error}")
+                        log_debug(f"⚠️ Index cleanup failed for incremental table {table_name}: {cleanup_error}")
                         # Don't fail the table processing due to cleanup issues
                 elif config.CLEANUP_TEMPORARY_INDEXES and config.ENABLE_INDEX_OPTIMIZATION:
-                    log(f"ℹ️ Skipping index cleanup for {table_name} (not an incremental table)")
-                    log(f"   Table uses full refresh method - no temporary indexes to clean up")
+                    log_debug(f"ℹ️ Skipping index cleanup for {table_name} (not an incremental table)")
+                    log_debug(f"   Table uses full refresh method - no temporary indexes to clean up")
                 else:
-                    log(f"ℹ️ Index cleanup disabled for {table_name}")
+                    log_debug(f"ℹ️ Index cleanup disabled for {table_name}")
                 
                 # Get actual record count for this table
                 try:
@@ -389,52 +389,52 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                         if max_timestamp is not None:
                             new_records = get_new_records_count(engine_source, table_name, modifier_column, max_timestamp)
                             log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time, new_records)
-                            log(f"✅ Successfully processed table: {table_name} ({new_records} new records)")
+                            log_status(f"✅ Successfully processed table: {table_name} ({new_records} new records)")
                         else:
                             # First time sync
                             source_count = get_table_row_count(engine_source, table_name)
                             log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time, source_count)
-                            log(f"✅ Successfully processed table: {table_name} ({source_count} records, first time)")
+                            log_status(f"✅ Successfully processed table: {table_name} ({source_count} records, first time)")
                     else:
                         # For full refresh, get total source count
                         source_count = get_table_row_count(engine_source, table_name)
                         log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time, source_count)
-                        log(f"✅ Successfully processed table: {table_name} ({source_count} records, full refresh)")
+                        log_status(f"✅ Successfully processed table: {table_name} ({source_count} records, full refresh)")
                 except Exception as e:
-                    log(f"⚠️ Could not get record count for {table_name}: {e}")
+                    log_debug(f"⚠️ Could not get record count for {table_name}: {e}")
                     log_performance_metrics(f"Table {table_name}", table_start_time, table_end_time)
-                    log(f"✅ Successfully processed table: {table_name}")
+                    log_status(f"✅ Successfully processed table: {table_name}")
             else:
                 failed_tables.append(table_name)
-                log(f"❌ Failed to process table: {table_name}")
+                log_error(f"❌ Failed to process table: {table_name}")
                 
         except Exception as table_error:
             table_end_time = time.time()
             failed_tables.append(table_name)
-            log(f"❌ Error processing table {table_name}: {table_error}")
+            log_error(f"❌ Error processing table {table_name}: {table_error}")
             log_performance_metrics(f"Table {table_name} (FAILED)", table_start_time, table_end_time)
             
             # Force connection pool recovery on critical errors
-            log(f"🔄 Attempting connection pool recovery after critical error...")
+            log_debug(f"🔄 Attempting connection pool recovery after critical error...")
             try:
                 recovered_source = recover_connection_pool(engine_source, "source")
                 if recovered_source is not None:
                     engine_source = recovered_source
-                    log(f"✅ Source pool recovery after critical error completed")
+                    log_debug(f"✅ Source pool recovery after critical error completed")
                 else:
-                    log(f"❌ Source pool recovery after critical error failed completely")
+                    log_error(f"❌ Source pool recovery after critical error failed completely")
             except Exception as recovery_error:
-                log(f"❌ Source pool recovery after critical error failed: {recovery_error}")
+                log_error(f"❌ Source pool recovery after critical error failed: {recovery_error}")
                 
             try:
                 recovered_target = recover_connection_pool(engine_target, "target")
                 if recovered_target is not None:
                     engine_target = recovered_target
-                    log(f"✅ Target pool recovery after critical error completed")
+                    log_debug(f"✅ Target pool recovery after critical error completed")
                 else:
-                    log(f"❌ Target pool recovery after critical error failed completely")
+                    log_error(f"❌ Target pool recovery after critical error failed completely")
             except Exception as recovery_error:
-                log(f"❌ Target pool recovery after critical error failed: {recovery_error}")
+                log_error(f"❌ Target pool recovery after critical error failed: {recovery_error}")
     
     batch_end_time = time.time()
     
@@ -455,33 +455,33 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                     if max_timestamp is not None:
                         new_records = get_new_records_count(engine_source, table_name, modifier_column, max_timestamp)
                         total_records_processed += new_records
-                        log(f"📊 Table {table_name}: {new_records} new records synced")
+                        log_debug(f"📊 Table {table_name}: {new_records} new records synced")
                     else:
                         # First time sync, get total source count
                         source_count = get_table_row_count(engine_source, table_name)
                         total_records_processed += source_count
-                        log(f"📊 Table {table_name}: {source_count} records synced (first time)")
+                        log_debug(f"📊 Table {table_name}: {source_count} records synced (first time)")
                 else:
                     # For full refresh, get total source count
                     source_count = get_table_row_count(engine_source, table_name)
                     total_records_processed += source_count
-                    log(f"📊 Table {table_name}: {source_count} records synced (full refresh)")
+                    log_debug(f"📊 Table {table_name}: {source_count} records synced (full refresh)")
         except Exception as e:
-            log(f"⚠️ Could not get record count for {table_name}: {e}")
+            log_debug(f"⚠️ Could not get record count for {table_name}: {e}")
     
     log_performance_metrics(f"Batch processing", batch_start_time, batch_end_time, total_records_processed)
     
     # Summary
-    log(f"\n{'='*60}")
-    log(f"📊 Batch processing summary:")
-    log(f"✅ Successful: {len(successful_tables)} tables")
-    log(f"❌ Failed: {len(failed_tables)} tables")
-    log(f"📈 Total records processed: {total_records_processed:,}")
+    log_status(f"\n{'='*60}")
+    log_status(f"📊 Batch processing summary:")
+    log_status(f"✅ Successful: {len(successful_tables)} tables")
+    log_status(f"❌ Failed: {len(failed_tables)} tables")
+    log_status(f"📈 Total records processed: {total_records_processed:,}")
     
     if successful_tables:
-        log(f"✅ Successful tables: {', '.join(successful_tables)}")
+        log_status(f"✅ Successful tables: {', '.join(successful_tables)}")
     if failed_tables:
-        log(f"❌ Failed tables: {', '.join(failed_tables)}")
+        log_error(f"❌ Failed tables: {', '.join(failed_tables)}")
     
     return len(successful_tables), len(failed_tables)
 
@@ -1186,6 +1186,41 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         # Create pipeline with all configuration
         pipeline = dlt.pipeline(**pipeline_kwargs)
         
+        # CRITICAL NEW FEATURE: Start dataset-level staging table monitoring
+        # This will monitor and optimize tables like 'sync_data.sanitize_table_data'
+        if config.TRUNCATE_STAGING_DATASET:
+            try:
+                log("🚀 CRITICAL NEW FEATURE: Starting dataset-level staging table monitoring...")
+                log("   This will monitor and optimize 'sync_data.*' staging tables")
+                log("   Including tables like 'sync_data.sanitize_table_data'")
+                
+                # Start dataset-level staging table monitoring in a separate thread
+                import threading
+                dataset_staging_thread = threading.Thread(
+                    target=monitor_dataset_staging_tables,
+                    args=("sync_data", pipeline.destination.engine, config.INDEX_OPTIMIZATION_TIMEOUT),
+                    daemon=True
+                )
+                dataset_staging_thread.start()
+                log("✅ Dataset-level staging table monitoring thread started")
+                log("   This will automatically optimize all sync_data staging tables")
+                
+                # CRITICAL: Also check for existing dataset-level staging tables immediately
+                # This catches tables that were already created in previous runs
+                try:
+                    log("🔍 Proactively checking for existing dataset-level staging tables...")
+                    existing_tables = monitor_dataset_staging_tables("sync_data", pipeline.destination.engine, 10)
+                    if existing_tables:
+                        log(f"✅ Found and optimized {len(existing_tables)} existing dataset-level staging tables")
+                    else:
+                        log("ℹ️ No existing dataset-level staging tables found (this is normal for new pipelines)")
+                except Exception as immediate_check_error:
+                    log(f"⚠️ Immediate dataset-level staging table check failed: {immediate_check_error}")
+                
+            except Exception as dataset_monitoring_error:
+                log(f"⚠️ Could not start dataset-level staging monitoring: {dataset_monitoring_error}")
+                log("   Dataset-level staging tables may not be optimized")
+        
         # CRITICAL FIX: DLT staging OPTIMIZATION is now enabled for direct database operations
         if config.TRUNCATE_STAGING_DATASET:
             log("🔧 DLT staging OPTIMIZATION enabled - staging tables with fast DELETE operations")
@@ -1200,8 +1235,10 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         log(f"   Mode: incremental with merge disposition")
         if config.TRUNCATE_STAGING_DATASET:
             log(f"   Staging: OPTIMIZED (fast DELETE operations, automatic cleanup)")
+            log(f"   Dataset-level monitoring: ENABLED (will optimize sync_data.* staging tables)")
         else:
             log(f"   Staging: Default behavior (may create slow DELETE operations)")
+            log(f"   Dataset-level monitoring: DISABLED (staging optimization not configured)")
         
         return pipeline
         
@@ -1615,20 +1652,20 @@ def load_select_tables_from_database():
         from database import get_engines
         engine_source, engine_target = get_engines()
         
-        log(f"🚀 Starting database sync with {len(config.table_configs)} configured tables")
-        log(f"📋 Configured tables: {list(config.table_configs.keys())}")
-        log(f"🔧 Pipeline mode: {config.PIPELINE_MODE}")
+        log_config(f"🚀 Starting database sync with {len(config.table_configs)} configured tables")
+        log_config(f"📋 Configured tables: {list(config.table_configs.keys())}")
+        log_config(f"🔧 Pipeline mode: {config.PIPELINE_MODE}")
         
         # Check pipeline mode
         if config.PIPELINE_MODE.lower() == "file_staging":
-            log("📁 File staging mode enabled - extracting to files first, then loading to database")
+            log_config("📁 File staging mode enabled - extracting to files first, then loading to database")
             pipeline = None  # No MySQL pipeline created - avoids timeout issues
         elif config.PIPELINE_MODE.lower() == "direct":
-            log("⚡ Direct mode enabled - using db-to-db pipeline via DLT")
+            log_config("⚡ Direct mode enabled - using db-to-db pipeline via DLT")
             # Create DLT pipeline for direct database operation
             pipeline = create_pipeline()
         else:
-            log(f"⚠️ Unknown pipeline mode '{config.PIPELINE_MODE}', defaulting to direct mode")
+            log_config(f"⚠️ Unknown pipeline mode '{config.PIPELINE_MODE}', defaulting to direct mode")
             pipeline = create_pipeline()
         
         # Process tables in batches
@@ -1643,47 +1680,47 @@ def load_select_tables_from_database():
             batch_items = table_items[i:i + config.BATCH_SIZE]
             batch_dict = dict(batch_items)
             
-            log(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_dict)} tables)")
-            log(f"📋 Batch configuration: BATCH_SIZE={config.BATCH_SIZE}, BATCH_DELAY={config.BATCH_DELAY}s")
+            log_phase(f"\n🔄 Processing batch {batch_num}/{total_batches} ({len(batch_dict)} tables)")
+            log_debug(f"📋 Batch configuration: BATCH_SIZE={config.BATCH_SIZE}, BATCH_DELAY={config.BATCH_DELAY}s")
             
             # Monitor connection pool health before each batch
             from monitoring import monitor_connection_pool_health
             try:
                 if not monitor_connection_pool_health(engine_source, engine_target):
-                    log(f"⚠️ Connection pool health issues detected, attempting recovery...")
+                    log_debug(f"⚠️ Connection pool health issues detected, attempting recovery...")
                     # Force engine recreation
                     from database import create_engines
                     create_engines()
                     engine_source, engine_target = get_engines()
-                    log(f"✅ Engine recreation completed for batch {batch_num}")
+                    log_debug(f"✅ Engine recreation completed for batch {batch_num}")
             except Exception as health_check_error:
-                log(f"⚠️ Connection pool health check failed: {health_check_error}")
-                log(f"🔄 Attempting engine recreation...")
+                log_debug(f"⚠️ Connection pool health check failed: {health_check_error}")
+                log_debug(f"🔄 Attempting engine recreation...")
                 try:
                     from database import create_engines
                     create_engines()
                     engine_source, engine_target = get_engines()
-                    log(f"✅ Engine recreation completed after health check failure")
+                    log_debug(f"✅ Engine recreation completed after health check failure")
                 except Exception as recreation_error:
-                    log(f"❌ Engine recreation failed: {recreation_error}")
+                    log_error(f"❌ Engine recreation failed: {recreation_error}")
                     # Continue with existing engines - they might still work
             
             # Validate engines before processing
             if engine_source is None or engine_target is None:
-                log(f"❌ Invalid engines detected, attempting to recreate...")
+                log_error(f"❌ Invalid engines detected, attempting to recreate...")
                 try:
                     from database import create_engines
                     create_engines()
                     engine_source, engine_target = get_engines()
-                    log(f"✅ Engines recreated successfully")
+                    log_debug(f"✅ Engines recreated successfully")
                 except Exception as engine_error:
-                    log(f"❌ Failed to recreate engines: {engine_error}")
-                    log(f"⚠️ Skipping batch {batch_num} due to engine issues")
+                    log_error(f"❌ Failed to recreate engines: {engine_error}")
+                    log_error(f"⚠️ Skipping batch {batch_num} due to engine issues")
                     total_failed += len(batch_dict)
                     continue
             
             if config.PIPELINE_MODE.lower() == "file_staging":
-                log("📁 Using file staging mode - extracting to files first, then loading to database")
+                log_debug("📁 Using file staging mode - extracting to files first, then loading to database")
                 # Process each table individually with file staging
                 for table_name, table_config in batch_dict.items():
                     try:
@@ -1693,11 +1730,11 @@ def load_select_tables_from_database():
                         else:
                             total_failed += 1
                     except Exception as table_error:
-                        log(f"❌ Error processing table {table_name}: {table_error}")
+                        log_error(f"❌ Error processing table {table_name}: {table_error}")
                         total_failed += 1
             else:
                 # Use direct db-to-db batch processing
-                log("⚡ Using direct db-to-db mode via DLT")
+                log_debug("⚡ Using direct db-to-db mode via DLT")
                 
                 # CRITICAL FIX: Separate incremental and full refresh tables
                 # This ensures they use the correct write_disposition
@@ -1712,34 +1749,34 @@ def load_select_tables_from_database():
                         # Full refresh tables use "replace" disposition
                         full_refresh_tables[table_name] = table_config
                 
-                log(f"📊 Batch breakdown: {len(incremental_tables)} incremental, {len(full_refresh_tables)} full refresh")
+                log_debug(f"📊 Batch breakdown: {len(incremental_tables)} incremental, {len(full_refresh_tables)} full refresh")
                 
                 # Process incremental tables with "merge" disposition
                 if incremental_tables:
-                    log(f"🔄 Processing {len(incremental_tables)} incremental tables with merge disposition")
+                    log_phase(f"🔄 Processing {len(incremental_tables)} incremental tables with merge disposition")
                     successful, failed = process_tables_batch(pipeline, engine_source, engine_target, incremental_tables, "merge")
                     total_successful += successful
                     total_failed += failed
                 
                 # Process full refresh tables with "replace" disposition
                 if full_refresh_tables:
-                    log(f"🔄 Processing {len(full_refresh_tables)} full refresh tables with replace disposition")
+                    log_phase(f"🔄 Processing {len(full_refresh_tables)} full refresh tables with replace disposition")
                     successful, failed = process_tables_batch(pipeline, engine_source, engine_target, full_refresh_tables, "replace")
                 total_successful += successful
                 total_failed += failed
             
             # Add delay between batches
             if i + config.BATCH_SIZE < len(table_items) and config.BATCH_DELAY > 0:
-                log(f"⏳ Waiting {config.BATCH_DELAY} seconds before next batch...")
+                log_debug(f"⏳ Waiting {config.BATCH_DELAY} seconds before next batch...")
                 time.sleep(config.BATCH_DELAY)
         
         # Final summary
-        log(f"\n{'='*60}")
-        log(f"🎯 FINAL SYNC SUMMARY")
-        log(f"📊 Total tables processed: {len(config.table_configs)}")
-        log(f"✅ Successful: {total_successful}")
-        log(f"❌ Failed: {total_failed}")
-        log(f"📈 Success rate: {(total_successful/len(config.table_configs)*100):.1f}%")
-        log(f"{'='*60}")
+        log_status(f"\n{'='*60}")
+        log_status(f"🎯 FINAL SYNC SUMMARY")
+        log_status(f"📊 Total tables processed: {len(config.table_configs)}")
+        log_status(f"✅ Successful: {total_successful}")
+        log_status(f"❌ Failed: {total_failed}")
+        log_status(f"📈 Success rate: {(total_successful/len(config.table_configs)*100):.1f}%")
+        log_status(f"{'='*60}")
     
     return retry_on_connection_error(_load_tables, "pipeline")

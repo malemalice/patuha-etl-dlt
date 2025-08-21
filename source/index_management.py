@@ -286,7 +286,19 @@ def wait_and_optimize_staging_table(table_name: str, table_config: Dict[str, Any
                             f"{table_name}",                  # Staging schema: zains_rz_staging.table_name
                         ]
                         
-                        for pattern in patterns:
+                        # CRITICAL NEW: Also check for dataset-level staging tables
+                        # These are tables like 'sync_data.sanitize_table_data' that affect all tables
+                        dataset_patterns = [
+                            "sync_data%",                     # sync_data.* (affects all tables)
+                            "_dlt_sync_data%",                # _dlt_sync_data.*
+                            "sync_data_staging%",             # sync_data_staging.*
+                            "sync_data__dlt%",                # sync_data__dlt.*
+                        ]
+                        
+                        # Combine both table-specific and dataset-level patterns
+                        all_patterns = patterns + dataset_patterns
+                        
+                        for pattern in all_patterns:
                             result = connection.execute(check_query, {"schema_name": schema, "pattern": pattern})
                             if result.fetchone()[0] > 0:
                                 staging_table_found = True
@@ -538,3 +550,128 @@ def verify_staging_optimization_working() -> bool:
     except Exception as e:
         log(f"❌ Error verifying staging optimization: {e}")
         return False
+
+
+def monitor_dataset_staging_tables(dataset_name: str, engine_target, timeout_seconds: int = 60):
+    """
+    Monitor and optimize dataset-level staging tables created by DLT.
+    
+    This is specifically for tables like 'sync_data.sanitize_table_data' that are created
+    at the dataset level, not individual table level.
+    """
+    try:
+        log(f"🚀 Starting dataset-level staging table monitoring for '{dataset_name}'...")
+        
+        start_time = time.time()
+        staging_tables_found = []
+        
+        while time.time() - start_time < timeout_seconds:
+            try:
+                with engine_target.connect() as connection:
+                    # Get current database name
+                    current_db_result = connection.execute(sa.text("SELECT DATABASE()"))
+                    current_db = current_db_result.scalar()
+                    
+                    # Check for dataset-level staging tables in main schema
+                    # These are tables like 'sync_data.sanitize_table_data'
+                    dataset_staging_query = sa.text("""
+                        SELECT table_name
+                        FROM information_schema.tables 
+                        WHERE table_schema = :schema_name
+                        AND table_name LIKE :pattern
+                    """)
+                    
+                    # DLT creates dataset-level staging tables with various patterns
+                    dataset_patterns = [
+                        f"{dataset_name}%",           # sync_data.*
+                        f"_dlt_{dataset_name}%",      # _dlt_sync_data.*
+                        f"{dataset_name}_staging%",   # sync_data_staging.*
+                        f"{dataset_name}__dlt%",      # sync_data__dlt.*
+                    ]
+                    
+                    for pattern in dataset_patterns:
+                        result = connection.execute(dataset_staging_query, {
+                            "schema_name": current_db, 
+                            "pattern": pattern
+                        })
+                        
+                        for row in result:
+                            table_name = row[0]
+                            full_table_name = f"{current_db}.{table_name}"
+                            
+                            if full_table_name not in staging_tables_found:
+                                staging_tables_found.append(full_table_name)
+                                log(f"🎯 Found dataset-level staging table: {full_table_name}")
+                                
+                                # Create a basic table config for optimization
+                                # Since this is a dataset-level table, we'll use safe defaults
+                                table_config = {
+                                    "primary_key": ["id"],  # Safe default
+                                    "table_name": table_name,
+                                    "dataset_name": dataset_name
+                                }
+                                
+                                # Optimize the dataset-level staging table
+                                success = optimize_staging_table_indexes(full_table_name, table_config, engine_target)
+                                if success:
+                                    log(f"✅ Dataset-level staging table optimized: {full_table_name}")
+                                else:
+                                    log(f"⚠️ Dataset-level staging table optimization failed: {full_table_name}")
+                    
+                    # Also check staging schema for dataset-level tables
+                    staging_schema = f"{current_db}_staging"
+                    staging_schema_check = sa.text("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = :schema_name")
+                    staging_exists = connection.execute(staging_schema_check, {"schema_name": staging_schema})
+                    
+                    if staging_exists.fetchone():
+                        log(f"🔍 Checking staging schema {staging_schema} for dataset-level tables...")
+                        
+                        for pattern in dataset_patterns:
+                            staging_result = connection.execute(dataset_staging_query, {
+                                "schema_name": staging_schema, 
+                                "pattern": pattern
+                            })
+                            
+                            for row in staging_result:
+                                table_name = row[0]
+                                full_table_name = f"{staging_schema}.{table_name}"
+                                
+                                if full_table_name not in staging_tables_found:
+                                    staging_tables_found.append(full_table_name)
+                                    log(f"🎯 Found dataset-level staging table in staging schema: {full_table_name}")
+                                    
+                                    # Create a basic table config for optimization
+                                    table_config = {
+                                        "primary_key": ["id"],  # Safe default
+                                        "table_name": table_name,
+                                        "dataset_name": dataset_name
+                                    }
+                                    
+                                    # Optimize the dataset-level staging table
+                                    success = optimize_staging_table_indexes(full_table_name, table_config, engine_target)
+                                    if success:
+                                        log(f"✅ Dataset-level staging table optimized: {full_table_name}")
+                                    else:
+                                        log(f"⚠️ Dataset-level staging table optimization failed: {full_table_name}")
+                    
+                    if staging_tables_found:
+                        log(f"✅ Dataset-level staging table monitoring completed. Found {len(staging_tables_found)} tables:")
+                        for table in staging_tables_found:
+                            log(f"   - {table}")
+                        return staging_tables_found
+                    
+                    # Wait before checking again
+                    time.sleep(1)
+                    
+            except Exception as check_error:
+                log(f"⚠️ Error checking for dataset-level staging tables: {check_error}")
+                time.sleep(2)
+        
+        if not staging_tables_found:
+            log(f"⚠️ No dataset-level staging tables found within {timeout_seconds}s for '{dataset_name}'")
+        
+        return staging_tables_found
+        
+    except Exception as e:
+        log(f"❌ Error in dataset-level staging table monitoring: {e}")
+        return []

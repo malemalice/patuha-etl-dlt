@@ -32,7 +32,7 @@ from typing import Any, Union, List
 import config
 
 # Import utilities
-from utils import log
+from utils import log, log_config, log_phase, log_status, log_error
 
 # Import core modules
 from database import create_engines, cleanup_engines, get_engines
@@ -44,19 +44,19 @@ def validate_table_configurations():
     """Validate all table configurations for proper primary key setup."""
     from utils import validate_primary_key_config, log_primary_key_info
     
-    log("🔍 Validating table configurations...")
+    log_config("🔍 Validating table configurations...")
     
     for table_name, table_config in config.table_configs.items():
         # Check if primary_key exists
         if "primary_key" not in table_config:
-            log(f"❌ Table '{table_name}' missing primary_key configuration")
+            log_error(f"❌ Table '{table_name}' missing primary_key configuration")
             continue
             
         primary_key = table_config["primary_key"]
         
         # Validate primary key configuration
         if not validate_primary_key_config(primary_key):
-            log(f"❌ Table '{table_name}' has invalid primary_key configuration: {primary_key}")
+            log_error(f"❌ Table '{table_name}' has invalid primary_key configuration: {primary_key}")
             continue
             
         # Log primary key information
@@ -64,99 +64,99 @@ def validate_table_configurations():
         
         # Check if modifier exists for incremental sync
         if "modifier" in table_config:
-            log(f"📅 Table '{table_name}' configured for incremental sync using column: {table_config['modifier']}")
+            log_config(f"📅 Table '{table_name}' configured for incremental sync using column: {table_config['modifier']}")
         else:
-            log(f"🔄 Table '{table_name}' configured for full refresh sync")
+            log_config(f"🔄 Table '{table_name}' configured for full refresh sync")
     
-    log(f"✅ Table configuration validation completed for {len(config.table_configs)} tables")
+    log_config(f"✅ Table configuration validation completed for {len(config.table_configs)} tables")
 
 def run_pipeline():
     """Main pipeline execution function."""
     if config.INTERVAL > 0:
-        log(f"🔄 Starting continuous sync mode (interval: {config.INTERVAL}s)")
+        log_phase(f"🔄 Starting continuous sync mode (interval: {config.INTERVAL}s)")
         while True:
             try:
-                log(f"\n🚀 Starting sync cycle at {time.strftime('%H:%M:%S')}")
+                log_phase(f"\n🚀 Starting sync cycle at {time.strftime('%H:%M:%S')}")
                 
                 # Run the main sync process
                 load_select_tables_from_database()
                 
-                log(f"✅ Sync cycle completed - waiting {config.INTERVAL}s until next cycle")
+                log_status(f"✅ Sync cycle completed - waiting {config.INTERVAL}s until next cycle")
                 time.sleep(config.INTERVAL)
                 
             except KeyboardInterrupt:
-                log("🛑 Shutdown signal received - stopping gracefully")
+                log_phase("🛑 Shutdown signal received - stopping gracefully")
                 break
             except Exception as e:
-                log(f"❌ FAILED: Sync cycle error")
-                log(f"   Error: {e}")
-                log(f"   Retrying in {config.INTERVAL}s...")
+                log_error(f"❌ FAILED: Sync cycle error")
+                log_error(f"   Error: {e}")
+                log_status(f"   Retrying in {config.INTERVAL}s...")
                 time.sleep(config.INTERVAL)
     else:
-        log("🔄 Starting single execution mode")
+        log_phase("🔄 Starting single execution mode")
         try:
             load_select_tables_from_database()
-            log("✅ Single execution completed successfully")
+            log_status("✅ Single execution completed successfully")
         except Exception as e:
-            log(f"❌ FAILED: Single execution error")
-            log(f"   Error: {e}")
-            sys.exit(1)
+            log_error(f"❌ FAILED: Single execution error")
+            log_error(f"   Error: {e}")
 
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
-    log(f"🛑 Received signal {signum}, shutting down gracefully...")
+    log_phase(f"🛑 Received signal {signum}, shutting down gracefully...")
     cleanup_engines()
     sys.exit(0)
 
 def main():
-    """Main function that orchestrates the entire pipeline."""
+    """Main entry point for the pipeline."""
     try:
         # Set up signal handlers
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
-        log("🚀 DLT Database Sync Pipeline Starting")
-        log(f"📋 Tables configured: {len(config.table_configs)}")
-        log(f"🔧 Pipeline mode: {config.PIPELINE_MODE}")
+        log_config("🚀 DLT Database Sync Pipeline Starting")
+        log_config(f"📋 Tables configured: {len(config.table_configs)}")
+        log_config(f"🔧 Pipeline mode: {config.PIPELINE_MODE}")
+        
         if config.PIPELINE_MODE.lower() == "file_staging":
-            log("📁 Using file staging mode - extract to files first, then load to database")
+            log_config("📁 Using file staging mode - extract to files first, then load to database")
         elif config.PIPELINE_MODE.lower() == "direct":
-            log("⚡ Using direct mode - db-to-db pipeline via DLT")
+            log_config("⚡ Using direct mode - db-to-db pipeline via DLT")
         else:
-            log(f"⚠️ Unknown pipeline mode '{config.PIPELINE_MODE}', will default to direct mode")
+            log_config(f"⚠️ Unknown pipeline mode '{config.PIPELINE_MODE}', will default to direct mode")
+        
+        log_config("🔄 Validating configurations...")
         
         # Validate table configurations
-        log("🔄 Validating configurations...")
         validate_table_configurations()
         
-        # Initialize database engines
+        # Create database engines
         create_engines()
         
-        # Get engines for monitoring setup
-        engine_source, engine_target = get_engines()
+        log_config("🔄 Starting background services...")
         
-        # Start background services
-        log("🔄 Starting background services...")
+        # Start HTTP server in background
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
-        periodic_connection_monitoring(engine_target, interval_seconds=60)
-        time.sleep(2)
+        
+        # Start connection monitoring in background
+        monitor_thread = threading.Thread(target=periodic_connection_monitoring, daemon=True)
+        monitor_thread.start()
+        
+        log_config("🔄 Starting pipeline execution...")
         
         # Run the main pipeline
-        log("🔄 Starting pipeline execution...")
         run_pipeline()
         
     except KeyboardInterrupt:
-        log("🛑 Keyboard interrupt - shutting down")
+        log_phase("🛑 Keyboard interrupt - shutting down")
     except Exception as e:
-        log(f"❌ FATAL ERROR: Pipeline failure")
-        log(f"   Error: {e}")
-        raise
+        log_error(f"❌ FATAL ERROR: Pipeline failure")
+        log_error(f"   Error: {e}")
     finally:
-        # Clean up resources
-        log("🧹 Cleaning up...")
+        log_phase("🧹 Cleaning up...")
         cleanup_engines()
-        log("👋 Shutdown complete")
+        log_phase("👋 Shutdown complete")
 
 if __name__ == "__main__":
     main()

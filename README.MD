@@ -285,6 +285,28 @@ The pipeline now supports **composite primary keys** (multiple columns that toge
 - **Schema Evolution**: New columns in source tables are automatically added to target tables
 - **Primary Key Flexibility**: Support for both single columns and arrays of columns as primary keys
 
+## Logging System
+
+The pipeline now uses a clean, organized logging system that shows only essential information by default:
+
+- **Configuration**: Database setup, table configuration, pipeline initialization
+- **Phase Status**: Current processing phase, batch progress, table processing
+- **Status Updates**: Completion results, success/failure counts, final summaries
+- **Error Information**: All errors and failures (always visible)
+- **Debug Information**: Detailed operations, performance metrics (only when `DEBUG_MODE=true`)
+
+### Logging Configuration
+
+```bash
+# Clean production logs (default)
+DEBUG_MODE=false
+
+# Detailed debug logs
+DEBUG_MODE=true
+```
+
+See `LOGGING.md` for complete logging documentation.
+
 ## Troubleshooting
 
 ### Common Issues
@@ -303,17 +325,15 @@ If you encounter `orjson.JSONDecodeError: unexpected character: line 1 column 1 
 
 **No manual configuration needed** - the app adapts automatically to your MySQL settings.
 
-**For troubleshooting:** Debug mode is **enabled by default** for easier troubleshooting:
+**For troubleshooting:** Debug mode can be enabled for detailed logging:
 ```bash
-# Debug modes are enabled by default
-DEBUG_MODE=true              # General detailed logging (default: true)
-DEEP_DEBUG_JSON=true         # Deep analysis of JSON errors (default: true)
-AUTO_SANITIZE_DATA=true      # Automatic data sanitization (default: true)
+# Clean production logs (default)
+DEBUG_MODE=false             # General detailed logging (default: false)
 
-# To disable detailed logging after fixing issues:
-DEBUG_MODE=false
-DEEP_DEBUG_JSON=false
-AUTO_SANITIZE_DATA=false
+# Detailed debug logs for troubleshooting
+DEBUG_MODE=true              # Enable detailed logging
+DEEP_DEBUG_JSON=true         # Deep analysis of JSON errors
+AUTO_SANITIZE_DATA=true      # Automatic data sanitization
 ```
 
 **Enhanced JSON Error Debugging:** With debugging enabled by default, you'll automatically see:
@@ -387,7 +407,7 @@ The pipeline uses a permissive SQL mode that allows zero dates to pass through, 
 
 ## TODO
 
-- ✅ ~~Enhanced logging output~~ (Completed: Added connection pool monitoring)
+- ✅ ~~Enhanced logging output~~ (Completed: Clean, organized logging system with configurable levels)
 - ✅ ~~Connection pool management~~ (Completed: Added configurable pool settings)
 - ✅ ~~Error handling improvements~~ (Completed: Added retry logic and graceful errors)
 - Configurable initial values for incremental sync

@@ -1,169 +1,215 @@
 """
 Database connection and management module for DLT Database Sync Pipeline.
-Contains engine creation, connection pooling, and basic database operations.
+Contains database engine creation, connection management, and utility functions.
 """
 
+import os
+import time
 import sqlalchemy as sa
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
+from typing import Tuple, Optional
 import config
-from utils import log
+from utils import log, log_config, log_debug, log_error
+
+# Global engine references
+ENGINE_SOURCE = None
+ENGINE_TARGET = None
 
 def _get_mysql_connect_args():
-    """Get MySQL/MariaDB connection arguments compatible with the available driver."""
+    """Get MySQL-specific connection arguments based on available drivers."""
+    mysql_connect_args = {}
     
-    # Base connection arguments compatible with most MySQL/MariaDB drivers
-    # Optimized for MariaDB to prevent connection pool corruption
-    base_args = {
-        'connect_timeout': 60,
-        'autocommit': False,
-        'charset': 'utf8mb4',
-        'use_unicode': True,
-        # MariaDB-specific optimizations
-        'sql_mode': 'STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO',
-        # init_command removed - will be handled after connection establishment
-    }
-    
-    # Try to detect which MySQL driver is available and add driver-specific arguments
     try:
         # Check if MySQLdb (mysqlclient) is available
         import MySQLdb
-        log("🔧 Detected MySQLdb/mysqlclient driver")
+        log_config("🔧 Detected MySQLdb/mysqlclient driver")
+        
         # MySQLdb-specific arguments
-        base_args.update({
-            'read_timeout': 300,
-            'write_timeout': 300,
+        mysql_connect_args.update({
+            'charset': 'utf8mb4',
+            'use_unicode': True,
+            'autocommit': False,
+            'sql_mode': 'TRADITIONAL',
+            'init_command': "SET SESSION sql_mode='TRADITIONAL'",
+            'connect_timeout': 60,
+            'read_timeout': 60,
+            'write_timeout': 60,
+            'local_infile': False,
+            'ssl': False
         })
-        return base_args
         
     except ImportError:
         try:
-            # Check if mysql.connector (mysql-connector-python) is available
+            # Check if mysql-connector-python is available
             import mysql.connector
-            log("🔧 Detected mysql-connector-python driver")
-            # mysql-connector-python specific arguments
-            base_args.update({
-                'use_pure': False,
-                'buffered': True,
-                'consume_results': True,
+            log_config("🔧 Detected mysql-connector-python driver")
+            
+            # mysql-connector-python-specific arguments
+            mysql_connect_args.update({
+                'charset': 'utf8mb4',
+                'use_unicode': True,
+                'autocommit': False,
+                'sql_mode': 'TRADITIONAL',
+                'init_command': "SET SESSION sql_mode='TRADITIONAL'",
+                'connection_timeout': 60,
+                'pool_reset_session': True,
+                'ssl_disabled': True
             })
-            return base_args
             
         except ImportError:
             try:
                 # Check if pymysql is available
                 import pymysql
-                log("🔧 Detected pymysql driver")
-                # PyMySQL-specific arguments
-                base_args.update({
-                    'read_timeout': 300,
-                    'write_timeout': 300,
+                log_config("🔧 Detected pymysql driver")
+                
+                # pymysql-specific arguments
+                mysql_connect_args.update({
+                    'charset': 'utf8mb4',
+                    'use_unicode': True,
+                    'autocommit': False,
+                    'sql_mode': 'TRADITIONAL',
+                    'init_command': "SET SESSION sql_mode='TRADITIONAL'",
+                    'connect_timeout': 60,
+                    'read_timeout': 60,
+                    'write_timeout': 60,
+                    'local_infile': False,
+                    'ssl': False
                 })
-                return base_args
                 
             except ImportError:
-                log("⚠️ No MySQL driver detected, using base arguments")
-                return base_args
+                log_config("⚠️ No MySQL driver detected, using base arguments")
+                # Base arguments for any MySQL driver
+                mysql_connect_args.update({
+                    'charset': 'utf8mb4',
+                    'use_unicode': True,
+                    'autocommit': False
+                })
+    
+    return mysql_connect_args
 
-def _configure_database_session(connection):
-    """Configure database session with optimal settings after connection establishment."""
+def _configure_session(engine, db_type):
+    """Configure database session with MariaDB-optimized settings."""
     try:
-        # Execute session configuration commands individually to avoid syntax errors
-        session_commands = [
-            "SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))",
-            "SET SESSION innodb_lock_wait_timeout=120",
-            "SET SESSION lock_wait_timeout=120", 
-            "SET SESSION wait_timeout=3600",
-            "SET SESSION interactive_timeout=3600",
-            "SET SESSION net_read_timeout=600",
-            "SET SESSION net_write_timeout=600"
-        ]
-        
-        for command in session_commands:
-            try:
-                connection.execute(sa.text(command))
-            except Exception as cmd_error:
-                # Log warning but don't fail - some commands might not be supported
-                log(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
-                
+        with engine.connect() as connection:
+            # Set session variables for MariaDB optimization
+            session_commands = [
+                "SET SESSION sql_mode='TRADITIONAL'",
+                "SET SESSION innodb_lock_wait_timeout=120",
+                "SET SESSION lock_wait_timeout=120",
+                "SET SESSION wait_timeout=28800",
+                "SET SESSION interactive_timeout=28800",
+                "SET SESSION net_read_timeout=60",
+                "SET SESSION net_write_timeout=60"
+            ]
+            
+            for command in session_commands:
+                try:
+                    connection.execute(text(command))
+                    connection.commit()
+                except Exception as cmd_error:
+                    log_debug(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
+                    
     except Exception as e:
-        log(f"⚠️ Session configuration failed (non-critical): {e}")
-        # Don't raise - this is not critical for basic functionality
+        log_debug(f"⚠️ Session configuration failed (non-critical): {e}")
 
 def create_engines():
-    """Create SQLAlchemy engines with optimized connection pool settings and MySQL-specific parameters."""
-    
-    log("🔧 Creating database engines...")
-    
-    pool_settings = {
-        'pool_size': config.POOL_SIZE,           # From config for MariaDB stability
-        'max_overflow': config.MAX_OVERFLOW,     # From config to prevent corruption
-        'pool_timeout': config.POOL_TIMEOUT,     # From config for MariaDB
-        'pool_recycle': config.POOL_RECYCLE,     # From config for MariaDB
-        'pool_pre_ping': config.POOL_PRE_PING,   # From config for connection validation
-        'pool_reset_on_return': 'commit',        # Reset connections on return
-    }
-    
-    # Note: Session configuration will be done after connection establishment
-    # This is more reliable than connection event listeners
-    
-    # Detect available MySQL driver and use appropriate connection arguments
-    mysql_connect_args = _get_mysql_connect_args()
-    log(f"🔧 Using MySQL connection arguments: {list(mysql_connect_args.keys())}")
+    """Create database engines with connection pooling and MariaDB optimization."""
+    global ENGINE_SOURCE, ENGINE_TARGET
     
     try:
-        log("🔄 Creating source database engine...")
-        config.ENGINE_SOURCE = sa.create_engine(
-            config.DB_SOURCE_URL,
-            connect_args=mysql_connect_args,
-            **pool_settings
+        log_config("🔧 Creating database engines...")
+        
+        # Get MySQL-specific connection arguments
+        mysql_connect_args = _get_mysql_connect_args()
+        
+        # Source database engine
+        source_url = f"mysql+pymysql://{config.SOURCE_DB_USER}:{config.SOURCE_DB_PASS}@{config.SOURCE_DB_HOST}:{config.SOURCE_DB_PORT}/{config.SOURCE_DB_NAME}"
+        
+        # Target database engine
+        target_url = f"mysql+pymysql://{config.TARGET_DB_USER}:{config.TARGET_DB_PASS}@{config.TARGET_DB_HOST}:{config.TARGET_DB_PORT}/{config.TARGET_DB_NAME}"
+        
+        # Connection pool configuration
+        pool_config = {
+            'poolclass': QueuePool,
+            'pool_size': config.POOL_SIZE,
+            'max_overflow': config.MAX_OVERFLOW,
+            'pool_timeout': config.POOL_TIMEOUT,
+            'pool_recycle': config.POOL_RECYCLE,
+            'pool_pre_ping': config.POOL_PRE_PING,
+            'echo': False
+        }
+        
+        log_config(f"🔧 Using MySQL connection arguments: {list(mysql_connect_args.keys())}")
+        
+        # Create source engine
+        log_config("🔄 Creating source database engine...")
+        ENGINE_SOURCE = create_engine(
+            source_url,
+            **pool_config,
+            connect_args=mysql_connect_args
         )
         
-        log("🔄 Creating target database engine...")
-        config.ENGINE_TARGET = sa.create_engine(
-            config.DB_TARGET_URL,
-            connect_args=mysql_connect_args,
-            **pool_settings
+        # Create target engine
+        log_config("🔄 Creating target database engine...")
+        ENGINE_TARGET = create_engine(
+            target_url,
+            **pool_config,
+            connect_args=mysql_connect_args
         )
         
-        # Test connections and configure sessions
-        log("🔄 Testing source database connection...")
-        with config.ENGINE_SOURCE.connect() as conn:
-            conn.execute(sa.text("SELECT 1"))
-            # Configure session settings after successful connection
-            _configure_database_session(conn)
+        # Configure sessions
+        _configure_session(ENGINE_SOURCE, "source")
+        _configure_session(ENGINE_TARGET, "target")
         
-        log("🔄 Testing target database connection...")
-        with config.ENGINE_TARGET.connect() as conn:
-            conn.execute(sa.text("SELECT 1"))
-            # Configure session settings after successful connection
-            _configure_database_session(conn)
+        # Test connections
+        log_config("🔄 Testing source database connection...")
+        with ENGINE_SOURCE.connect() as conn:
+            conn.execute(text("SELECT 1"))
         
-        log("✅ Database engines created and tested successfully")
+        log_config("🔄 Testing target database connection...")
+        with ENGINE_TARGET.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        
+        log_config("✅ Database engines created and tested successfully")
+        
+        # Store engines in config for global access
+        config.ENGINE_SOURCE = ENGINE_SOURCE
+        config.ENGINE_TARGET = ENGINE_TARGET
         
     except Exception as e:
-        log(f"❌ FAILED: Database engine creation error")
-        log(f"   Error: {e}")
-        log(f"   Check database connectivity and credentials")
+        log_error(f"❌ FAILED: Database engine creation error")
+        log_error(f"   Error: {e}")
+        log_error(f"   Check database connectivity and credentials")
         raise
 
-def cleanup_engines():
-    """Clean up engine resources on shutdown."""
-    log("🔄 Cleaning up database engines...")
-    try:
-        if config.ENGINE_SOURCE:
-            config.ENGINE_SOURCE.dispose()
-        if config.ENGINE_TARGET:
-            config.ENGINE_TARGET.dispose()
-        log("✅ Database engines cleaned up successfully")
-    except Exception as e:
-        log(f"❌ FAILED: Engine cleanup error")
-        log(f"   Error: {e}")
+def get_engines() -> Tuple[Optional[sa.Engine], Optional[sa.Engine]]:
+    """Get the current database engines."""
+    return ENGINE_SOURCE, ENGINE_TARGET
 
-def get_engines():
-    """Get the global database engines."""
-    if config.ENGINE_SOURCE is None or config.ENGINE_TARGET is None:
-        create_engines()
+def cleanup_engines():
+    """Clean up database engines and close connections."""
+    global ENGINE_SOURCE, ENGINE_TARGET
     
-    return config.ENGINE_SOURCE, config.ENGINE_TARGET
+    log_config("🔄 Cleaning up database engines...")
+    
+    if ENGINE_SOURCE:
+        try:
+            ENGINE_SOURCE.dispose()
+            ENGINE_SOURCE = None
+        except Exception as e:
+            log_debug(f"⚠️ Error disposing source engine: {e}")
+    
+    if ENGINE_TARGET:
+        try:
+            ENGINE_TARGET.dispose()
+            ENGINE_TARGET = None
+        except Exception as e:
+            log_debug(f"⚠️ Error disposing target engine: {e}")
+    
+    # Clear from config
+    config.ENGINE_SOURCE = None
+    config.ENGINE_TARGET = None
 
 def create_source_engine():
     """Create only the source database engine."""

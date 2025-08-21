@@ -10,7 +10,7 @@ from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import sqlalchemy as sa
 import config
-from utils import log
+from utils import log, log_debug, log_error
 import socket
 
 class SimpleHandler(SimpleHTTPRequestHandler):
@@ -36,7 +36,7 @@ class SimpleHandler(SimpleHTTPRequestHandler):
             return
         except Exception as e:
             # Log other errors but don't crash
-            log(f"⚠️ HTTP request error: {e}")
+            log_debug(f"⚠️ HTTP request error: {e}")
             self.close_connection = True
             return
     
@@ -48,7 +48,7 @@ class SimpleHandler(SimpleHTTPRequestHandler):
             else:
                 self.send_error(405, "Method not allowed")
         except Exception as e:
-            log(f"❌ Error processing {self.command} request: {e}")
+            log_error(f"❌ Error processing {self.command} request: {e}")
             try:
                 self.send_error(500, "Internal server error")
             except:
@@ -97,8 +97,8 @@ class SimpleHandler(SimpleHTTPRequestHandler):
                     # Client disconnected, ignore
                     pass
                 except Exception as e:
-                    log(f"⚠️ Error writing response: {e}")
-            
+                    log_debug(f"⚠️ Error writing response: {e}")
+                
             # Simple health check for /health endpoint
             elif self.path == "/health":
                 self.send_response(200)
@@ -111,139 +111,58 @@ class SimpleHandler(SimpleHTTPRequestHandler):
                 except (ConnectionResetError, BrokenPipeError):
                     pass
                 except Exception as e:
-                    log(f"⚠️ Error writing health response: {e}")
+                    log_debug(f"⚠️ Error writing health response: {e}")
             
             # 404 for unknown paths
             else:
-                self.send_response(404)
-                self.send_header("Content-type", "text/plain")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                try:
-                    self.wfile.write(b"Not Found")
-                    self.wfile.flush()
-                except (ConnectionResetError, BrokenPipeError):
-                    pass
-                except Exception as e:
-                    log(f"⚠️ Error writing 404 response: {e}")
+                self.send_error(404, "Not found")
                     
         except Exception as e:
-            log(f"❌ Error in do_GET: {e}")
+            log_error(f"❌ Error in do_GET: {e}")
             try:
-                self.send_response(500)
-                self.send_header("Content-type", "application/json")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                error_response = {"status": "error", "message": str(e)}
-                self.wfile.write(json.dumps(error_response).encode())
+                self.send_error(500, "Internal server error")
             except:
                 pass  # Connection might already be closed
     
     def log_message(self, format, *args):
-        """Override to use our logging system instead of stderr."""
-        log(f"🌐 HTTP: {format % args}")
+        """Override to use our logging system."""
+        log_debug(f"HTTP: {format % args}")
     
     def log_error(self, format, *args):
         """Override to use our logging system for errors."""
-        log(f"❌ HTTP Error: {format % args}")
+        log_error(f"HTTP Error: {format % args}")
 
 def run_http_server():
-    """Run the HTTP health check server with enhanced error handling."""
-    server_address = (config.HTTP_SERVER_HOST, config.HTTP_SERVER_PORT)
-    
+    """Run the HTTP health check server."""
     try:
-        httpd = HTTPServer(server_address, SimpleHandler)
+        server = HTTPServer((config.HTTP_SERVER_HOST, config.HTTP_SERVER_PORT), SimpleHandler)
+        log_debug(f"🌐 HTTP server started on port {config.HTTP_SERVER_PORT}")
         
-        # Set socket options for better connection handling
-        if config.HTTP_SERVER_ENABLE_REUSEADDR:
-            httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if config.HTTP_SERVER_ENABLE_KEEPALIVE:
-            httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Set server timeout
+        server.timeout = config.HTTP_SERVER_TIMEOUT
         
-        # Set timeout for socket operations
-        httpd.socket.settimeout(config.HTTP_SERVER_TIMEOUT)
-        
-        log(f"🌐 Health check server starting on {config.HTTP_SERVER_HOST or 'all interfaces'}:{config.HTTP_SERVER_PORT}...")
-        
-        request_count = 0
-        
-        # Enhanced serve_forever with error handling and request counting
         while True:
             try:
-                httpd.handle_request()
-                request_count += 1
-                
-                # Restart server after max requests to prevent memory leaks
-                if request_count >= config.HTTP_SERVER_MAX_REQUESTS:
-                    log(f"🔄 HTTP server restarting after {request_count} requests")
-                    httpd.server_close()
-                    httpd = HTTPServer(server_address, SimpleHandler)
-                    if config.HTTP_SERVER_ENABLE_REUSEADDR:
-                        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    if config.HTTP_SERVER_ENABLE_KEEPALIVE:
-                        httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                    httpd.socket.settimeout(config.HTTP_SERVER_TIMEOUT)
-                    request_count = 0
-                    log("✅ HTTP server restarted successfully")
-                    
-            except KeyboardInterrupt:
-                log("🛑 HTTP server shutdown requested")
-                break
+                server.handle_request()
             except Exception as e:
-                log(f"⚠️ HTTP server error: {e}")
-                # Continue serving other requests
+                log_debug(f"⚠️ HTTP request handling error: {e}")
                 continue
                 
     except Exception as e:
-        log(f"❌ Failed to start HTTP server: {e}")
-        # Don't crash the entire pipeline if HTTP server fails
-        return
+        log_error(f"❌ HTTP server error: {e}")
 
-def periodic_connection_monitoring(engine_target, interval_seconds=60):
-    """Periodically monitor and clean up problematic connections and queries.
-    
-    This function runs in a separate thread and performs:
-    1. Connection pool monitoring
-    2. Long-running query detection and cleanup
-    3. Resource usage monitoring
-    """
-    def _monitor():
-        while True:
-            try:
-                # Monitor connection pool status
-                if hasattr(engine_target.pool, 'size'):
-                    try:
-                        pool_size = engine_target.pool.size()
-                        checked_out = engine_target.pool.checkedout()
-                        overflow = engine_target.pool.overflow()
-                        
-                        log(f"🔍 Connection Pool Status - Size: {pool_size}, Checked out: {checked_out}, Overflow: {overflow}")
-                        
-                        # Warning if pool utilization is high
-                        utilization = (checked_out / (pool_size + overflow)) * 100 if (pool_size + overflow) > 0 else 0
-                        if utilization > 80:
-                            log(f"⚠️ High connection pool utilization: {utilization:.1f}%")
-                    except Exception as pool_error:
-                        log(f"⚠️ Error monitoring connection pool: {pool_error}")
-                
-                # Monitor and kill long-running queries
-                try:
-                    monitor_and_kill_long_queries(engine_target)
-                except Exception as query_monitor_error:
-                    log(f"⚠️ Error in query monitoring: {query_monitor_error}")
-                
-            except Exception as monitor_error:
-                log(f"❌ Error in connection monitoring: {monitor_error}")
-                # Log additional debug info
-                log(f"🔍 Debug: Monitor error type: {type(monitor_error)}")
-                log(f"🔍 Debug: Monitor error details: {str(monitor_error)}")
+def periodic_connection_monitoring():
+    """Periodically monitor connection pool health."""
+    while True:
+        try:
+            time.sleep(60)  # Check every minute
             
-            time.sleep(interval_seconds)
-    
-    # Start monitoring thread
-    monitor_thread = threading.Thread(target=_monitor, daemon=True)
-    monitor_thread.start()
-    log(f"🔍 Connection monitoring started (interval: {interval_seconds}s)")
+            if config.ENGINE_SOURCE and config.ENGINE_TARGET:
+                monitor_connection_pool_health(config.ENGINE_SOURCE, config.ENGINE_TARGET)
+                
+        except Exception as e:
+            log_debug(f"⚠️ Periodic connection monitoring error: {e}")
+            time.sleep(60)  # Wait before retrying
 
 def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
     """Monitor and kill long-running queries that might cause connection timeouts.
@@ -275,7 +194,7 @@ def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
             long_queries = result.fetchall()
             
             if long_queries:
-                log(f"🔍 Found {len(long_queries)} long-running queries (>{timeout_seconds}s)")
+                log_debug(f"🔍 Found {len(long_queries)} long-running queries (>{timeout_seconds}s)")
                 
                 for query_info in long_queries:
                     # Handle both tuple and dictionary result formats
@@ -292,24 +211,24 @@ def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
                     
                     # Validate we have the required data
                     if query_id is not None and query_time is not None:
-                        log(f"🔍 Long query ID {query_id}: {query_time}s - {query_preview}")
+                        log_debug(f"🔍 Long query ID {query_id}: {query_time}s - {query_preview}")
                         
                         # Kill queries running longer than 2x timeout
                         if query_time > timeout_seconds * 2:
                             try:
                                 kill_query = f"KILL {query_id}"
                                 connection.execute(sa.text(kill_query))
-                                log(f"💀 Killed long-running query ID {query_id} ({query_time}s)")
+                                log_debug(f"💀 Killed long-running query ID {query_id} ({query_time}s)")
                             except Exception as kill_error:
-                                log(f"❌ Failed to kill query ID {query_id}: {kill_error}")
+                                log_error(f"❌ Failed to kill query ID {query_id}: {kill_error}")
                     else:
-                        log(f"⚠️ Skipping query info with missing data: {query_info}")
+                        log_debug(f"⚠️ Skipping query info with missing data: {query_info}")
             
         except Exception as query_error:
-            log(f"❌ Error monitoring queries: {query_error}")
+            log_error(f"❌ Error monitoring queries: {query_error}")
             # Log additional debug info
-            log(f"🔍 Debug: Query error type: {type(query_error)}")
-            log(f"🔍 Debug: Query error details: {str(query_error)}")
+            log_debug(f"🔍 Debug: Query error type: {type(query_error)}")
+            log_debug(f"🔍 Debug: Query error details: {str(query_error)}")
     
     try:
         from database import execute_with_transaction_management
@@ -319,7 +238,7 @@ def monitor_and_kill_long_queries(engine_target, timeout_seconds=300):
             _monitor_queries
         )
     except Exception as e:
-        log(f"❌ Error in query monitoring: {e}")
+        log_error(f"❌ Error in query monitoring: {e}")
 
 def get_connection_pool_status(engine):
     """Get detailed connection pool status."""
@@ -336,53 +255,45 @@ def get_connection_pool_status(engine):
     except Exception as e:
         return {"error": str(e)}
 
-def log_performance_metrics(operation_name, start_time, end_time, record_count=None):
-    """Log performance metrics for operations."""
-    duration = end_time - start_time
-    
-    if "Batch processing" in operation_name:
-        # For batch processing, show tables and records separately
-        if record_count is not None:
-            rate = record_count / duration if duration > 0 else 0
-            log(f"⏱️ {operation_name} completed in {duration:.2f}s")
-            log(f"📊 Performance: {record_count:,} records processed at {rate:.1f} records/sec")
-        else:
-            log(f"⏱️ {operation_name} completed in {duration:.2f}s")
-    else:
-        # For other operations
-        metrics_info = f"⏱️ {operation_name} completed in {duration:.2f}s"
-        if record_count is not None:
-            rate = record_count / duration if duration > 0 else 0
-            metrics_info += f" ({record_count:,} records, {rate:.1f} records/sec)"
-        
-        log(metrics_info)
-
 def monitor_connection_pool_health(engine_source, engine_target):
-    """Monitor connection pool health and detect corruption."""
+    """Monitor connection pool health for both engines."""
     try:
-        from database import check_connection_pool_health
+        if engine_source and hasattr(engine_source, 'pool'):
+            source_pool = engine_source.pool
+            source_status = {
+                'size': source_pool.size(),
+                'checked_out': source_pool.checkedout(),
+                'overflow': source_pool.overflow(),
+                'checked_in': source_pool.checkedin()
+            }
+            log_debug(f"Source pool status - Size: {source_status['size']}, Checked out: {source_status['checked_out']}")
         
-        # Check source pool health
-        source_healthy, source_status = check_connection_pool_health(engine_source, "source")
-        if not source_healthy:
-            log(f"⚠️ Source connection pool health issue: {source_status}")
-            return False
-        
-        # Check target pool health
-        target_healthy, target_status = check_connection_pool_health(engine_target, "target")
-        if not target_healthy:
-            log(f"⚠️ Target connection pool health issue: {target_status}")
-            return False
-        
-        # Log pool status
-        source_pool_status = get_connection_pool_status(engine_source)
-        target_pool_status = get_connection_pool_status(engine_target)
-        
-        log(f"🔍 Source pool status: {source_pool_status}")
-        log(f"🔍 Target pool status: {target_pool_status}")
+        if engine_target and hasattr(engine_target, 'pool'):
+            target_pool = engine_target.pool
+            target_status = {
+                'size': target_pool.size(),
+                'checked_out': target_pool.checkedout(),
+                'overflow': target_pool.overflow(),
+                'checked_in': target_pool.checkedin()
+            }
+            log_debug(f"Target pool status - Size: {target_status['size']}, Checked out: {target_status['checked_out']}")
         
         return True
         
     except Exception as e:
-        log(f"❌ Error monitoring connection pool health: {e}")
+        log_debug(f"⚠️ Connection pool monitoring error: {e}")
         return False
+
+def log_performance_metrics(operation_name: str, start_time: float, end_time: float, records_processed: int = 0):
+    """Log performance metrics for operations."""
+    try:
+        duration = end_time - start_time
+        records_per_second = records_processed / duration if duration > 0 else 0
+        
+        log_debug(f"📊 Performance: {operation_name}")
+        log_debug(f"   Duration: {duration:.2f}s")
+        log_debug(f"   Records: {records_processed:,}")
+        log_debug(f"   Rate: {records_per_second:.2f} records/sec")
+        
+    except Exception as e:
+        log_debug(f"⚠️ Error logging performance metrics: {e}")
