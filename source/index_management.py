@@ -278,11 +278,12 @@ def wait_and_optimize_staging_table(table_name: str, table_config: Dict[str, Any
                         """)
                         
                         # DLT creates staging tables with various patterns
+                        # CRITICAL: Check for BOTH main schema and staging schema patterns
                         patterns = [
-                            f"{table_name}__dlt_tmp%",        # Standard DLT staging pattern
+                            f"{table_name}__dlt_tmp%",        # Main schema: zains_rz.table_name__dlt_tmp
                             f"{table_name}_staging%",         # Alternative staging pattern
                             f"_dlt_{table_name}%",            # DLT internal pattern
-                            f"{table_name}",                  # Direct table name in staging schema
+                            f"{table_name}",                  # Staging schema: zains_rz_staging.table_name
                         ]
                         
                         for pattern in patterns:
@@ -306,6 +307,31 @@ def wait_and_optimize_staging_table(table_name: str, table_config: Dict[str, Any
                                 
                                 # Immediately optimize the staging table
                                 optimize_staging_table_indexes(full_table_name, table_config, engine_target)
+                                
+                                # CRITICAL: Also check if we need to create indexes on staging schema table
+                                # DLT might DELETE from zains_rz_staging.table_name even if staging table is in main schema
+                                if schema == current_db:  # If we found table in main schema
+                                    staging_schema_table = f"{staging_schema}.{table_name}"
+                                    log(f"🔍 CRITICAL: Also checking staging schema table: {staging_schema_table}")
+                                    
+                                    # Check if staging schema table exists and needs optimization
+                                    staging_check_query = sa.text("""
+                                        SELECT COUNT(*) as count
+                                        FROM information_schema.tables 
+                                        WHERE table_schema = :schema_name
+                                        AND table_name = :table_name
+                                    """)
+                                    staging_exists = connection.execute(staging_check_query, {
+                                        "schema_name": staging_schema,
+                                        "table_name": table_name
+                                    })
+                                    
+                                    if staging_exists.fetchone()[0] > 0:
+                                        log(f"🎯 CRITICAL: Found staging schema table: {staging_schema_table}")
+                                        log(f"   This is likely what DLT uses for DELETE operations")
+                                        # Optimize the staging schema table too
+                                        optimize_staging_table_indexes(staging_schema_table, table_config, engine_target)
+                                
                                 return
                     
                     if staging_table_found:
@@ -453,6 +479,50 @@ def cleanup_table_indexes(table_name: str, engine_target) -> bool:
             
     except Exception as e:
         log(f"❌ Error cleaning up indexes: {e}")
+        return False
+
+
+def ensure_staging_schema_table_optimized(table_name: str, table_config: Dict[str, Any], engine_target) -> bool:
+    """
+    CRITICAL: Ensure that staging schema table exists and is optimized.
+    
+    This function proactively checks and optimizes the staging schema table
+    that DLT uses for DELETE operations, even if the main staging table
+    is created in a different schema.
+    """
+    try:
+        # Get current database name to determine staging schema
+        with engine_target.connect() as connection:
+            current_db_result = connection.execute(sa.text("SELECT DATABASE()"))
+            current_db = current_db_result.scalar()
+            staging_schema = f"{current_db}_staging"
+            
+            # Check if staging schema table exists
+            staging_check_query = sa.text("""
+                SELECT COUNT(*) as count
+                FROM information_schema.tables 
+                WHERE table_schema = :schema_name
+                AND table_name = :table_name
+            """)
+            staging_exists = connection.execute(staging_check_query, {
+                "schema_name": staging_schema,
+                "table_name": table_name
+            })
+            
+            if staging_exists.fetchone()[0] > 0:
+                staging_schema_table = f"{staging_schema}.{table_name}"
+                log(f"🔍 CRITICAL: Found staging schema table: {staging_schema_table}")
+                log(f"   This is what DLT uses for DELETE operations - optimizing now")
+                
+                # Optimize the staging schema table
+                return optimize_staging_table_indexes(staging_schema_table, table_config, engine_target)
+            else:
+                log(f"⚠️ Staging schema table {staging_schema}.{table_name} does not exist")
+                log(f"   DLT might create it during pipeline execution")
+                return False
+                
+    except Exception as e:
+        log(f"❌ Error ensuring staging schema table optimization: {e}")
         return False
 
 
