@@ -4,13 +4,12 @@ FROM python:3.11-slim
 # Set environment variable for timezone
 ENV TZ=Asia/Jakarta
 
+# Install only the absolutely necessary packages
 RUN apt-get update && apt-get install -y \
-    python3-dev \
     default-libmysqlclient-dev \
-    build-essential \
-    pkg-config \
     cron \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Set the working directory
 WORKDIR /app
