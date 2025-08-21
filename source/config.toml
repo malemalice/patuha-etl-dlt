@@ -1,0 +1,53 @@
+# DLT Configuration File
+# This file contains DLT-specific configuration for staging management and performance optimization
+
+[load]
+# CRITICAL: Enable automatic truncation of staging tables after each load
+# This prevents staging table accumulation and long-running DELETE queries
+truncate_staging_dataset = true
+
+# Enable staging dataset cleanup after successful loads
+staging_dataset_cleanup = true
+
+# Configure load behavior
+workers = 1  # Single worker to avoid conflicts
+max_parallel_items = 1  # Reduce parallelism to avoid staging conflicts
+
+[destination]
+# CRITICAL: Use staging-optimized strategy for better performance
+# This strategy uses staging tables more efficiently and reduces DELETE operations
+replace_strategy = "staging-optimized"
+
+# CRITICAL: Use simple merge strategy to avoid complex EXISTS subqueries
+# This prevents long-running DELETE operations with complex WHERE EXISTS clauses
+merge_strategy = "delete-insert"
+
+# Configure destination behavior for MySQL/SQLAlchemy
+staging_dataset_name = "sync_data_staging"
+staging_dataset_schema = "zains_rz_staging"
+
+# Avoid complex DELETE operations
+avoid_complex_deletes = true
+use_simple_merge = true
+
+[destination.sqlalchemy]
+# MySQL-specific optimizations
+staging_dataset_cleanup = true
+truncate_staging_tables = true
+
+[normalize]
+# Optimize normalization for better performance
+max_nesting_level = 10
+skip_nulls = false
+
+[extract]
+# Reduce parallelism to avoid staging conflicts
+max_parallel_items = 1
+workers = 1
+
+[runtime]
+# Enable runtime monitoring
+enable_runtime_trace = true
+
+# Logging configuration
+log_level = "INFO"

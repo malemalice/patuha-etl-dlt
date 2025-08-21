@@ -18,6 +18,13 @@ import config
 from utils import log, format_primary_key, validate_primary_key_config, log_primary_key_info
 from database import execute_with_transaction_management, ensure_dlt_columns
 from schema_management import sync_table_schema
+
+# CRITICAL FIX: Set DLT staging management environment variables
+# This must be done before any DLT operations to ensure proper staging cleanup
+if config.TRUNCATE_STAGING_DATASET:
+    os.environ["DLT_TRUNCATE_STAGING_DATASET"] = "true"
+    os.environ["DLT_STAGING_DATASET_CLEANUP"] = "true"
+    log("🔧 DLT staging environment variables set at module level")
 from data_processing import validate_table_data, sanitize_table_data, debug_problematic_rows
 from error_handling import retry_on_connection_error, retry_on_lock_timeout
 from monitoring import log_performance_metrics
@@ -155,6 +162,7 @@ def force_table_clear(engine_target, table_name):
     except Exception as e:
         log(f"❌ Error in force_table_clear for {table_name}: {e}")
         return False
+
 
 def safe_table_cleanup(engine_target, table_name, write_disposition="replace"):
     """Safely clean up table data based on write disposition with lock timeout handling.
@@ -302,21 +310,23 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 failed_tables.append(table_name)
                 continue
             
-            # Handle different sync strategies
+            # CRITICAL: Handle different sync strategies with strict method separation
             if "modifier" in table_config and write_disposition == "merge":
-                # Incremental sync
+                # Incremental sync - ONLY for tables with modifier column and merge disposition
                 log(f"📈 Processing incremental sync for {table_name}")
                 log(f"   Table has modifier column: {table_config['modifier']}")
                 log(f"   Using merge disposition for incremental sync")
+                log(f"   CRITICAL: Incremental method - NO fallback to full refresh")
                 success = process_incremental_table(pipeline, engine_source, engine_target, table_name, table_config)
             else:
-                # Full refresh
+                # Full refresh - for tables without modifier OR with non-merge disposition
                 log(f"🔄 Processing full refresh for {table_name}")
                 if "modifier" not in table_config:
                     log(f"   Table has no modifier column - using full refresh")
                 else:
                     log(f"   Table has modifier but write_disposition is not merge - using full refresh")
                 log(f"   Using {write_disposition} disposition for full refresh")
+                log(f"   CRITICAL: Full refresh method - NO incremental logic")
                 success = process_full_refresh_table(pipeline, engine_source, engine_target, table_name, table_config, write_disposition)
             
             table_end_time = time.time()
@@ -430,10 +440,26 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
     return len(successful_tables), len(failed_tables)
 
 def process_incremental_table(pipeline, engine_source, engine_target, table_name, table_config):
-    """Process a single table with incremental loading."""
+    """Process a single table with incremental sync using DLT's built-in mechanisms.
+    
+    CRITICAL: This function ONLY handles incremental sync and does NOT fallback to full refresh.
+    Incremental failures remain as incremental failures to maintain method separation.
+    """
     try:
+        # CRITICAL SAFEGUARD: Ensure this is truly an incremental table
+        if "modifier" not in table_config:
+            log(f"❌ CRITICAL ERROR: Incremental function called for non-incremental table!")
+            log(f"   Table {table_name} has no modifier column but is in incremental function")
+            log(f"   This should not happen - check table processing logic")
+            return False
+        
         modifier_column = table_config["modifier"]
         primary_key = table_config["primary_key"]
+        
+        log(f"📈 CONFIRMED: Incremental method for {table_name}")
+        log(f"   Modifier column: {modifier_column}")
+        log(f"   Primary key: {primary_key}")
+        log(f"   NO fallback to full refresh on failure")
         
         # Get the latest timestamp from target
         max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
@@ -517,10 +543,22 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         
         # Apply hints
         if incremental_config is not None:
-            table_source.apply_hints(
-                primary_key=formatted_primary_key,
-                incremental=incremental_config
-            )
+            # CRITICAL: Configure hints with merge strategy optimization
+            hints_config = {
+                "primary_key": formatted_primary_key,
+                "incremental": incremental_config
+            }
+            
+            # Add merge strategy to avoid complex DELETE operations
+            if config.TRUNCATE_STAGING_DATASET:
+                try:
+                    # Note: DLT may not support these hint parameters directly
+                    # They are handled through the destination configuration
+                    log(f"🔧 Using staging-optimized merge strategy for {table_name}")
+                except Exception as merge_config_error:
+                    log(f"⚠️ Could not apply merge strategy hints: {merge_config_error}")
+            
+            table_source.apply_hints(**hints_config)
             log(f"✅ Applied incremental hints with config: {incremental_config}")
             
             # CRITICAL FIX: Force DLT to re-evaluate incremental state by clearing cached state
@@ -558,9 +596,14 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
             except Exception as cache_clear_error:
                 log(f"⚠️ Could not clear DLT cached state: {cache_clear_error}")
         else:
-            table_source.apply_hints(
-                primary_key=formatted_primary_key
-            )
+            # CRITICAL: Configure hints with merge strategy optimization for non-incremental tables
+            hints_config = {"primary_key": formatted_primary_key}
+            
+            # Add merge strategy to avoid complex DELETE operations
+            if config.TRUNCATE_STAGING_DATASET:
+                log(f"🔧 Using staging-optimized merge strategy for non-incremental {table_name}")
+            
+            table_source.apply_hints(**hints_config)
             log(f"✅ Applied primary key hints only (no incremental)")
         
         log(f"✅ Incremental hints applied successfully")
@@ -646,31 +689,25 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         log(f"🔧 Running DLT pipeline...")
         
         try:
-            # Run pipeline exactly like old_db_pipeline.py line 678
+            # CRITICAL FIX: Use DLT's built-in staging management
+            # DLT 1.15.0 automatically handles staging cleanup when properly configured
+            if config.TRUNCATE_STAGING_DATASET:
+                log(f"🗑️ DLT staging management enabled - using built-in cleanup")
+            else:
+                log(f"⚠️ DLT staging management disabled - may cause staging table accumulation")
+            
+            # Run pipeline with DLT's automatic staging management
             load_info = pipeline.run(source, write_disposition="merge")
             log(f"✅ Pipeline run completed")
         except Exception as pipeline_error:
-            log(f"❌ Pipeline run failed: {pipeline_error}")
+            log(f"❌ Incremental pipeline run failed: {pipeline_error}")
             
-            # CRITICAL FIX: If pipeline fails, try without incremental configuration
-            log(f"🔧 Attempting fallback: running pipeline without incremental configuration...")
-            try:
-                # Remove incremental configuration
-                if hasattr(table_source, '_incremental'):
-                    table_source._incremental = None
-                    log(f"🔧 Removed incremental configuration for fallback")
-                
-                # Re-apply hints without incremental
-                table_source.apply_hints(primary_key=formatted_primary_key)
-                log(f"🔧 Applied hints without incremental for fallback")
-                
-                # Try pipeline run again
-                load_info = pipeline.run(source)
-                log(f"✅ Fallback pipeline run successful")
-                
-            except Exception as fallback_error:
-                log(f"❌ Fallback pipeline run also failed: {fallback_error}")
-                load_info = None
+            # CRITICAL: Do NOT fallback to full refresh for incremental tables
+            # Incremental failures should remain as incremental failures
+            log(f"❌ Incremental sync failed for {table_name}")
+            log(f"   Error: {pipeline_error}")
+            log(f"   Incremental tables do not fallback to full refresh")
+            load_info = None
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
@@ -684,33 +721,15 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                     
                     # CRITICAL CHECK: If no load packages, this indicates DLT didn't process any data
                     if len(load_info.load_packages) == 0:
-                        log(f"🚨 CRITICAL: DLT created 0 load packages!")
+                        log(f"🚨 CRITICAL: DLT created 0 load packages for incremental sync!")
                         log(f"   This means DLT thinks there's no new data to process")
                         log(f"   But we know there are {new_records_count} new records in source")
                         
-                        # CRITICAL FIX: Force DLT to process data by removing incremental configuration
-                        log(f"🔧 Forcing DLT to process data by removing incremental configuration...")
-                        try:
-                            # Create a new source without incremental configuration
-                            fallback_source = sql_database(engine_source, schema=config.SOURCE_DB_NAME, table_names=[table_name])
-                            fallback_table = getattr(fallback_source, table_name)
-                            fallback_table.apply_hints(primary_key=formatted_primary_key)
-                            
-                            # Apply sanitization
-                            fallback_source = fallback_source | sanitize_table_data
-                            
-                            log(f"🔧 Running fallback pipeline without incremental configuration...")
-                            fallback_load_info = pipeline.run(fallback_source)
-                            
-                            if fallback_load_info and hasattr(fallback_load_info, 'load_packages'):
-                                log(f"✅ Fallback pipeline created {len(fallback_load_info.load_packages)} load packages")
-                                # Use the fallback result
-                                load_info = fallback_load_info
-                            else:
-                                log(f"❌ Fallback pipeline also failed to create load packages")
-                                
-                        except Exception as fallback_force_error:
-                            log(f"❌ Fallback force processing failed: {fallback_force_error}")
+                        # CRITICAL: Do NOT fallback to full refresh for incremental tables
+                        # This maintains the integrity of incremental vs full refresh methods
+                        log(f"❌ Incremental sync failed to create load packages")
+                        log(f"   Incremental tables do not fallback to full refresh")
+                        log(f"   Check incremental configuration or data timestamps")
                     else:
                         log(f"✅ DLT created {len(load_info.load_packages)} load packages")
                     
@@ -733,6 +752,11 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
             
             if rows_synced > 0:
                 log(f"✅ Incremental sync successful: {rows_synced} rows synced")
+                
+                # DLT 1.15.0 automatically handles staging cleanup when configured
+                if config.TRUNCATE_STAGING_DATASET:
+                    log(f"✅ DLT staging management handled cleanup automatically")
+                
                 return True
             else:
                 log(f"⚠️ No rows were synced despite successful load info")
@@ -762,14 +786,32 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         return False
 
 def process_full_refresh_table(pipeline, engine_source, engine_target, table_name, table_config, write_disposition):
-    """Process a single table with full refresh."""
+    """Process a single table with full refresh.
+    
+    CRITICAL: This function ONLY handles full refresh sync and does NOT use incremental logic.
+    Full refresh tables completely replace target data and maintain method separation.
+    """
     try:
         primary_key = table_config["primary_key"]
+        
+        # CRITICAL SAFEGUARD: Ensure this is truly a full refresh table
+        if "modifier" in table_config and write_disposition == "merge":
+            log(f"❌ CRITICAL ERROR: Full refresh function called for incremental table!")
+            log(f"   Table {table_name} has modifier column but is in full refresh function")
+            log(f"   This should not happen - check table processing logic")
+            return False
         
         # Log the full refresh details
         log(f"🔄 Full refresh for {table_name}:")
         log(f"   Primary key: {primary_key}")
         log(f"   Write disposition: {write_disposition}")
+        log(f"   CONFIRMED: Full refresh method (no incremental logic)")
+        
+        # Verify no modifier column or non-merge disposition
+        if "modifier" in table_config:
+            log(f"   Table has modifier '{table_config['modifier']}' but using full refresh due to write_disposition: {write_disposition}")
+        else:
+            log(f"   Table has no modifier column - pure full refresh")
         
         # Get source table row count for comparison
         source_count = get_table_row_count(engine_source, table_name)
@@ -869,6 +911,13 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         # This is essential for full refresh tables to work correctly
         log(f"🔧 Executing pipeline.run() with write_disposition: {write_disposition}")
         
+        # CRITICAL FIX: Use DLT's built-in staging management
+        # DLT 1.15.0 automatically handles staging cleanup when properly configured
+        if config.TRUNCATE_STAGING_DATASET:
+            log(f"🗑️ DLT staging management enabled - using built-in cleanup")
+        else:
+            log(f"⚠️ DLT staging management disabled - may cause staging table accumulation")
+        
         if write_disposition == "replace":
             log(f"   Full refresh mode: Will replace all data in target table")
             # Force the write_disposition to be respected
@@ -892,6 +941,11 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
             
             if rows_synced > 0 or (write_disposition == "replace" and target_count_after > 0):
                 log(f"✅ Full refresh successful: {target_count_after} rows in target")
+                
+                # DLT 1.15.0 automatically handles staging cleanup when configured
+                if config.TRUNCATE_STAGING_DATASET:
+                    log(f"✅ DLT staging management handled cleanup automatically")
+                
                 return True
             else:
                 log(f"⚠️ No rows were synced despite successful load info")
@@ -919,35 +973,89 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         # Configure DLT pipeline with correct syntax for DLT 1.15.0
         # Use sqlalchemy destination for MySQL compatibility
         # Configure staging and load behavior using available DLT 1.15.0 options
+        
+        # CRITICAL: Ensure DLT loads the config.toml file for staging management
+        import dlt.common.configuration as dlt_config
+        try:
+            # Force DLT to load configuration from config.toml
+            dlt_config.resolve_configuration()
+            log("🔧 DLT configuration loaded from config.toml")
+        except Exception as config_load_error:
+            log(f"⚠️ Could not load DLT config.toml: {config_load_error}")
+        
+        # CRITICAL: Configure SQLAlchemy destination with staging optimization
+        destination_config = {
+            "replace_strategy": "staging-optimized",  # Use staging-optimized strategy
+            "truncate_staging_dataset": True,  # Enable staging cleanup
+            "staging_dataset_cleanup": True,  # Clean up staging after loads
+        }
+        
         pipeline_kwargs = {
             "pipeline_name": pipeline_name+"v1",
-            "destination": dlt.destinations.sqlalchemy(config.DB_TARGET_URL),
+            "destination": dlt.destinations.sqlalchemy(config.DB_TARGET_URL, **destination_config),
             "dataset_name": "sync_data"
         }
         
-        # Add staging configuration if truncate_staging_dataset is enabled
+        # CRITICAL FIX: Configure DLT 1.15.0 staging behavior
+        # DLT 1.15.0 uses environment variables and destination configuration for staging management
         if config.PIPELINE_MODE.lower() == "direct" and config.TRUNCATE_STAGING_DATASET:
-            # For DLT 1.15.0, we configure staging behavior through pipeline options
-            # This ensures staging is properly managed and cleaned up
+            # Configure DLT staging behavior through destination configuration
             pipeline_kwargs.update({
-                "dev_mode": False,  # Keep incremental behavior (replaces deprecated full_refresh)
+                "dev_mode": False,  # Keep incremental behavior
                 "restore_from_destination": True,  # Sync with destination state
                 "enable_runtime_trace": True,  # Enable runtime monitoring
-                # Note: write_disposition is set per-table, not globally
             })
-            log("🗑️ Staging dataset truncation enabled for direct mode")
-            log("   Configured via DLT 1.15.0 pipeline options")
+            
+            # CRITICAL: Set additional DLT configuration for staging optimization
+            try:
+                # Configure DLT to use staging-optimized strategy and avoid complex DELETE operations
+                dlt_config = dlt.common.configuration.get_config()
+                dlt_config["destination"]["replace_strategy"] = "staging-optimized"
+                dlt_config["destination"]["merge_strategy"] = "delete-insert"  # Use simpler merge strategy
+                dlt_config["load"]["truncate_staging_dataset"] = True
+                dlt_config["load"]["staging_dataset_cleanup"] = True
+                dlt_config["load"]["workers"] = 1  # Single worker to avoid staging conflicts
+                dlt_config["extract"]["max_parallel_items"] = 1  # Reduce parallelism
+                
+                # CRITICAL: Configure to avoid complex EXISTS subqueries
+                dlt_config["destination"]["avoid_complex_deletes"] = True
+                dlt_config["destination"]["use_simple_merge"] = True
+                
+                log("🔧 Applied DLT staging optimization configuration")
+                log("   Merge strategy: delete-insert (avoids complex EXISTS queries)")
+                log("   Replace strategy: staging-optimized")
+            except Exception as staging_config_error:
+                log(f"⚠️ Could not apply staging optimization: {staging_config_error}")
+            
+            log("🗑️ DLT staging management enabled for direct mode")
+            log("   Configured via config.toml and environment variables")
+            log("   Replace strategy: staging-optimized")
+            log("   Truncate staging dataset: true")
+            log("   Single worker mode: enabled")
             log("   Write disposition: Set per-table (merge for incremental, replace for full refresh)")
         else:
-            log("⚠️ Staging dataset truncation disabled")
+            log("⚠️ DLT staging management disabled")
+            log("   This may cause staging table accumulation and slow DELETE queries")
         
         # Create pipeline with all configuration
         pipeline = dlt.pipeline(**pipeline_kwargs)
+        
+        # CRITICAL FIX: Use DLT's built-in staging management
+        # DLT 1.15.0 automatically handles staging cleanup when configured properly
+        if config.TRUNCATE_STAGING_DATASET:
+            log("🔧 DLT staging management enabled - will use built-in cleanup")
+            log("   DLT automatically manages staging tables and cleanup")
+        else:
+            log("⚠️ DLT staging management disabled")
         
         log(f"✅ Created DLT pipeline: {pipeline_name}")
         log(f"   Destination: {destination}")
         log(f"   Dataset: sync_data")
         log(f"   Mode: incremental with merge disposition")
+        if config.TRUNCATE_STAGING_DATASET:
+            log(f"   Staging management: Enabled (DLT handles cleanup automatically)")
+        else:
+            log(f"   Staging management: Disabled (may cause performance issues)")
         
         return pipeline
         

@@ -25,7 +25,6 @@ SOURCE_DB_PORT = os.getenv("SOURCE_DB_PORT", "3306")
 SOURCE_DB_NAME = os.getenv("SOURCE_DB_NAME", "dbzains")
 
 # Pipeline Configuration
-FETCH_LIMIT = os.getenv("FETCH_LIMIT", 1)
 INTERVAL = int(os.getenv("INTERVAL", 60))  # Interval in seconds
 
 # Batch processing configuration
@@ -46,20 +45,8 @@ LOCK_TIMEOUT_BASE_DELAY = int(os.getenv("LOCK_TIMEOUT_BASE_DELAY", "10"))  # Bas
 LOCK_TIMEOUT_MAX_DELAY = int(os.getenv("LOCK_TIMEOUT_MAX_DELAY", "300"))  # Max delay in seconds
 LOCK_TIMEOUT_JITTER = float(os.getenv("LOCK_TIMEOUT_JITTER", "0.1"))  # Jitter factor (0.1 = 10%)
 
-# Transaction management configuration
-TRANSACTION_TIMEOUT = int(os.getenv("TRANSACTION_TIMEOUT", "300"))  # Transaction timeout in seconds
-MAX_CONCURRENT_TRANSACTIONS = int(os.getenv("MAX_CONCURRENT_TRANSACTIONS", "3"))  # Max concurrent transactions
-
-# Incremental merge optimization configuration
-MERGE_BATCH_SIZE = int(os.getenv("MERGE_BATCH_SIZE", "1000"))  # Batch size for merge operations
-MERGE_MAX_BATCH_SIZE = int(os.getenv("MERGE_MAX_BATCH_SIZE", "5000"))  # Max batch size for merge operations
-MERGE_OPTIMIZATION_ENABLED = os.getenv("MERGE_OPTIMIZATION_ENABLED", "true").lower() == "true"  # Enable merge optimizations
+# Connection loss retry configuration
 CONNECTION_LOSS_RETRIES = int(os.getenv("CONNECTION_LOSS_RETRIES", "3"))  # Max retries for connection loss
-
-# Staging table isolation configuration
-STAGING_ISOLATION_ENABLED = os.getenv("STAGING_ISOLATION_ENABLED", "true").lower() == "true"  # Enable staging table isolation
-STAGING_SCHEMA_PREFIX = os.getenv("STAGING_SCHEMA_PREFIX", "dlt_staging")  # Base prefix for staging schemas
-STAGING_SCHEMA_RETENTION_HOURS = int(os.getenv("STAGING_SCHEMA_RETENTION_HOURS", "24"))  # How long to keep old staging schemas
 
 # Pipeline Mode Configuration
 PIPELINE_MODE = os.getenv("PIPELINE_MODE", "direct")  # Options: 'direct' (db-to-db) or 'file_staging' (extract to files first)
@@ -70,8 +57,7 @@ TRUNCATE_STAGING_DATASET = os.getenv("TRUNCATE_STAGING_DATASET", "true").lower()
 # File-based staging configuration (used when PIPELINE_MODE='file_staging')
 FILE_STAGING_DIR = os.getenv("FILE_STAGING_DIR", "staging")  # Base directory for staging files
 FILE_STAGING_RETENTION_HOURS = int(os.getenv("FILE_STAGING_RETENTION_HOURS", "24"))  # How long to keep staging files
-FILE_STAGING_COMPRESSION = os.getenv("FILE_STAGING_COMPRESSION", "snappy")  # Compression algorithm
-FILE_STAGING_ADVANCED_MONITORING = os.getenv("FILE_STAGING_ADVANCED_MONITORING", "true").lower() == "true"
+FILE_STAGING_WAIT_TIMEOUT = int(os.getenv("FILE_STAGING_WAIT_TIMEOUT", "60"))  # Timeout for file watcher (seconds)
 
 # Legacy support - maintain FILE_STAGING_ENABLED for backward compatibility
 FILE_STAGING_ENABLED = PIPELINE_MODE.lower() == "file_staging"
@@ -81,10 +67,6 @@ POOL_SIZE = int(os.getenv("POOL_SIZE", "15"))  # Reduced for MariaDB stability
 MAX_OVERFLOW = int(os.getenv("MAX_OVERFLOW", "20"))  # Reduced for MariaDB stability
 POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", "30"))  # Faster timeout for MariaDB
 POOL_RECYCLE = int(os.getenv("POOL_RECYCLE", "1800"))  # More frequent recycling for MariaDB
-
-# MariaDB-specific optimizations
-MARIADB_OPTIMIZED = os.getenv("MARIADB_OPTIMIZED", "true").lower() == "true"
-CONNECTION_VALIDATION = os.getenv("CONNECTION_VALIDATION", "true").lower() == "true"
 POOL_PRE_PING = os.getenv("POOL_PRE_PING", "true").lower() == "true"
 
 # HTTP Server Configuration
@@ -138,7 +120,7 @@ DB_TARGET_URL = f"{_MYSQL_DRIVER_PREFIX}://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TA
 _log_driver_selection()
 
 # Global transaction semaphore to limit concurrent transactions
-transaction_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSACTIONS)
+transaction_semaphore = threading.Semaphore(3)  # Default to 3 concurrent transactions
 
 # Global engine variables (will be set by database module)
 ENGINE_SOURCE = None
