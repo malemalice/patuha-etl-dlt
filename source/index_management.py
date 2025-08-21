@@ -180,9 +180,31 @@ def optimize_table_for_dlt(table_name: str, table_config: Dict[str, Any],
     Optimize a table for DLT operations by creating necessary indexes.
     
     This should be called BEFORE running DLT pipeline to ensure optimal performance.
+    
+    IMPORTANT: This function should ONLY be called for incremental tables (those with 
+    modifier columns and merge disposition). Full refresh tables don't benefit from 
+    these indexes since they replace all data and don't perform complex DELETE operations.
+    
+    Args:
+        table_name: Name of the table to optimize
+        table_config: Table configuration dict (must have 'modifier' key for incremental tables)
+        engine_source: Source database engine
+        engine_target: Target database engine
+    
+    Returns:
+        bool: True if optimization was successful, False otherwise
     """
     try:
         log(f"🔧 Starting DLT optimization for table {table_name}...")
+        
+        # VALIDATION: Ensure this function is only called for incremental tables
+        if "modifier" not in table_config:
+            log(f"⚠️ WARNING: optimize_table_for_dlt called for non-incremental table {table_name}")
+            log(f"   This function should only be called for incremental tables with modifier columns")
+            log(f"   Full refresh tables don't benefit from these indexes")
+            return False
+        
+        log(f"✅ Confirmed: {table_name} is an incremental table with modifier column")
         
         # Analyze what indexes are needed for DLT's DELETE operations
         optimization_strategy = analyze_dlt_delete_pattern(table_name, table_config)

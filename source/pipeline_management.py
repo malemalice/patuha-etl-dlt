@@ -318,20 +318,24 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 continue
             
             # CRITICAL: Optimize indexes for DLT operations BEFORE running pipeline
-            if config.ENABLE_INDEX_OPTIMIZATION:
+            # ONLY for incremental tables (those with modifier column and merge disposition)
+            if config.ENABLE_INDEX_OPTIMIZATION and "modifier" in table_config and write_disposition == "merge":
                 try:
-                    log(f"🔧 Optimizing indexes for DLT operations on {table_name}...")
+                    log(f"🔧 Optimizing indexes for DLT operations on {table_name} (incremental table)...")
                     index_optimization_success = optimize_table_for_dlt(table_name, table_config, engine_source, engine_target)
                     if index_optimization_success:
-                        log(f"✅ Index optimization completed for {table_name}")
+                        log(f"✅ Index optimization completed for incremental table {table_name}")
                     else:
-                        log(f"⚠️ Index optimization had issues for {table_name}, but continuing...")
+                        log(f"⚠️ Index optimization had issues for incremental table {table_name}, but continuing...")
                 except Exception as index_error:
-                    log(f"⚠️ Index optimization failed for {table_name}: {index_error}")
+                    log(f"⚠️ Index optimization failed for incremental table {table_name}: {index_error}")
                     log(f"   Continuing without index optimization...")
                     # Don't fail the table processing due to index issues
+            elif config.ENABLE_INDEX_OPTIMIZATION:
+                log(f"ℹ️ Skipping index optimization for {table_name} (not an incremental table)")
+                log(f"   Table uses full refresh method - indexes not needed for DLT operations")
             else:
-                log(f"ℹ️ Index optimization disabled for {table_name} (ENABLE_INDEX_OPTIMIZATION=false)")
+                log(f"ℹ️ Index optimization disabled globally (ENABLE_INDEX_OPTIMIZATION=false)")
             
             # CRITICAL: Handle different sync strategies with strict method separation
             if "modifier" in table_config and write_disposition == "merge":
@@ -358,17 +362,21 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                 successful_tables.append(table_name)
                 
                 # CRITICAL: Clean up temporary indexes after successful DLT operation
-                if config.CLEANUP_TEMPORARY_INDEXES and config.ENABLE_INDEX_OPTIMIZATION:
+                # ONLY for incremental tables (those with modifier column and merge disposition)
+                if config.CLEANUP_TEMPORARY_INDEXES and config.ENABLE_INDEX_OPTIMIZATION and "modifier" in table_config and write_disposition == "merge":
                     try:
-                        log(f"🧹 Cleaning up temporary indexes for {table_name}...")
+                        log(f"🧹 Cleaning up temporary indexes for incremental table {table_name}...")
                         cleanup_success = cleanup_table_indexes(table_name, engine_target)
                         if cleanup_success:
-                            log(f"✅ Index cleanup completed for {table_name}")
+                            log(f"✅ Index cleanup completed for incremental table {table_name}")
                         else:
-                            log(f"⚠️ Index cleanup had issues for {table_name}")
+                            log(f"⚠️ Index cleanup had issues for incremental table {table_name}")
                     except Exception as cleanup_error:
-                        log(f"⚠️ Index cleanup failed for {table_name}: {cleanup_error}")
+                        log(f"⚠️ Index cleanup failed for incremental table {table_name}: {cleanup_error}")
                         # Don't fail the table processing due to cleanup issues
+                elif config.CLEANUP_TEMPORARY_INDEXES and config.ENABLE_INDEX_OPTIMIZATION:
+                    log(f"ℹ️ Skipping index cleanup for {table_name} (not an incremental table)")
+                    log(f"   Table uses full refresh method - no temporary indexes to clean up")
                 else:
                     log(f"ℹ️ Index cleanup disabled for {table_name}")
                 
@@ -1009,44 +1017,16 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         # This is essential for full refresh tables to work correctly
         log(f"🔧 Executing pipeline.run() with write_disposition: {write_disposition}")
         
-        # CRITICAL: For full refresh, optimize target table AND staging tables
-        # DLT replace operations also use staging tables for data loading
+        # CRITICAL: For full refresh tables, skip index optimization
+        # Full refresh tables don't need indexes for DLT operations since they replace all data
+        # Indexes are only beneficial for incremental tables with merge operations
         
         if config.ENABLE_INDEX_OPTIMIZATION:
-            try:
-                log(f"🔧 Optimizing target table {table_name} for DLT replace operations")
-                
-                # Optimize the target table for DLT operations
-                from index_management import optimize_table_for_dlt
-                optimization_success = optimize_table_for_dlt(table_name, table_config, engine_source, engine_target)
-                
-                if optimization_success:
-                    log(f"✅ Target table optimization completed for {table_name}")
-                else:
-                    log(f"⚠️ Target table optimization had issues for {table_name}")
-                
-                # CRITICAL: Start staging table optimization in parallel thread for full refresh
-                # This will wait for DLT to create staging tables and immediately optimize them
-                import threading
-                staging_optimization_thread = None
-                try:
-                    log(f"🚀 Starting staging table optimization thread for {table_name} (full refresh)...")
-                    from index_management import wait_and_optimize_staging_table
-                    staging_optimization_thread = threading.Thread(
-                        target=wait_and_optimize_staging_table,
-                        args=(table_name, table_config, engine_source, engine_target, config.INDEX_OPTIMIZATION_TIMEOUT),
-                        daemon=True
-                    )
-                    staging_optimization_thread.start()
-                    log(f"✅ Staging table optimization thread started for {table_name}")
-                    log(f"   This will create indexes on staging tables as soon as DLT creates them")
-                except Exception as thread_error:
-                    log(f"⚠️ Could not start staging optimization thread: {thread_error}")
-                    
-            except Exception as optimization_error:
-                log(f"⚠️ Could not optimize target table: {optimization_error}")
+            log(f"ℹ️ Skipping index optimization for {table_name} (full refresh table)")
+            log(f"   Full refresh tables don't need indexes for DLT operations")
+            log(f"   Indexes are only beneficial for incremental tables with merge operations")
         else:
-            log(f"ℹ️ Table optimization disabled for {table_name}")
+            log(f"ℹ️ Index optimization disabled globally (ENABLE_INDEX_OPTIMIZATION=false)")
         
         # CRITICAL FIX: DLT staging OPTIMIZATION is enabled for direct database operations
         if config.TRUNCATE_STAGING_DATASET:
