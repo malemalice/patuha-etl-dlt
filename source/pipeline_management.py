@@ -684,7 +684,7 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
             fresh_pipeline_name = f"mysql_sync_fresh_{table_name}_{int(time.time())}"
             
             # CRITICAL FIX: Use connection string directly to avoid _conn_lock error
-            target_url = f"mysql+pymysql://{config.TARGET_DB_USER}:{config.TARGET_DB_PASS}@{config.TARGET_DB_HOST}:{config.TARGET_DB_PORT}/{config.TARGET_DB_NAME}"
+            target_url = f"mysql+pymysql://{config._url_encode_credential(config.TARGET_DB_USER)}:{config._url_encode_credential(config.TARGET_DB_PASS)}@{config.TARGET_DB_HOST}:{config.TARGET_DB_PORT}/{config.TARGET_DB_NAME}"
             
             fresh_pipeline = dlt.pipeline(
                 pipeline_name=fresh_pipeline_name,

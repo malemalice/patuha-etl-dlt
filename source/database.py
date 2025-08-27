@@ -123,11 +123,11 @@ def create_engines():
         # Get MySQL-specific connection arguments
         mysql_connect_args = _get_mysql_connect_args()
         
-        # Source database engine
-        source_url = f"mysql+pymysql://{config.SOURCE_DB_USER}:{config.SOURCE_DB_PASS}@{config.SOURCE_DB_HOST}:{config.SOURCE_DB_PORT}/{config.SOURCE_DB_NAME}"
+        # Source database engine - use URL-encoded credentials from config
+        source_url = f"mysql+pymysql://{config._url_encode_credential(config.SOURCE_DB_USER)}:{config._url_encode_credential(config.SOURCE_DB_PASS)}@{config.SOURCE_DB_HOST}:{config.SOURCE_DB_PORT}/{config.SOURCE_DB_NAME}"
         
-        # Target database engine
-        target_url = f"mysql+pymysql://{config.TARGET_DB_USER}:{config.TARGET_DB_PASS}@{config.TARGET_DB_HOST}:{config.TARGET_DB_PORT}/{config.TARGET_DB_NAME}"
+        # Target database engine - use URL-encoded credentials from config
+        target_url = f"mysql+pymysql://{config._url_encode_credential(config.TARGET_DB_USER)}:{config._url_encode_credential(config.TARGET_DB_PASS)}@{config.TARGET_DB_HOST}:{config.TARGET_DB_PORT}/{config.TARGET_DB_NAME}"
         
         # Connection pool configuration
         pool_config = {

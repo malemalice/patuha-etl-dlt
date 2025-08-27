@@ -6,6 +6,7 @@ Contains all environment variables, constants, and configuration loading.
 import os
 import json
 import threading
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -117,9 +118,14 @@ def _log_driver_selection():
         # utils module not available during config loading
         pass
 
-# Construct database URLs with the correct driver
-DB_SOURCE_URL = f"{_MYSQL_DRIVER_PREFIX}://{SOURCE_DB_USER}:{SOURCE_DB_PASS}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
-DB_TARGET_URL = f"{_MYSQL_DRIVER_PREFIX}://{TARGET_DB_USER}:{TARGET_DB_PASS}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
+# Helper function to URL-encode database credentials
+def _url_encode_credential(credential):
+    """URL-encode database credentials to handle special characters like @, :, etc."""
+    return quote_plus(str(credential)) if credential else ""
+
+# Construct database URLs with the correct driver and URL-encoded credentials
+DB_SOURCE_URL = f"{_MYSQL_DRIVER_PREFIX}://{_url_encode_credential(SOURCE_DB_USER)}:{_url_encode_credential(SOURCE_DB_PASS)}@{SOURCE_DB_HOST}:{SOURCE_DB_PORT}/{SOURCE_DB_NAME}"
+DB_TARGET_URL = f"{_MYSQL_DRIVER_PREFIX}://{_url_encode_credential(TARGET_DB_USER)}:{_url_encode_credential(TARGET_DB_PASS)}@{TARGET_DB_HOST}:{TARGET_DB_PORT}/{TARGET_DB_NAME}"
 
 # Log driver selection when config is loaded (will be called later by main pipeline)
 _log_driver_selection()
