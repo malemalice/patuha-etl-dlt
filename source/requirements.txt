@@ -14,3 +14,5 @@ python-dotenv
 pytz>=2023.3
 # Add missing orjson package for high-performance JSON processing
 orjson>=3.9.0
+# Progress bar for DLT pipeline execution visibility
+alive-progress>=2.4.0

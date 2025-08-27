@@ -37,9 +37,9 @@ from monitoring import log_performance_metrics
 from index_management import optimize_table_for_dlt, cleanup_table_indexes, wait_and_optimize_staging_table, monitor_dataset_staging_tables
 
 def get_max_timestamp(engine_target, table_name, column_name):
-    """Get the maximum timestamp value from the target table with lock timeout handling."""
-    def _get_timestamp(connection):
-        try:
+    """Get the maximum timestamp value from the target table."""
+    try:
+        with engine_target.connect() as connection:
             query = f"SELECT MAX({column_name}) FROM {table_name}"
             result = connection.execute(sa.text(query))
             max_value = result.scalar()
@@ -51,16 +51,6 @@ def get_max_timestamp(engine_target, table_name, column_name):
                 log_debug(f"📅 Latest {column_name} in target table {table_name}: {max_value}")
                 return max_value
                 
-        except Exception as e:
-            log_error(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
-            return None
-    
-    try:
-        return execute_with_transaction_management(
-            engine_target,
-            f"get_max_timestamp for {table_name}.{column_name}",
-            _get_timestamp
-        )
     except Exception as e:
         log_error(f"❌ Error getting max timestamp for {table_name}.{column_name}: {e}")
         return None
@@ -138,11 +128,8 @@ def force_table_clear(engine_target, table_name):
                 return False
     
     try:
-        return execute_with_transaction_management(
-            engine_target,
-            f"force_table_clear for {table_name}",
-            _clear_table
-        )
+        with engine_target.connect() as connection:
+            return _clear_table(connection)
     except Exception as e:
         log(f"❌ Error in force_table_clear for {table_name}: {e}")
         return False
@@ -593,14 +580,47 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 # Add UTC timezone to naive datetime to prevent DLT warnings
                 max_timestamp = pytz.UTC.localize(max_timestamp)
         
+        # Get source data range for comparison
+        try:
+            with engine_source.connect() as connection:
+                # Get the latest timestamp in source
+                source_max_query = f"SELECT MAX({modifier_column}) FROM {table_name}"
+                source_max_result = connection.execute(sa.text(source_max_query))
+                source_max_timestamp = source_max_result.scalar()
+                
+                # Get count of records newer than target timestamp
+                if max_timestamp is not None and source_max_timestamp is not None:
+                    new_records_query = f"SELECT COUNT(*) FROM {table_name} WHERE {modifier_column} > %s"
+                    new_records_result = connection.execute(sa.text(new_records_query), (max_timestamp,))
+                    new_records_count = new_records_result.scalar()
+                else:
+                    # If no target timestamp, count all records
+                    total_records_query = f"SELECT COUNT(*) FROM {table_name}"
+                    total_records_result = connection.execute(sa.text(total_records_query))
+                    new_records_count = total_records_result.scalar()
+                
+        except Exception as source_check_error:
+            log_error(f"⚠️ Could not check source data range: {source_check_error}")
+            source_max_timestamp = None
+            new_records_count = 0
+        
         # Apply incremental hints
         table_source = getattr(source, table_name)
         
-        # Debug incremental configuration
-        log(f"🔧 Applying incremental hints for {table_name}:")
+        # Debug incremental configuration with source/target comparison
+        log(f"🔧 Incremental sync configuration for {table_name}:")
         log(f"   Primary key: {formatted_primary_key}")
         log(f"   Modifier column: {modifier_column}")
-        log(f"   Initial value: {max_timestamp}")
+        log(f"   📅 Target latest timestamp: {max_timestamp}")
+        log(f"   📅 Source latest timestamp: {source_max_timestamp}")
+        if max_timestamp and source_max_timestamp:
+            if source_max_timestamp > max_timestamp:
+                log(f"   📊 New records available: {new_records_count}")
+                log(f"   📈 Sync range: {max_timestamp} → {source_max_timestamp}")
+            else:
+                log(f"   ✅ No new records (source not newer than target)")
+        else:
+            log(f"   📊 Records to sync: {new_records_count} (full sync mode)")
         
         # Create incremental configuration with proper handling
         if max_timestamp is not None:
@@ -833,8 +853,17 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 log(f"⚠️ DLT staging optimization not configured - may use default staging behavior")
             
             # Run pipeline with DLT staging optimization (fast DELETE operations)
+            log(f"🔄 Starting DLT pipeline execution for {table_name} (incremental sync)...")
+            log(f"   Source records to process: checking incremental data...")
+            log(f"   Progress bars should appear below during execution...")
             load_info = pipeline.run(source, write_disposition="merge")
-            log(f"✅ Pipeline run completed")
+            log(f"✅ Pipeline run completed for {table_name}")
+            
+            # Log detailed load info
+            if load_info:
+                log(f"📊 Load info details: {load_info}")
+            else:
+                log_error(f"⚠️ No load info returned - this may indicate a problem")
             
             # CRITICAL: Force staging cleanup after pipeline run
             if config.TRUNCATE_STAGING_DATASET:
@@ -853,13 +882,18 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 except Exception as cleanup_error:
                     log(f"⚠️ Could not force staging cleanup: {cleanup_error}")
         except Exception as pipeline_error:
-            log(f"❌ Incremental pipeline run failed: {pipeline_error}")
+            log_error(f"❌ Incremental pipeline run failed for {table_name}")
+            log_error(f"   Error type: {type(pipeline_error).__name__}")
+            log_error(f"   Error details: {str(pipeline_error)}")
+            
+            # Log additional context for debugging
+            log_error(f"   Table: {table_name}")
+            log_error(f"   Modifier column: {modifier_column if 'modifier_column' in locals() else 'Unknown'}")
+            log_error(f"   Max timestamp: {max_timestamp if 'max_timestamp' in locals() else 'Unknown'}")
             
             # CRITICAL: Do NOT fallback to full refresh for incremental tables
             # Incremental failures should remain as incremental failures
-            log(f"❌ Incremental sync failed for {table_name}")
-            log(f"   Error: {pipeline_error}")
-            log(f"   Incremental tables do not fallback to full refresh")
+            log_error(f"   Incremental tables do not fallback to full refresh")
             load_info = None
         
         if load_info:
@@ -900,11 +934,18 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
             new_target_count = get_table_row_count(engine_target, table_name)
             rows_synced = new_target_count - target_count
             
-            log(f"📊 Sync verification - Rows synced: {rows_synced}")
-            log(f"   Target before: {target_count}, Target after: {new_target_count}")
+            # Get new target timestamp after sync
+            new_target_max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
+            
+            log(f"📊 Incremental sync results for {table_name}:")
+            log(f"   Rows synced: {rows_synced}")
+            log(f"   Target count: {target_count} → {new_target_count}")
+            log(f"   📅 Target timestamp: {max_timestamp} → {new_target_max_timestamp}")
             
             if rows_synced > 0:
                 log(f"✅ Incremental sync successful: {rows_synced} rows synced")
+                if new_target_max_timestamp:
+                    log(f"   📈 Timestamp advanced to: {new_target_max_timestamp}")
                 
                 # DLT 1.15.0 automatically handles staging cleanup when configured
                 if config.TRUNCATE_STAGING_DATASET:
@@ -1096,7 +1137,7 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         
         if write_disposition == "replace":
             # Force the write_disposition to be respected
-            log(f"🔄 Executing pipeline.run() for {table_name} with replace disposition...")
+            log(f"🔄 Starting DLT pipeline execution for {table_name} (full refresh)...")
             try:
                 load_info = pipeline.run(source, write_disposition="replace")
                 log(f"✅ Pipeline execution completed for {table_name}")
@@ -1254,7 +1295,8 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
             log("⚠️ Table optimization not configured")
             log("   Default DLT behavior may create slow DELETE operations")
         
-        # Create pipeline with all configuration
+        # Create pipeline with all configuration and progress reporting
+        pipeline_kwargs["progress"] = "alive_progress"  # Add progress bar for better visibility
         pipeline = dlt.pipeline(**pipeline_kwargs)
         
         # CRITICAL NEW FEATURE: Start dataset-level staging table monitoring
@@ -1505,11 +1547,8 @@ def process_data_chunk(records, table_name, engine_target, primary_keys):
                 connection.execute(sa.text(upsert_sql), values)
             return True
         
-        return execute_with_transaction_management(
-            engine_target,
-            f"upsert_chunk for {table_name}",
-            _execute_upsert
-        )
+        with engine_target.connect() as connection:
+            return _execute_upsert(connection)
         
     except Exception as e:
         log(f"❌ Error processing data chunk for {table_name}: {e}")
@@ -1835,8 +1874,8 @@ def load_select_tables_from_database():
                 if full_refresh_tables:
                     log_phase(f"🔄 Processing {len(full_refresh_tables)} full refresh tables with replace disposition")
                     successful, failed = process_tables_batch(pipeline, engine_source, engine_target, full_refresh_tables, "replace")
-                total_successful += successful
-                total_failed += failed
+                    total_successful += successful
+                    total_failed += failed
             
             # Add delay between batches
             if i + config.BATCH_SIZE < len(table_items) and config.BATCH_DELAY > 0:
