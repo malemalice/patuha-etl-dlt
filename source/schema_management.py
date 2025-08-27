@@ -156,14 +156,4 @@ def validate_table_structure(engine_source, engine_target, table_name: str) -> b
         log_error(f"❌ Error validating table structure for {table_name}: {e}")
         return False
 
-def get_table_row_count(engine, table_name: str) -> int:
-    """Get the total row count for a table."""
-    try:
-        with engine.connect() as conn:
-            query = f"SELECT COUNT(*) FROM {table_name}"
-            result = conn.execute(sa.text(query))
-            count = result.scalar()
-            return count or 0
-    except Exception as e:
-        log_error(f"❌ Error getting row count for table {table_name}: {e}")
-        return 0
+# get_table_row_count function moved to pipeline_management.py to avoid duplication

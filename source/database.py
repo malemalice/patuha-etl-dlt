@@ -113,6 +113,30 @@ def _configure_session(engine, db_type):
     except Exception as e:
         log_debug(f"⚠️ Session configuration failed (non-critical): {e}")
 
+def _configure_database_session(connection):
+    """Configure database session settings for a specific connection."""
+    try:
+        # Set session variables for MariaDB optimization
+        session_commands = [
+            "SET SESSION sql_mode='TRADITIONAL'",
+            "SET SESSION innodb_lock_wait_timeout=120",
+            "SET SESSION lock_wait_timeout=120",
+            "SET SESSION wait_timeout=28800",
+            "SET SESSION interactive_timeout=28800",
+            "SET SESSION net_read_timeout=60",
+            "SET SESSION net_write_timeout=60"
+        ]
+        
+        for command in session_commands:
+            try:
+                connection.execute(text(command))
+                connection.commit()
+            except Exception as cmd_error:
+                log_debug(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
+                
+    except Exception as e:
+        log_debug(f"⚠️ Session configuration failed (non-critical): {e}")
+
 def create_engines():
     """Create database engines with connection pooling and MariaDB optimization."""
     global ENGINE_SOURCE, ENGINE_TARGET
