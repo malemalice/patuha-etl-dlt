@@ -233,8 +233,7 @@ mysql_connect_args = {
 ```python
 # Enhanced dependencies with version specifications
 dlt>=1.15.0                    # Data Load Tool framework with latest features
-mysql-connector-python         # MySQL driver with enhanced error handling
-pymysql                        # Pure Python MySQL client for fallback
+pymysql>=1.1.0                 # Primary MySQL driver for stability and compatibility
 sqlalchemy                     # Database ORM and advanced connection pooling
 python-dotenv                  # Environment variable management
 pandas>=1.5.0                 # Data manipulation and analysis

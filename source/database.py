@@ -17,15 +17,15 @@ ENGINE_SOURCE = None
 ENGINE_TARGET = None
 
 def _get_mysql_connect_args():
-    """Get MySQL-specific connection arguments based on available drivers."""
+    """Get MySQL-specific connection arguments using pymysql (primary) or MySQLdb (fallback)."""
     mysql_connect_args = {}
-    
+
     try:
-        # Check if MySQLdb (mysqlclient) is available
-        import MySQLdb
-        log_config("🔧 Detected MySQLdb/mysqlclient driver")
-        
-        # MySQLdb-specific arguments
+        # Primary: Check if pymysql is available (recommended)
+        import pymysql
+        log_config("🔧 Using pymysql driver (recommended)")
+
+        # pymysql-specific arguments (optimized for stability)
         mysql_connect_args.update({
             'charset': 'utf8mb4',
             'use_unicode': True,
@@ -38,51 +38,36 @@ def _get_mysql_connect_args():
             'local_infile': False,
             'ssl': False
         })
-        
+
     except ImportError:
         try:
-            # Check if mysql-connector-python is available
-            import mysql.connector
-            log_config("🔧 Detected mysql-connector-python driver")
-            
-            # mysql-connector-python-specific arguments
+            # Fallback: Check if MySQLdb (mysqlclient) is available
+            import MySQLdb
+            log_config("🔧 Using MySQLdb/mysqlclient driver (fallback)")
+
+            # MySQLdb-specific arguments
             mysql_connect_args.update({
                 'charset': 'utf8mb4',
                 'use_unicode': True,
                 'autocommit': False,
+                'sql_mode': 'TRADITIONAL',
+                'init_command': "SET SESSION sql_mode='TRADITIONAL'",
                 'connect_timeout': 60,
-                'ssl_disabled': True
+                'read_timeout': 60,
+                'write_timeout': 60,
+                'local_infile': False,
+                'ssl': False
             })
-            
+
         except ImportError:
-            try:
-                # Check if pymysql is available
-                import pymysql
-                log_config("🔧 Detected pymysql driver")
-                
-                # pymysql-specific arguments
-                mysql_connect_args.update({
-                    'charset': 'utf8mb4',
-                    'use_unicode': True,
-                    'autocommit': False,
-                    'sql_mode': 'TRADITIONAL',
-                    'init_command': "SET SESSION sql_mode='TRADITIONAL'",
-                    'connect_timeout': 60,
-                    'read_timeout': 60,
-                    'write_timeout': 60,
-                    'local_infile': False,
-                    'ssl': False
-                })
-                
-            except ImportError:
-                log_config("⚠️ No MySQL driver detected, using base arguments")
-                # Base arguments for any MySQL driver
-                mysql_connect_args.update({
-                    'charset': 'utf8mb4',
-                    'use_unicode': True,
-                    'autocommit': False
-                })
-    
+            log_config("⚠️ No MySQL driver detected, using base arguments")
+            # Base arguments for any MySQL driver
+            mysql_connect_args.update({
+                'charset': 'utf8mb4',
+                'use_unicode': True,
+                'autocommit': False
+            })
+
     return mysql_connect_args
 
 def _configure_session(engine, db_type):

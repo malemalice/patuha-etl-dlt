@@ -1,10 +1,6 @@
 dlt[sqlalchemy]>=1.15.0
-# MySQL drivers - use pymysql as primary (more compatible, fewer conflicts)
+# MySQL driver - using pymysql for stability and compatibility
 pymysql>=1.1.0
-# mysqlclient can cause installation issues, removed to avoid conflicts
-# mysqlclient>=2.1.0
-# mysql-connector-python can cause conflicts, removed
-# mysql-connector-python
 sqlalchemy
 setuptools<81
 pandas>=1.5.0

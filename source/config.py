@@ -85,24 +85,19 @@ HTTP_SERVER_ENABLE_REUSEADDR = os.getenv("HTTP_SERVER_ENABLE_REUSEADDR", "true")
 
 # Database URLs with intelligent driver selection
 def _get_mysql_driver_url_prefix():
-    """Get the appropriate MySQL URL prefix based on available drivers."""
+    """Get the appropriate MySQL URL prefix prioritizing pymysql for stability."""
     try:
-        # Check if MySQLdb (mysqlclient) is available
-        import MySQLdb
-        return "mysql"  # Use default mysql:// for MySQLdb
+        # Primary: Check if pymysql is available (recommended for stability)
+        import pymysql
+        return "mysql+pymysql"
     except ImportError:
         try:
-            # Check if mysql.connector is available
-            import mysql.connector
-            return "mysql+mysqlconnector"
+            # Fallback: Check if MySQLdb (mysqlclient) is available
+            import MySQLdb
+            return "mysql"  # Use default mysql:// for MySQLdb
         except ImportError:
-            try:
-                # Check if pymysql is available
-                import pymysql
-                return "mysql+pymysql"
-            except ImportError:
-                # Fallback to default
-                return "mysql"
+            # Fallback to default if no drivers available
+            return "mysql"
 
 # Get the appropriate driver prefix
 _MYSQL_DRIVER_PREFIX = _get_mysql_driver_url_prefix()
