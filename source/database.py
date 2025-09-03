@@ -50,10 +50,7 @@ def _get_mysql_connect_args():
                 'charset': 'utf8mb4',
                 'use_unicode': True,
                 'autocommit': False,
-                'sql_mode': 'TRADITIONAL',
-                'init_command': "SET SESSION sql_mode='TRADITIONAL'",
-                'connection_timeout': 60,
-                'pool_reset_session': True,
+                'connect_timeout': 60,
                 'ssl_disabled': True
             })
             
