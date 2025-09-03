@@ -67,6 +67,66 @@ def get_table_row_count(engine, table_name):
         log_error(f"❌ Error getting row count for {table_name}: {e}")
         return 0
 
+def log_sync_results(table_name, engine_source, engine_target, operation_type="sync"):
+    """Log comprehensive sync results comparing source vs target row counts."""
+    try:
+        log("🔍" + "="*60)
+        log(f"🔍 SYNC VERIFICATION: {table_name} ({operation_type})")
+        log("🔍" + "="*60)
+
+        # Get row counts
+        source_count = get_table_row_count(engine_source, table_name)
+        target_count = get_table_row_count(engine_target, table_name)
+
+        log(f"📊 Source table '{table_name}': {source_count:,} rows")
+        log(f"📊 Target table '{table_name}': {target_count:,} rows")
+
+        # Calculate difference
+        difference = abs(source_count - target_count)
+        percentage_diff = (difference / max(source_count, 1)) * 100
+
+        if source_count == target_count:
+            log(f"✅ PERFECT SYNC: Row counts match exactly ({source_count:,} rows)")
+            log(f"🎯 Sync accuracy: 100.0%")
+        elif difference == 0:
+            log(f"✅ PERFECT SYNC: No difference in row counts")
+        else:
+            log(f"⚠️ ROW COUNT DIFFERENCE: {difference:,} rows ({percentage_diff:.2f}%)")
+            if operation_type == "incremental":
+                log(f"ℹ️ Incremental sync: Some difference expected due to ongoing changes")
+            elif operation_type == "full_refresh":
+                log(f"⚠️ Full refresh: Row counts should match - investigate data loss")
+            else:
+                log(f"ℹ️ {operation_type}: Row count difference detected")
+
+        # Additional verification for full refresh
+        if operation_type == "full_refresh" and source_count > 0:
+            if target_count == 0:
+                log_error(f"🚨 CRITICAL: Full refresh resulted in 0 target rows despite {source_count:,} source rows")
+                log_error(f"   This indicates a complete sync failure")
+            elif percentage_diff > 10:
+                log_error(f"🚨 SIGNIFICANT LOSS: {percentage_diff:.1f}% data loss detected")
+                log_error(f"   Expected: {source_count:,} | Actual: {target_count:,}")
+            elif percentage_diff > 1:
+                log(f"⚠️ MINOR LOSS: {percentage_diff:.1f}% data difference")
+                log(f"   May be due to concurrent updates or data filtering")
+
+        log("🔍" + "="*60)
+        log(f"🔍 SYNC VERIFICATION COMPLETE: {table_name}")
+        log("🔍" + "="*60)
+
+        return {
+            'source_count': source_count,
+            'target_count': target_count,
+            'difference': difference,
+            'percentage_diff': percentage_diff,
+            'sync_status': 'perfect' if difference == 0 else 'partial' if percentage_diff < 10 else 'failed'
+        }
+
+    except Exception as e:
+        log_error(f"❌ Failed to verify sync results for {table_name}: {e}")
+        return None
+
 def get_new_records_count(engine, table_name, modifier_column, since_timestamp):
     """Get the count of new records since a specific timestamp."""
     try:
@@ -858,12 +918,21 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
             log(f"   Progress bars should appear below during execution...")
             load_info = pipeline.run(source, write_disposition="merge")
             log(f"✅ Pipeline run completed for {table_name}")
-            
+
             # Log detailed load info
             if load_info:
                 log(f"📊 Load info details: {load_info}")
             else:
                 log_error(f"⚠️ No load info returned - this may indicate a problem")
+
+            # 🔍 CRITICAL: Log comprehensive sync verification
+            try:
+                sync_results = log_sync_results(table_name, engine_source, engine_target, "incremental_merge")
+                if sync_results:
+                    log(f"📈 Incremental sync summary: {sync_results['sync_status'].upper()}")
+                    log(f"   Source: {sync_results['source_count']:,} | Target: {sync_results['target_count']:,}")
+            except Exception as sync_error:
+                log_error(f"❌ Sync verification failed: {sync_error}")
             
             # CRITICAL: Force staging cleanup after pipeline run
             if config.TRUNCATE_STAGING_DATASET:
@@ -1141,6 +1210,23 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
             try:
                 load_info = pipeline.run(source, write_disposition="replace")
                 log(f"✅ Pipeline execution completed for {table_name}")
+
+                # 🔍 CRITICAL: Log comprehensive sync verification for full refresh
+                try:
+                    sync_results = log_sync_results(table_name, engine_source, engine_target, "full_refresh")
+                    if sync_results:
+                        log(f"📈 Full refresh sync summary: {sync_results['sync_status'].upper()}")
+                        log(f"   Source: {sync_results['source_count']:,} | Target: {sync_results['target_count']:,}")
+
+                        # Additional validation for full refresh
+                        if sync_results['source_count'] > 0 and sync_results['target_count'] == 0:
+                            log_error(f"🚨 CRITICAL ISSUE: Full refresh sync completely failed!")
+                            log_error(f"   Source has {sync_results['source_count']:,} rows but target has 0")
+                        elif sync_results['percentage_diff'] > 5:
+                            log_error(f"🚨 SIGNIFICANT ISSUE: Full refresh has {sync_results['percentage_diff']:.1f}% data loss")
+                except Exception as sync_error:
+                    log_error(f"❌ Sync verification failed: {sync_error}")
+
             except Exception as pipeline_error:
                 log_error(f"❌ Pipeline execution failed for {table_name}: {pipeline_error}")
                 log_error(f"   Pipeline error type: {type(pipeline_error).__name__}")
@@ -1159,7 +1245,16 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         elif write_disposition == "merge":
             log(f"   Merge mode: Will merge data with existing target table")
             load_info = pipeline.run(source, write_disposition="merge")
-            
+
+            # 🔍 CRITICAL: Log comprehensive sync verification for merge
+            try:
+                sync_results = log_sync_results(table_name, engine_source, engine_target, "merge_sync")
+                if sync_results:
+                    log(f"📈 Merge sync summary: {sync_results['sync_status'].upper()}")
+                    log(f"   Source: {sync_results['source_count']:,} | Target: {sync_results['target_count']:,}")
+            except Exception as sync_error:
+                log_error(f"❌ Sync verification failed: {sync_error}")
+
             # CRITICAL: Force staging cleanup after merge
             if config.TRUNCATE_STAGING_DATASET:
                 try:
@@ -1173,7 +1268,16 @@ def process_full_refresh_table(pipeline, engine_source, engine_target, table_nam
         else:
             log(f"   Append mode: Will add data to existing target table")
             load_info = pipeline.run(source, write_disposition=write_disposition)
-            
+
+            # 🔍 CRITICAL: Log comprehensive sync verification for append
+            try:
+                sync_results = log_sync_results(table_name, engine_source, engine_target, f"append_{write_disposition}")
+                if sync_results:
+                    log(f"📈 Append sync summary: {sync_results['sync_status'].upper()}")
+                    log(f"   Source: {sync_results['source_count']:,} | Target: {sync_results['target_count']:,}")
+            except Exception as sync_error:
+                log_error(f"❌ Sync verification failed: {sync_error}")
+
             # CRITICAL: Force staging cleanup after append
             if config.TRUNCATE_STAGING_DATASET:
                 try:
@@ -1299,6 +1403,35 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         pipeline_kwargs["progress"] = "alive_progress"  # Add progress bar for better visibility
         pipeline = dlt.pipeline(**pipeline_kwargs)
         
+        # CRITICAL FIX: Clean up any pending packages from previous runs before starting
+        # This prevents the "pending load packages" warning
+        try:
+            log("🧹 Cleaning up any pending load packages from previous runs...")
+
+            # Force DLT to not load pending packages - this is the key fix
+            import dlt
+            dlt.config["load.restore_schemas_on_run"] = False
+            log("✅ Disabled schema restoration to prevent loading pending packages")
+
+            # Force pipeline to start fresh by cleaning up any existing state
+            if hasattr(pipeline, 'drop'):
+                try:
+                    pipeline.drop()
+                    log("✅ Dropped existing pipeline state")
+                except Exception as drop_error:
+                    log(f"ℹ️ Pipeline drop not needed or failed: {drop_error}")
+
+            # Also try to clean up dataset-level staging tables
+            try:
+                from index_management import cleanup_dataset_staging_tables
+                cleanup_dataset_staging_tables(config.TARGET_DB_NAME, pipeline.destination.engine)
+                log("✅ Cleaned up dataset-level staging tables")
+            except Exception as staging_cleanup_error:
+                log(f"ℹ️ Dataset staging cleanup not needed: {staging_cleanup_error}")
+
+        except Exception as cleanup_error:
+            log(f"ℹ️ Pipeline cleanup not critical: {cleanup_error}")
+
         # CRITICAL NEW FEATURE: Start dataset-level staging table monitoring
         # This will monitor and optimize DLT staging tables
         if config.TRUNCATE_STAGING_DATASET:
@@ -1311,18 +1444,18 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
                 import threading
                 dataset_staging_thread = threading.Thread(
                     target=monitor_dataset_staging_tables,
-                    args=("sync_data", pipeline.destination.engine, config.INDEX_OPTIMIZATION_TIMEOUT),
+                    args=(config.TARGET_DB_NAME, pipeline.destination.engine, config.INDEX_OPTIMIZATION_TIMEOUT),
                     daemon=True
                 )
                 dataset_staging_thread.start()
                 log("✅ Dataset-level staging table monitoring thread started")
-                log("   This will automatically optimize all sync_data staging tables")
+                log(f"   This will automatically optimize all {config.TARGET_DB_NAME} staging tables")
                 
                 # CRITICAL: Also check for existing dataset-level staging tables immediately
                 # This catches tables that were already created in previous runs
                 try:
                     log("🔍 Proactively checking for existing dataset-level staging tables...")
-                    existing_tables = monitor_dataset_staging_tables("sync_data", pipeline.destination.engine, 10)
+                    existing_tables = monitor_dataset_staging_tables(config.TARGET_DB_NAME, pipeline.destination.engine, 10)
                     if existing_tables:
                         log(f"✅ Found and optimized {len(existing_tables)} existing dataset-level staging tables")
                     else:
@@ -1344,11 +1477,11 @@ def create_pipeline(pipeline_name="mysql_sync", destination="sqlalchemy"):
         
         log(f"✅ Created DLT pipeline: {pipeline_name}")
         log(f"   Destination: SQLAlchemy MySQL")
-        log(f"   Dataset: sync_data")
+        log(f"   Dataset: {config.TARGET_DB_NAME}")
         log(f"   Mode: incremental with merge disposition")
         if config.TRUNCATE_STAGING_DATASET:
             log(f"   Staging: OPTIMIZED (fast DELETE operations, automatic cleanup)")
-            log(f"   Dataset-level monitoring: ENABLED (will optimize sync_data.* staging tables)")
+            log(f"   Dataset-level monitoring: ENABLED (will optimize {config.TARGET_DB_NAME}.* staging tables)")
         else:
             log(f"   Staging: Default behavior (may create slow DELETE operations)")
             log(f"   Dataset-level monitoring: DISABLED (staging optimization not configured)")
@@ -1676,10 +1809,15 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
             # Step 1.5: Run DLT pipeline extraction
             log(f"🔄 Extracting data from source to files for {table_name}...")
             load_info = staging_pipeline.run(source)
-            
+
             if not load_info:
                 log(f"❌ Phase 1 FAILED: No data extracted for {table_name}")
                 return False
+
+            # 🔍 Log staging extraction results
+            log(f"📊 Staging extraction completed for {table_name}")
+            log(f"   Load info: {load_info}")
+            log(f"✅ Phase 1 SUCCESS: Data extracted to staging files")
             
             # Step 1.6: Wait for files to be ready with improved detection
             log(f"⏳ Waiting for staging files to be ready for {table_name}...")
