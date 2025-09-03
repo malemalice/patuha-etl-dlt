@@ -5,8 +5,8 @@ FROM python:3.11-slim
 ENV TZ=Asia/Jakarta
 
 # Install only the absolutely necessary packages
+# Note: Using pymysql (pure Python) instead of mysqlclient, so no MySQL dev headers needed
 RUN apt-get update && apt-get install -y \
-    default-libmysqlclient-dev \
     cron \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
