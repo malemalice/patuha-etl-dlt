@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 from typing import Tuple, Optional
 import config
-from utils import log, log_config, log_debug, log_error
+from utils import log, log_config, log_debug, log_error, log_status
 
 # Global engine references
 ENGINE_SOURCE = None
@@ -108,14 +108,14 @@ def _configure_database_session(connection):
             "SET SESSION net_read_timeout=60",
             "SET SESSION net_write_timeout=60"
         ]
-        
+
         for command in session_commands:
             try:
                 connection.execute(text(command))
-                connection.commit()
+                # Don't call commit() here - let the transaction context manager handle it
             except Exception as cmd_error:
                 log_debug(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
-                
+
     except Exception as e:
         log_debug(f"⚠️ Session configuration failed (non-critical): {e}")
 
@@ -358,14 +358,14 @@ def _execute_transaction(engine, operation_func, *args, **kwargs):
 
 def execute_with_transaction_management(engine, operation_name, operation_func, *args, **kwargs):
     """Execute database operations with proper transaction management and lock timeout handling."""
-    
+
     # Acquire semaphore to limit concurrent transactions
     config.transaction_semaphore.acquire()
-    
+
     try:
         result = _execute_transaction(engine, operation_func, *args, **kwargs)
         return result
-        
+
     except Exception as e:
         log(f"❌ FAILED: Transaction error for {operation_name}")
         log(f"   Error: {e}")
@@ -373,6 +373,64 @@ def execute_with_transaction_management(engine, operation_name, operation_func, 
     finally:
         # Always release the semaphore
         config.transaction_semaphore.release()
+
+def count_table_rows(engine, table_name, db_type="database"):
+    """Count rows in a specific table and return the count."""
+    def _count_rows(connection):
+        query = sa.text(f"SELECT COUNT(*) as row_count FROM {table_name}")
+        result = connection.execute(query)
+        row = result.fetchone()
+        return row[0] if row else 0
+
+    try:
+        return execute_with_transaction_management(
+            engine,
+            f"count_rows_{db_type}_{table_name}",
+            _count_rows
+        )
+    except Exception as e:
+        log_debug(f"⚠️ Failed to count rows in {db_type} table {table_name}: {e}")
+        return None
+
+def log_row_count_comparison(table_name, engine_source, engine_target):
+    """Log row count comparison between source and target tables after sync."""
+    try:
+        # Count rows in source table
+        source_count = count_table_rows(engine_source, table_name, "source")
+        if source_count is None:
+            log(f"⚠️ Could not count rows in source table {table_name}")
+            return
+
+        # Count rows in target table
+        target_count = count_table_rows(engine_target, table_name, "target")
+        if target_count is None:
+            log(f"⚠️ Could not count rows in target table {table_name}")
+            return
+
+        # Calculate difference
+        difference = target_count - source_count
+        difference_abs = abs(difference)
+
+        # Log the comparison
+        log_status(f"📊 ROW COUNT COMPARISON: {table_name}")
+        log_status(f"   Source: {source_count:,} rows")
+        log_status(f"   Target: {target_count:,} rows")
+        log_status(f"   Difference: {difference:+,} rows")
+
+        if difference == 0:
+            log_status(f"   ✅ PERFECT SYNC: Row counts match exactly")
+        elif difference > 0:
+            log_status(f"   ⚠️ TARGET HAS MORE: {difference_abs:,} extra rows in target")
+        else:
+            log_status(f"   ⚠️ SOURCE HAS MORE: {difference_abs:,} fewer rows in target")
+
+        # Calculate sync percentage
+        if source_count > 0:
+            sync_percentage = (target_count / source_count) * 100
+            log_status(f"   📈 Sync Rate: {sync_percentage:.1f}%")
+
+    except Exception as e:
+        log_debug(f"⚠️ Error during row count comparison for {table_name}: {e}")
 
 def ensure_dlt_columns(engine_target, table_name):
     """Check if _dlt_load_id and _dlt_id exist in the target table, add them if not."""

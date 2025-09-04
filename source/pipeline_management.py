@@ -136,10 +136,18 @@ def get_new_records_count(engine, table_name, modifier_column, since_timestamp):
                 query = f"SELECT COUNT(*) FROM {table_name}"
                 result = connection.execute(sa.text(query))
             else:
-                # Get records newer than the timestamp
+                # Ensure since_timestamp has proper timezone (GMT +7) for consistency
+                query_timestamp = since_timestamp
+                if isinstance(since_timestamp, datetime) and since_timestamp.tzinfo is None:
+                    # If timestamp has no timezone info, default to GMT +7 (Asia/Bangkok)
+                    import pytz
+                    bangkok_tz = pytz.timezone('Asia/Bangkok')
+                    query_timestamp = bangkok_tz.localize(since_timestamp)
+                    log(f"🔧 Converted since_timestamp to GMT +7: {query_timestamp}")
+
+                # Get records newer than the timestamp - use named parameters for consistency
                 query = f"SELECT COUNT(*) FROM {table_name} WHERE {modifier_column} > :since_timestamp"
-                # Use the correct SQLAlchemy 2.0+ parameter binding syntax
-                result = connection.execute(sa.text(query), {"since_timestamp": since_timestamp})
+                result = connection.execute(sa.text(query), {"since_timestamp": query_timestamp})
             
             count = result.scalar()
             return count or 0
@@ -387,7 +395,14 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
             
             if success:
                 successful_tables.append(table_name)
-                
+
+                # Log row count comparison after successful sync
+                try:
+                    from database import log_row_count_comparison
+                    log_row_count_comparison(table_name, engine_source, engine_target)
+                except Exception as count_error:
+                    log_debug(f"⚠️ Row count comparison failed for {table_name}: {count_error}")
+
                 # CRITICAL: Clean up temporary indexes after successful DLT operation
                 # ONLY for incremental tables (those with modifier column and merge disposition)
                 if config.CLEANUP_TEMPORARY_INDEXES and config.ENABLE_INDEX_OPTIMIZATION and "modifier" in table_config and write_disposition == "merge":
@@ -540,6 +555,13 @@ def process_tables_batch(pipeline, engine_source, engine_target, tables_dict, wr
                         retry_successful.append(table_name)
                         successful_tables.append(table_name)
                         log_status(f"✅ Retry successful for table: {table_name}")
+
+                        # Log row count comparison after successful retry
+                        try:
+                            from database import log_row_count_comparison
+                            log_row_count_comparison(table_name, fresh_engine_source, fresh_engine_target)
+                        except Exception as count_error:
+                            log_debug(f"⚠️ Row count comparison failed for retried table {table_name}: {count_error}")
                     else:
                         retry_failed.append(table_name)
                         failed_tables.append(table_name)
@@ -603,7 +625,9 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         log(f"   NO fallback to full refresh on failure")
         
         # Get the latest timestamp from target
+        log(f"🔍 Getting latest {modifier_column} from TARGET database...")
         max_timestamp = get_max_timestamp(engine_target, table_name, modifier_column)
+        log(f"   📅 TARGET latest {modifier_column}: {max_timestamp}")
         
         # CRITICAL FIX: Apply same timezone handling as old_db_pipeline.py (line 665-666)
         # This ensures consistent timezone handling to fix the incremental sync issue
@@ -634,53 +658,145 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         from datetime import datetime
         import pytz
         
-        # Convert max_timestamp to timezone-aware datetime if needed
+        # Convert max_timestamp to timezone-aware datetime if needed (like working commit)
+        # Keep original for SQL queries, create pendulum-aware copy for DLT
+        max_timestamp_sql = max_timestamp  # Keep original for SQL queries
+
         if max_timestamp is not None and isinstance(max_timestamp, datetime):
-            if max_timestamp.tzinfo is None:
-                # Add UTC timezone to naive datetime to prevent DLT warnings
-                max_timestamp = pytz.UTC.localize(max_timestamp)
-        
+            # CRITICAL FIX: Create a PROPER COPY before converting to Pendulum
+            # This ensures max_timestamp_sql remains a timezone-naive datetime object
+            if hasattr(max_timestamp, 'replace'):
+                # Create a timezone-naive copy for SQLAlchemy compatibility
+                max_timestamp_sql = datetime(
+                    max_timestamp.year, max_timestamp.month, max_timestamp.day,
+                    max_timestamp.hour, max_timestamp.minute, max_timestamp.second,
+                    max_timestamp.microsecond
+                    # Note: tzinfo is intentionally omitted for SQLAlchemy compatibility
+                )
+                log_phase(f"🔧 Created SQL-safe datetime copy: {max_timestamp_sql} (type: {type(max_timestamp_sql)})")
+                log_phase(f"   Timezone info: {max_timestamp_sql.tzinfo} (should be None for SQLAlchemy)")
+
+            # CRITICAL FIX: Use pendulum conversion like the working commit a989acb
+            try:
+                from dlt.common import pendulum
+                max_timestamp = pendulum.instance(max_timestamp).in_tz("Asia/Bangkok")
+                log_phase(f"🔧 Applied pendulum timezone conversion (Asia/Bangkok): {max_timestamp} (type: {type(max_timestamp)})")
+            except Exception as tz_error:
+                log_error(f"⚠️ Warning: Could not apply pendulum timezone conversion: {tz_error}")
+                log_error(f"   Table {table_name} had problematic timestamp data requiring this fix")
+                log_error(f"   Other tables may have worked because their datetime data was cleaner")
+                # Fallback: keep original timestamp
+                max_timestamp = max_timestamp_sql
+
         # Get source data range for comparison
         try:
             with engine_source.connect() as connection:
                 # Get the latest timestamp in source
+                log_phase(f"🔍 Getting latest {modifier_column} from SOURCE database...")
                 source_max_query = f"SELECT MAX({modifier_column}) FROM {table_name}"
                 source_max_result = connection.execute(sa.text(source_max_query))
                 source_max_timestamp = source_max_result.scalar()
-                
-                # Get count of records newer than target timestamp
-                if max_timestamp is not None and source_max_timestamp is not None:
-                    new_records_query = f"SELECT COUNT(*) FROM {table_name} WHERE {modifier_column} > %s"
-                    new_records_result = connection.execute(sa.text(new_records_query), (max_timestamp,))
+
+                # 🕐 TIMEZONE HANDLING: If source timestamp has no timezone info, default to GMT +7 (Asia/Bangkok)
+                # This ensures consistent timezone handling across all database operations
+                if source_max_timestamp and isinstance(source_max_timestamp, datetime) and source_max_timestamp.tzinfo is None:
+                    log_phase(f"   📅 SOURCE timestamp has no timezone - defaulting to GMT +7 (Asia/Bangkok)")
+                    # Convert naive datetime to GMT +7 timezone for consistency with target database
+                    import pytz
+                    bangkok_tz = pytz.timezone('Asia/Bangkok')
+                    source_max_timestamp = bangkok_tz.localize(source_max_timestamp)
+                    log_phase(f"   📅 SOURCE timestamp with GMT +7: {source_max_timestamp}")
+                else:
+                    log_phase(f"   📅 SOURCE latest {modifier_column}: {source_max_timestamp}")
+
+                # Get count of records newer than target timestamp (like working commit)
+                if max_timestamp_sql is not None and source_max_timestamp is not None:
+                    log_phase(f"🔍 Executing new records query...")
+                    # 🕐 TIMEZONE CONSISTENCY: Ensure comparison timestamp is also in GMT +7
+                    # This prevents timezone mismatches in the WHERE clause comparison
+                    comparison_timestamp = max_timestamp_sql
+                    if isinstance(max_timestamp_sql, datetime) and max_timestamp_sql.tzinfo is None:
+                        log_phase(f"   📅 Comparison timestamp has no timezone - converting to GMT +7")
+                        import pytz
+                        bangkok_tz = pytz.timezone('Asia/Bangkok')
+                        comparison_timestamp = bangkok_tz.localize(max_timestamp_sql)
+                        log_phase(f"   📅 Comparison timestamp with GMT +7: {comparison_timestamp}")
+
+                    # Try named parameters instead of positional for complex primary key compatibility
+                    new_records_query = f"SELECT COUNT(*) FROM {table_name} WHERE {modifier_column} > :timestamp"
+                    log_phase(f"   📋 Query: {new_records_query}")
+                    log_phase(f"   📋 Params: {{'timestamp': {comparison_timestamp}}} (type: {type(comparison_timestamp)})")
+                    log_phase(f"   ✅ CONFIRMED: Using NAMED parameters (:timestamp) for complex primary key compatibility")
+
+                    # Use named parameters for better compatibility with complex primary keys
+                    new_records_result = connection.execute(sa.text(new_records_query), {"timestamp": comparison_timestamp})
                     new_records_count = new_records_result.scalar()
+                    log_phase(f"🔍 Found {new_records_count} new records since {comparison_timestamp}")
+                    log_phase(f"   📊 Source max timestamp: {source_max_timestamp} (type: {type(source_max_timestamp)})")
                 else:
                     # If no target timestamp, count all records
                     total_records_query = f"SELECT COUNT(*) FROM {table_name}"
                     total_records_result = connection.execute(sa.text(total_records_query))
                     new_records_count = total_records_result.scalar()
+                    log_phase(f"🔍 No target timestamp - counting all records: {new_records_count}")
                 
         except Exception as source_check_error:
             log_error(f"⚠️ Could not check source data range: {source_check_error}")
+            log_error(f"   ✅ CONFIRMED: This is the UPDATED exception handler with comprehensive logging")
+            log_error(f"   ✅ CONFIRMED: Named parameter fix is being used (:timestamp instead of %s)")
+            log_error(f"   Exception type: {type(source_check_error)}")
+            log_error(f"   Exception details: {str(source_check_error)}")
+            import traceback
+            log_error(f"   Full traceback: {traceback.format_exc()}")
+            log_error(f"   max_timestamp_sql at failure: {max_timestamp_sql} (type: {type(max_timestamp_sql)})")
+            log_error(f"   max_timestamp at failure: {max_timestamp} (type: {type(max_timestamp)})")
             source_max_timestamp = None
             new_records_count = 0
+
+            # Add row count comparison even when source check fails
+            log_error(f"📊 ROW COUNT COMPARISON (despite source check failure):")
+            source_count = get_table_row_count(engine_source, table_name)
+            target_count = get_table_row_count(engine_target, table_name)
+            difference = abs(source_count - target_count)
+            percentage_diff = (difference / max(source_count, 1)) * 100
+            log_error(f"   Source: {source_count:,} rows")
+            log_error(f"   Target: {target_count:,} rows")
+            log_error(f"   Difference: {difference:,} rows ({percentage_diff:.2f}%)")
+
+            log_error(f"🚨 SOURCE CHECK FAILED - CONTINUING WITH PIPELINE EXECUTION ANYWAY")
+            log_error(f"   This should still reach pipeline.run() despite the source check failure")
         
         # Apply incremental hints
         table_source = getattr(source, table_name)
-        
-        # Debug incremental configuration with source/target comparison
-        log(f"🔧 Incremental sync configuration for {table_name}:")
-        log(f"   Primary key: {formatted_primary_key}")
-        log(f"   Modifier column: {modifier_column}")
-        log(f"   📅 Target latest timestamp: {max_timestamp}")
-        log(f"   📅 Source latest timestamp: {source_max_timestamp}")
+
+        # 🔍 CRITICAL: Show comprehensive source vs target modifier comparison
+        log(f"🔧 INCREMENTAL SYNC ANALYSIS for {table_name}:")
+        log(f"   📊 Modifier column: {modifier_column}")
+        log(f"   🔑 Primary key: {formatted_primary_key}")
+        log(f"   📅 TARGET latest {modifier_column}: {max_timestamp}")
+        log(f"   📅 SOURCE latest {modifier_column}: {source_max_timestamp}")
+        log(f"   📈 Records to sync: {new_records_count}")
+
         if max_timestamp and source_max_timestamp:
+            time_diff = source_max_timestamp - max_timestamp
+            log(f"   ⏱️  Time difference: {time_diff}")
+
             if source_max_timestamp > max_timestamp:
-                log(f"   📊 New records available: {new_records_count}")
-                log(f"   📈 Sync range: {max_timestamp} → {source_max_timestamp}")
+                log(f"   ✅ SOURCE is NEWER - {new_records_count} records will be synced")
+                log(f"   📊 Sync window: {max_timestamp} → {source_max_timestamp}")
+            elif source_max_timestamp == max_timestamp:
+                log(f"   ⚖️  SOURCE and TARGET are in sync - no new records")
             else:
-                log(f"   ✅ No new records (source not newer than target)")
+                log(f"   ⚠️  SOURCE is OLDER than TARGET - this is unusual")
+                log(f"   🔍 This might indicate data inconsistencies")
+        elif max_timestamp is None:
+            log(f"   📝 TARGET has no existing data - full initial sync")
+        elif source_max_timestamp is None:
+            log(f"   📝 SOURCE has no data in {modifier_column} column")
         else:
-            log(f"   📊 Records to sync: {new_records_count} (full sync mode)")
+            log(f"   ❓ Unable to determine sync status - check data types")
+
+        log(f"🔄 Ready for incremental pipeline execution...")
         
         # Create incremental configuration with proper handling
         if max_timestamp is not None:
@@ -904,6 +1020,41 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         else:
             log(f"ℹ️ Table optimization disabled for {table_name}")
         
+        # 🔍 FINAL INCREMENTAL SYNC SUMMARY BEFORE PIPELINE EXECUTION
+        log(f"🔍 INCREMENTAL SYNC SUMMARY - Ready for Pipeline Execution:")
+        log(f"   📊 Table: {table_name}")
+        log(f"   🔑 Primary Key: {formatted_primary_key}")
+        log(f"   📅 Modifier Column: {modifier_column}")
+        log(f"   📅 Target Latest: {max_timestamp}")
+        log(f"   📅 Source Latest: {source_max_timestamp}")
+        log(f"   📈 New Records to Sync: {new_records_count}")
+
+        # Add row count comparison for complete visibility
+        source_count = get_table_row_count(engine_source, table_name)
+        target_count = get_table_row_count(engine_target, table_name)
+        difference = abs(source_count - target_count)
+        percentage_diff = (difference / max(source_count, 1)) * 100
+        log(f"   📊 Total Row Counts:")
+        log(f"      Source: {source_count:,} rows")
+        log(f"      Target: {target_count:,} rows")
+        log(f"      Difference: {difference:,} rows ({percentage_diff:.2f}%)")
+
+        if new_records_count > 0:
+            log(f"   ✅ INCREMENTAL SYNC: Will sync {new_records_count} new records")
+            log(f"   📊 Processing records where {modifier_column} > {max_timestamp}")
+            log(f"   🎯 Expected result: Target should increase by {new_records_count} rows")
+        elif new_records_count == 0:
+            log(f"   ⚖️  NO CHANGES: Source and target are in sync")
+            log(f"   📊 No records where {modifier_column} > {max_timestamp}")
+            if difference == 0:
+                log(f"   ✅ CONFIRMED: Row counts match exactly")
+            else:
+                log(f"   ⚠️  WARNING: Row counts differ despite no new records found")
+        else:
+            log(f"   ❓ UNKNOWN: Unable to determine record count")
+
+        log(f"🚀 Starting DLT Pipeline Execution...")
+
         try:
             # CRITICAL FIX: Use DLT's built-in staging management
             # DLT 1.15.0 automatically handles staging cleanup when properly configured
@@ -911,13 +1062,30 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
                 log(f"🗑️ DLT staging OPTIMIZATION enabled - fast DELETE operations with automatic cleanup")
             else:
                 log(f"⚠️ DLT staging optimization not configured - may use default staging behavior")
-            
+
             # Run pipeline with DLT staging optimization (fast DELETE operations)
             log(f"🔄 Starting DLT pipeline execution for {table_name} (incremental sync)...")
             log(f"   Source records to process: checking incremental data...")
             log(f"   Progress bars should appear below during execution...")
-            load_info = pipeline.run(source, write_disposition="merge")
-            log(f"✅ Pipeline run completed for {table_name}")
+            log(f"🚀 EXECUTING: pipeline.run(source, write_disposition='merge')")
+            log(f"   Pipeline: {pipeline.pipeline_name if hasattr(pipeline, 'pipeline_name') else 'Unknown'}")
+            log(f"   Source type: {type(source)}")
+            log(f"   Write disposition: merge")
+
+            try:
+                load_info = pipeline.run(source, write_disposition="merge")
+                log(f"✅ Pipeline run completed for {table_name}")
+                log(f"   Load info type: {type(load_info)}")
+                if load_info is None:
+                    log_error(f"🚨 CRITICAL: pipeline.run() returned None!")
+                else:
+                    log(f"   Load info received: {bool(load_info)}")
+            except Exception as run_error:
+                log_error(f"🚨 CRITICAL: pipeline.run() threw exception: {run_error}")
+                log_error(f"   Exception type: {type(run_error)}")
+                import traceback
+                log_error(f"   Full traceback: {traceback.format_exc()}")
+                load_info = None
 
             # Log detailed load info
             if load_info:
@@ -967,19 +1135,25 @@ def process_incremental_table(pipeline, engine_source, engine_target, table_name
         
         if load_info:
             log(f"📊 Load info for {table_name}: {load_info}")
-            
+            log(f"📊 Load info attributes: {dir(load_info)}")
+
             # CRITICAL: Validate that DLT actually created load packages
             try:
                 if hasattr(load_info, 'loads_ids'):
                     log(f"🔍 Load IDs: {load_info.loads_ids}")
+                    log(f"   Number of load IDs: {len(load_info.loads_ids) if load_info.loads_ids else 0}")
                 if hasattr(load_info, 'load_packages'):
                     log(f"🔍 Load packages: {len(load_info.load_packages)}")
-                    
+
                     # CRITICAL CHECK: If no load packages, this indicates DLT didn't process any data
                     if len(load_info.load_packages) == 0:
                         log(f"🚨 CRITICAL: DLT created 0 load packages for incremental sync!")
                         log(f"   This means DLT thinks there's no new data to process")
                         log(f"   But we know there are {new_records_count} new records in source")
+                        log(f"   This indicates the incremental cursor is not working properly")
+                        log(f"   Max timestamp: {max_timestamp}")
+                        log(f"   New records count: {new_records_count}")
+                        log(f"   This is likely why the difference stays the same (-6,722 rows)")
                         
                         # CRITICAL: Do NOT fallback to full refresh for incremental tables
                         # This maintains the integrity of incremental vs full refresh methods
@@ -1882,6 +2056,14 @@ def process_incremental_table_with_file(table_name, table_config, engine_source,
         
         if processing_success:
             log(f"✅ Phase 2 SUCCESS: Table {table_name} processed successfully")
+
+            # Log row count comparison after successful sync
+            try:
+                from database import log_row_count_comparison
+                log_row_count_comparison(table_name, engine_source, engine_target)
+            except Exception as count_error:
+                log(f"⚠️ Row count comparison failed for {table_name}: {count_error}")
+
             log(f"🎉 COMPLETE: {table_name} sync finished successfully")
             return True
         else:
