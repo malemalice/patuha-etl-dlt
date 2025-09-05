@@ -1,119 +1,436 @@
 """
 Database connection and management module for DLT Database Sync Pipeline.
-Contains engine creation, connection pooling, and basic database operations.
+Contains database engine creation, connection management, and utility functions.
 """
 
+import os
+import time
 import sqlalchemy as sa
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import QueuePool
+from typing import Tuple, Optional
 import config
-from utils import log
+from utils import log, log_config, log_debug, log_error, log_status
+
+# Global engine references
+ENGINE_SOURCE = None
+ENGINE_TARGET = None
+
+def _get_mysql_connect_args():
+    """Get MySQL-specific connection arguments using pymysql (primary) or MySQLdb (fallback)."""
+    mysql_connect_args = {}
+
+    try:
+        # Primary: Check if pymysql is available (recommended)
+        import pymysql
+        log_config("🔧 Using pymysql driver (recommended)")
+
+        # pymysql-specific arguments (optimized for stability)
+        mysql_connect_args.update({
+            'charset': 'utf8mb4',
+            'use_unicode': True,
+            'autocommit': False,
+            'sql_mode': 'TRADITIONAL',
+            'init_command': "SET SESSION sql_mode='TRADITIONAL'",
+            'connect_timeout': 60,
+            'read_timeout': 60,
+            'write_timeout': 60,
+            'local_infile': False,
+            'ssl': False
+        })
+
+    except ImportError:
+        try:
+            # Fallback: Check if MySQLdb (mysqlclient) is available
+            import MySQLdb
+            log_config("🔧 Using MySQLdb/mysqlclient driver (fallback)")
+
+            # MySQLdb-specific arguments
+            mysql_connect_args.update({
+                'charset': 'utf8mb4',
+                'use_unicode': True,
+                'autocommit': False,
+                'sql_mode': 'TRADITIONAL',
+                'init_command': "SET SESSION sql_mode='TRADITIONAL'",
+                'connect_timeout': 60,
+                'read_timeout': 60,
+                'write_timeout': 60,
+                'local_infile': False,
+                'ssl': False
+            })
+
+        except ImportError:
+            log_config("⚠️ No MySQL driver detected, using base arguments")
+            # Base arguments for any MySQL driver
+            mysql_connect_args.update({
+                'charset': 'utf8mb4',
+                'use_unicode': True,
+                'autocommit': False
+            })
+
+    return mysql_connect_args
+
+def _configure_session(engine, db_type):
+    """Configure database session with MariaDB-optimized settings."""
+    try:
+        with engine.connect() as connection:
+            # Set session variables for MariaDB optimization
+            session_commands = [
+                "SET SESSION sql_mode='TRADITIONAL'",
+                "SET SESSION innodb_lock_wait_timeout=120",
+                "SET SESSION lock_wait_timeout=120",
+                "SET SESSION wait_timeout=28800",
+                "SET SESSION interactive_timeout=28800",
+                "SET SESSION net_read_timeout=60",
+                "SET SESSION net_write_timeout=60"
+            ]
+            
+            for command in session_commands:
+                try:
+                    connection.execute(text(command))
+                    connection.commit()
+                except Exception as cmd_error:
+                    log_debug(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
+                    
+    except Exception as e:
+        log_debug(f"⚠️ Session configuration failed (non-critical): {e}")
+
+def _configure_database_session(connection):
+    """Configure database session settings for a specific connection."""
+    try:
+        # Set session variables for MariaDB optimization
+        session_commands = [
+            "SET SESSION sql_mode='TRADITIONAL'",
+            "SET SESSION innodb_lock_wait_timeout=120",
+            "SET SESSION lock_wait_timeout=120",
+            "SET SESSION wait_timeout=28800",
+            "SET SESSION interactive_timeout=28800",
+            "SET SESSION net_read_timeout=60",
+            "SET SESSION net_write_timeout=60"
+        ]
+
+        for command in session_commands:
+            try:
+                connection.execute(text(command))
+                # Don't call commit() here - let the transaction context manager handle it
+            except Exception as cmd_error:
+                log_debug(f"⚠️ Session command failed (non-critical): {command} - {cmd_error}")
+
+    except Exception as e:
+        log_debug(f"⚠️ Session configuration failed (non-critical): {e}")
 
 def create_engines():
-    """Create SQLAlchemy engines with optimized connection pool settings and MySQL-specific parameters."""
-    
-    pool_settings = {
-        'pool_size': 20,           # Configurable base pool size
-        'max_overflow': 30,        # Configurable overflow limit  
-        'pool_timeout': 60,        # Configurable timeout
-        'pool_recycle': 3600,      # Configurable connection recycle time
-        'pool_pre_ping': True,     # Validate connections before use
-    }
-    
-    # MySQL-specific connection arguments to handle timeouts and connection stability
-    mysql_connect_args = {
-        'connect_timeout': 60,
-        'read_timeout': 300,
-        'write_timeout': 300,
-        'autocommit': False,  # Better transaction control
-        'charset': 'utf8mb4',
-        'init_command': "SET sql_mode=(SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY','')); SET SESSION innodb_lock_wait_timeout=120; SET SESSION lock_wait_timeout=120",
-        'use_unicode': True,
-    }
-    
-    log("🔧 Creating database engines with optimized connection pool settings...")
-    log(f"🔧 Pool settings: {pool_settings}")
-    log(f"🔧 MySQL connection args: {mysql_connect_args}")
+    """Create database engines with connection pooling and MariaDB optimization."""
+    global ENGINE_SOURCE, ENGINE_TARGET
     
     try:
-        config.ENGINE_SOURCE = sa.create_engine(
+        log_config("🔧 Creating database engines...")
+        
+        # Get MySQL-specific connection arguments
+        mysql_connect_args = _get_mysql_connect_args()
+        
+        # Source database engine - use URL-encoded credentials from config
+        source_url = f"mysql+pymysql://{config._url_encode_credential(config.SOURCE_DB_USER)}:{config._url_encode_credential(config.SOURCE_DB_PASS)}@{config.SOURCE_DB_HOST}:{config.SOURCE_DB_PORT}/{config.SOURCE_DB_NAME}"
+        
+        # Target database engine - use URL-encoded credentials from config
+        target_url = f"mysql+pymysql://{config._url_encode_credential(config.TARGET_DB_USER)}:{config._url_encode_credential(config.TARGET_DB_PASS)}@{config.TARGET_DB_HOST}:{config.TARGET_DB_PORT}/{config.TARGET_DB_NAME}"
+        
+        # Connection pool configuration
+        pool_config = {
+            'poolclass': QueuePool,
+            'pool_size': config.POOL_SIZE,
+            'max_overflow': config.MAX_OVERFLOW,
+            'pool_timeout': config.POOL_TIMEOUT,
+            'pool_recycle': config.POOL_RECYCLE,
+            'pool_pre_ping': config.POOL_PRE_PING,
+            'echo': False
+        }
+        
+        log_config(f"🔧 Using MySQL connection arguments: {list(mysql_connect_args.keys())}")
+        
+        # Create source engine
+        log_config("🔄 Creating source database engine...")
+        ENGINE_SOURCE = create_engine(
+            source_url,
+            **pool_config,
+            connect_args=mysql_connect_args
+        )
+        
+        # Create target engine
+        log_config("🔄 Creating target database engine...")
+        ENGINE_TARGET = create_engine(
+            target_url,
+            **pool_config,
+            connect_args=mysql_connect_args
+        )
+        
+        # Configure sessions
+        _configure_session(ENGINE_SOURCE, "source")
+        _configure_session(ENGINE_TARGET, "target")
+        
+        # Test connections
+        log_config("🔄 Testing source database connection...")
+        with ENGINE_SOURCE.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        
+        log_config("🔄 Testing target database connection...")
+        with ENGINE_TARGET.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        
+        log_config("✅ Database engines created and tested successfully")
+        
+        # Store engines in config for global access
+        config.ENGINE_SOURCE = ENGINE_SOURCE
+        config.ENGINE_TARGET = ENGINE_TARGET
+        
+    except Exception as e:
+        log_error(f"❌ FAILED: Database engine creation error")
+        log_error(f"   Error: {e}")
+        log_error(f"   Check database connectivity and credentials")
+        raise
+
+def get_engines() -> Tuple[Optional[sa.Engine], Optional[sa.Engine]]:
+    """Get the current database engines."""
+    return ENGINE_SOURCE, ENGINE_TARGET
+
+def cleanup_engines():
+    """Clean up database engines and close connections."""
+    global ENGINE_SOURCE, ENGINE_TARGET
+    
+    log_config("🔄 Cleaning up database engines...")
+    
+    if ENGINE_SOURCE:
+        try:
+            ENGINE_SOURCE.dispose()
+            ENGINE_SOURCE = None
+        except Exception as e:
+            log_debug(f"⚠️ Error disposing source engine: {e}")
+    
+    if ENGINE_TARGET:
+        try:
+            ENGINE_TARGET.dispose()
+            ENGINE_TARGET = None
+        except Exception as e:
+            log_debug(f"⚠️ Error disposing target engine: {e}")
+    
+    # Clear from config
+    config.ENGINE_SOURCE = None
+    config.ENGINE_TARGET = None
+
+def create_source_engine():
+    """Create only the source database engine."""
+    try:
+        log("🔄 Creating source database engine only...")
+        
+        pool_settings = {
+            'pool_size': config.POOL_SIZE,
+            'max_overflow': config.MAX_OVERFLOW,
+            'pool_timeout': config.POOL_TIMEOUT,
+            'pool_recycle': config.POOL_RECYCLE,
+            'pool_pre_ping': config.POOL_PRE_PING,
+            'pool_reset_on_return': 'commit',
+        }
+        
+        mysql_connect_args = _get_mysql_connect_args()
+        
+        engine = sa.create_engine(
             config.DB_SOURCE_URL,
             connect_args=mysql_connect_args,
             **pool_settings
         )
-        log(f"✅ Source engine created successfully")
         
-        config.ENGINE_TARGET = sa.create_engine(
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(sa.text("SELECT 1"))
+            _configure_database_session(conn)
+        
+        log("✅ Source database engine created successfully")
+        return engine
+        
+    except Exception as e:
+        log(f"❌ Failed to create source engine: {e}")
+        return None
+
+def create_target_engine():
+    """Create only the target database engine."""
+    try:
+        log("🔄 Creating target database engine only...")
+        
+        pool_settings = {
+            'pool_size': config.POOL_SIZE,
+            'max_overflow': config.MAX_OVERFLOW,
+            'pool_timeout': config.POOL_TIMEOUT,
+            'pool_recycle': config.POOL_RECYCLE,
+            'pool_pre_ping': config.POOL_PRE_PING,
+            'pool_reset_on_return': 'commit',
+        }
+        
+        mysql_connect_args = _get_mysql_connect_args()
+        
+        engine = sa.create_engine(
             config.DB_TARGET_URL,
             connect_args=mysql_connect_args,
             **pool_settings
         )
-        log(f"✅ Target engine created successfully")
         
-        # Test connections
-        with config.ENGINE_SOURCE.connect() as conn:
+        # Test connection
+        with engine.connect() as conn:
             conn.execute(sa.text("SELECT 1"))
-        log("✅ Source database connection test successful")
+            _configure_database_session(conn)
         
-        with config.ENGINE_TARGET.connect() as conn:
-            conn.execute(sa.text("SELECT 1"))
-        log("✅ Target database connection test successful")
+        log("✅ Target database engine created successfully")
+        return engine
         
     except Exception as e:
-        log(f"❌ Error creating database engines: {e}")
-        raise
+        log(f"❌ Failed to create target engine: {e}")
+        return None
 
-def cleanup_engines():
-    """Clean up engine resources on shutdown."""
+def check_connection_pool_health(engine, pool_name="database"):
+    """Check if connection pool is healthy and not corrupted."""
     try:
-        if config.ENGINE_SOURCE:
-            config.ENGINE_SOURCE.dispose()
-            log("✅ Source engine disposed")
-        if config.ENGINE_TARGET:
-            config.ENGINE_TARGET.dispose()
-            log("✅ Target engine disposed")
+        if not hasattr(engine, 'pool'):
+            return False, "No pool attribute"
+        
+        pool = engine.pool
+        
+        # Check if pool has required methods
+        if not hasattr(pool, 'size') or not hasattr(pool, 'overflow'):
+            return False, "Pool missing required methods"
+        
+        # Check for negative overflow (indicates corruption)
+        try:
+            overflow = pool.overflow()
+            if overflow < 0:
+                return False, f"Pool corrupted (overflow: {overflow})"
+        except Exception as e:
+            return False, f"Error checking overflow: {e}"
+        
+        # Check pool size
+        try:
+            size = pool.size()
+            if size <= 0:
+                return False, f"Invalid pool size: {size}"
+        except Exception as e:
+            return False, f"Error checking pool size: {e}"
+        
+        # Test actual connection to ensure it's working
+        try:
+            with engine.connect() as conn:
+                conn.execute(sa.text("SELECT 1"))
+            return True, "Pool healthy"
+        except Exception as conn_error:
+            return False, f"Connection test failed: {conn_error}"
+        
     except Exception as e:
-        log(f"❌ Error disposing engines: {e}")
+        return False, f"Pool health check failed: {e}"
 
-def get_engines():
-    """Get the global database engines."""
-    if config.ENGINE_SOURCE is None or config.ENGINE_TARGET is None:
-        create_engines()
-    
-    return config.ENGINE_SOURCE, config.ENGINE_TARGET
+def get_configured_connection(engine, purpose="database"):
+    """Get a database connection with session configuration applied."""
+    try:
+        # Test connection before using it
+        if engine is None:
+            raise Exception("Engine is None")
+            
+        connection = engine.connect()
+        
+        # Test if connection is actually working
+        try:
+            connection.execute(sa.text("SELECT 1"))
+        except Exception as test_error:
+            log(f"⚠️ Connection test failed: {test_error}")
+            connection.close()
+            raise Exception(f"Connection test failed: {test_error}")
+        
+        # Configure session settings
+        _configure_database_session(connection)
+        log(f"✅ {purpose} connection established and configured")
+        return connection
+    except Exception as e:
+        log(f"❌ Failed to get configured {purpose} connection: {e}")
+        raise
 
 def _execute_transaction(engine, operation_func, *args, **kwargs):
     """Internal function to execute operations within a transaction context."""
     with engine.begin() as connection:
-        # Set transaction timeout
-        connection.execute(sa.text(f"SET SESSION innodb_lock_wait_timeout = {config.TRANSACTION_TIMEOUT}"))
-        connection.execute(sa.text(f"SET SESSION lock_wait_timeout = {config.TRANSACTION_TIMEOUT}"))
+        # Configure session settings for this transaction
+        _configure_database_session(connection)
         return operation_func(connection, *args, **kwargs)
 
 def execute_with_transaction_management(engine, operation_name, operation_func, *args, **kwargs):
-    """Execute database operations with proper transaction management and lock timeout handling.
-    
-    This function:
-    1. Acquires a transaction semaphore to limit concurrent transactions
-    2. Executes the operation within a transaction context
-    3. Handles lock timeouts and connection issues
-    4. Releases the semaphore when done
-    """
-    log(f"🔄 Starting transaction for {operation_name}")
-    
+    """Execute database operations with proper transaction management and lock timeout handling."""
+
     # Acquire semaphore to limit concurrent transactions
     config.transaction_semaphore.acquire()
-    
+
     try:
         result = _execute_transaction(engine, operation_func, *args, **kwargs)
-        log(f"✅ Transaction completed successfully for {operation_name}")
         return result
-        
+
     except Exception as e:
-        log(f"❌ Transaction failed for {operation_name}: {e}")
+        log(f"❌ FAILED: Transaction error for {operation_name}")
+        log(f"   Error: {e}")
         raise
     finally:
         # Always release the semaphore
         config.transaction_semaphore.release()
-        log(f"🔄 Transaction semaphore released for {operation_name}")
+
+def count_table_rows(engine, table_name, db_type="database"):
+    """Count rows in a specific table and return the count."""
+    def _count_rows(connection):
+        query = sa.text(f"SELECT COUNT(*) as row_count FROM {table_name}")
+        result = connection.execute(query)
+        row = result.fetchone()
+        return row[0] if row else 0
+
+    try:
+        return execute_with_transaction_management(
+            engine,
+            f"count_rows_{db_type}_{table_name}",
+            _count_rows
+        )
+    except Exception as e:
+        log_debug(f"⚠️ Failed to count rows in {db_type} table {table_name}: {e}")
+        return None
+
+def log_row_count_comparison(table_name, engine_source, engine_target):
+    """Log row count comparison between source and target tables after sync."""
+    try:
+        # Count rows in source table
+        source_count = count_table_rows(engine_source, table_name, "source")
+        if source_count is None:
+            log(f"⚠️ Could not count rows in source table {table_name}")
+            return
+
+        # Count rows in target table
+        target_count = count_table_rows(engine_target, table_name, "target")
+        if target_count is None:
+            log(f"⚠️ Could not count rows in target table {table_name}")
+            return
+
+        # Calculate difference
+        difference = target_count - source_count
+        difference_abs = abs(difference)
+
+        # Log the comparison
+        log_status(f"📊 ROW COUNT COMPARISON: {table_name}")
+        log_status(f"   Source: {source_count:,} rows")
+        log_status(f"   Target: {target_count:,} rows")
+        log_status(f"   Difference: {difference:+,} rows")
+
+        if difference == 0:
+            log_status(f"   ✅ PERFECT SYNC: Row counts match exactly")
+        elif difference > 0:
+            log_status(f"   ⚠️ TARGET HAS MORE: {difference_abs:,} extra rows in target")
+        else:
+            log_status(f"   ⚠️ SOURCE HAS MORE: {difference_abs:,} fewer rows in target")
+
+        # Calculate sync percentage
+        if source_count > 0:
+            sync_percentage = (target_count / source_count) * 100
+            log_status(f"   📈 Sync Rate: {sync_percentage:.1f}%")
+
+    except Exception as e:
+        log_debug(f"⚠️ Error during row count comparison for {table_name}: {e}")
 
 def ensure_dlt_columns(engine_target, table_name):
     """Check if _dlt_load_id and _dlt_id exist in the target table, add them if not."""

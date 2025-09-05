@@ -4,13 +4,12 @@ FROM python:3.11-slim
 # Set environment variable for timezone
 ENV TZ=Asia/Jakarta
 
+# Install only the absolutely necessary packages
+# Note: Using pymysql (pure Python) instead of mysqlclient, so no MySQL dev headers needed
 RUN apt-get update && apt-get install -y \
-    python3-dev \
-    default-libmysqlclient-dev \
-    build-essential \
-    pkg-config \
     cron \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # Set the working directory
 WORKDIR /app
@@ -18,9 +17,7 @@ WORKDIR /app
 # Copy the dependency file and install Python dependencies
 COPY source/requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir pymysql && \
-    pip install --no-cache-dir python-dotenv
+    pip install --no-cache-dir -r requirements.txt
 
 # Create staging directory for Parquet files
 RUN mkdir -p /app/staging && \
@@ -31,6 +28,11 @@ RUN mkdir -p /var/log/app && \
     chmod 755 /var/log/app
 
 COPY source/ .
+
+# Clean up Python cache files to ensure fresh code execution
+RUN find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
+    find . -name "*.pyc" -delete 2>/dev/null || true && \
+    find . -name "*.pyo" -delete 2>/dev/null || true
 
 # Use a command that keeps the container running for manual execution
 # CMD ["tail", "-f", "/dev/null"]

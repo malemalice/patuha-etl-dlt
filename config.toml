@@ -1,0 +1,30 @@
+# DLT Configuration File
+# DEEP THINKING: Use ONLY DLT 1.15.0 supported parameters
+
+[load]
+# CRITICAL: ENABLE staging optimization for direct database operations
+# These are the ONLY parameters that DLT 1.15.0 SQLAlchemy destination supports
+truncate_staging_dataset = true      # ✅ SUPPORTED: Clear staging after each load
+staging_dataset_cleanup = true       # ✅ SUPPORTED: Enable staging cleanup
+workers = 1                          # ✅ SUPPORTED: Single worker to avoid conflicts
+max_parallel_items = 1               # ✅ SUPPORTED: Reduce parallelism
+
+[extract]
+# Single worker for direct database operations
+workers = 1                          # ✅ SUPPORTED: Single worker
+max_parallel_items = 1               # ✅ SUPPORTED: Single worker
+
+# NOTE: DLT SQLAlchemy destination does NOT support destination-level staging configuration
+# All staging management happens at the load/extract level
+
+[normalize]
+# Optimize normalization for better performance
+max_nesting_level = 10
+skip_nulls = false
+
+[runtime]
+# Enable runtime monitoring
+enable_runtime_trace = true
+
+# Logging configuration
+log_level = "INFO"

@@ -1,10 +1,16 @@
 dlt[sqlalchemy]>=1.15.0
-mysql-connector-python
-pymysql
-sqlalchemy
+# MySQL driver - using pymysql for stability and compatibility
+pymysql>=1.1.0
+sqlalchemy>=1.4.0
 setuptools<81
-mysqlclient>=2.1.0
 pandas>=1.5.0
 pyarrow>=10.0.0
 watchdog>=3.0.0
-python-dotenv
+python-dotenv>=1.0.0
+pytz>=2023.3
+# Add missing orjson package for high-performance JSON processing
+orjson>=3.9.0
+# Progress bar for DLT pipeline execution visibility
+alive-progress>=2.4.0
+# Humanize for readable numbers and time formatting
+humanize>=4.0.0
