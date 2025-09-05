@@ -5,20 +5,24 @@
 - **Project**: DLT Database Sync Pipeline
 - **Version**: 2.1
 - **Date**: 2024-2025
-- **Status**: Production Ready with Enhanced Error Recovery
+- **Status**: Production Ready with Modular Architecture and Advanced Features
+- **Architecture**: Modular Design (97% code reduction from monolithic structure)
 
 ---
 
 ## 1. Executive Summary
 
-The DLT Database Sync Pipeline is a robust, enterprise-grade data synchronization solution that enables real-time and scheduled data transfer between MySQL/MariaDB databases. The system provides incremental and full refresh synchronization capabilities while maintaining data integrity, schema consistency, and operational reliability. Built on DLT 1.15.0+ framework, it includes advanced error handling, connection pool management, file-based staging for optimal performance, and comprehensive data validation mechanisms.
+The DLT Database Sync Pipeline is a robust, enterprise-grade data synchronization solution that enables real-time and scheduled data transfer between MySQL/MariaDB databases. The system features a modular architecture with incremental and full refresh synchronization capabilities while maintaining data integrity, schema consistency, and operational reliability. Built on DLT 1.15.0+ framework with SQLAlchemy and PyMySQL, it includes advanced error handling, connection pool management, file-based staging for large tables, and comprehensive monitoring and validation mechanisms.
 
-**Recent Enhancements (v2.1):**
+**Key Achievements (v2.1):**
+- ✅ **Modular Architecture**: 97% code reduction from monolithic structure (3,774 → 161 lines main file)
+- ✅ **File-Based Staging**: Hybrid approach for large tables avoiding DLT timeout issues
 - ✅ **Connection Pool Recovery**: Automatic detection and recovery from corrupted connection pools
-- ✅ **Timezone Handling**: Robust timezone-aware timestamp comparisons for incremental sync
-- ✅ **Data Validation**: Pre and post-sync row count verification with detailed sync reporting
+- ✅ **Composite Primary Keys**: Support for multiple column primary keys
+- ✅ **Data Validation**: Pre and post-sync row count verification with detailed reporting
 - ✅ **Enhanced Error Recovery**: Multi-layered error handling with automatic retry mechanisms
-- ✅ **SQL Parameter Binding**: Fixed parameter binding issues for reliable query execution
+- ✅ **Timezone Handling**: Robust timezone-aware timestamp comparisons for incremental sync
+- ✅ **Batch Processing**: Configurable batch sizes for optimal performance with large datasets
 
 ## 2. Product Vision
 
@@ -45,23 +49,26 @@ The DLT Database Sync Pipeline is a robust, enterprise-grade data synchronizatio
 ### 4.1 Primary Objectives
 - ✅ Reduce data replication complexity from days to minutes
 - ✅ Minimize manual intervention in data synchronization processes
-- ✅ Ensure 99.9% data consistency between source and target databases
+- ✅ Ensure 99.9% data consistency with comprehensive validation
 - ✅ Support both real-time and batch synchronization modes
 - ✅ Provide enterprise-grade error handling and recovery mechanisms
-- ✅ Optimize performance for large-scale data operations
-- ✅ **NEW**: Automatic recovery from connection pool corruption
-- ✅ **NEW**: Comprehensive data validation and sync verification
-- ✅ **NEW**: Timezone-aware incremental synchronization
+- ✅ Optimize performance for large-scale data operations (15GB+ tables)
+- ✅ **ACHIEVED**: Modular architecture with 97% code reduction
+- ✅ **ACHIEVED**: File-based staging for large table handling
+- ✅ **ACHIEVED**: Automatic recovery from connection pool corruption
+- ✅ **ACHIEVED**: Composite primary key support
+- ✅ **ACHIEVED**: Comprehensive data validation and sync verification
+- ✅ **ACHIEVED**: Timezone-aware incremental synchronization
 
 ### 4.2 Success Metrics
-- **Performance**: < 5 minutes sync time for tables with < 1M records
-- **Reliability**: 99.9% uptime for continuous sync operations
+- **Performance**: < 5 minutes sync time for tables with < 1M records, handles 15GB+ tables without timeouts
+- **Reliability**: 99.9% uptime for continuous sync operations with automatic recovery
 - **Accuracy**: 100% data consistency validation with row count verification
-- **Scalability**: Support for 100+ tables per pipeline instance
-- **Error Recovery**: < 5 minute recovery time for common failures
-- **Resource Efficiency**: < 512MB RAM per pipeline instance
-- **NEW**: **Connection Pool Recovery**: < 2 minute recovery from pool corruption
-- **NEW**: **Data Validation**: 100% sync verification accuracy
+- **Scalability**: Support for 100+ tables per pipeline instance with batch processing
+- **Error Recovery**: < 5 minute recovery time for common failures, < 2 minutes for connection pool corruption
+- **Resource Efficiency**: < 512MB RAM per pipeline instance, optimized for large datasets
+- **Code Quality**: 97% reduction in main file size through modular architecture
+- **Large Table Support**: Handles tables of any size with file-based staging mode
 
 ## 5. User Stories
 
@@ -74,12 +81,13 @@ So that I can quickly set up data replication in any environment with confidence
 Acceptance Criteria:
 - One-command deployment with docker-compose up
 - Environment-specific configuration via .env files
-- Health check endpoints for monitoring
+- Health check endpoints for monitoring with detailed status
 - Automatic container restart on failures
 - Comprehensive logging and error tracking
 - Resource usage monitoring and alerting
-- **NEW**: Automatic connection pool recovery and health monitoring
-- **NEW**: Real-time sync validation and reporting
+- **ACHIEVED**: Automatic connection pool recovery and health monitoring
+- **ACHIEVED**: Real-time sync validation and reporting
+- **ACHIEVED**: Modular architecture for easier maintenance and deployment
 ```
 
 ### 5.2 Data Engineer
@@ -90,14 +98,15 @@ So that I can efficiently transfer only changed data while maintaining reliabili
 
 Acceptance Criteria:
 - Support for timestamp-based incremental sync with timezone handling
-- Configurable sync intervals (minutes to hours)
+- Configurable sync intervals (seconds to hours)
 - Primary key-based data merging (single and composite keys)
-- Schema evolution handling
-- Automatic data sanitization for problematic values
-- File-based staging to avoid database conflicts
-- **NEW**: Pre and post-sync data validation with row count verification
-- **NEW**: Automatic detection of sync failures and data discrepancies
-- **NEW**: Timezone-aware timestamp comparisons for accurate incremental sync
+- Schema evolution handling with automatic column addition
+- Automatic data sanitization for problematic values (Decimal, NULL bytes, dates)
+- File-based staging mode for large tables to avoid database conflicts
+- **ACHIEVED**: Pre and post-sync data validation with row count verification
+- **ACHIEVED**: Automatic detection of sync failures and data discrepancies
+- **ACHIEVED**: Timezone-aware timestamp comparisons for accurate incremental sync
+- **ACHIEVED**: Batch processing with configurable batch sizes
 ```
 
 ### 5.3 Database Administrator
@@ -107,15 +116,16 @@ I want to monitor sync pipeline performance and handle connection issues,
 So that I can ensure optimal database resource utilization and prevent bottlenecks.
 
 Acceptance Criteria:
-- Connection pool monitoring and alerts
-- Sync performance metrics and logs
-- Error tracking and notification
-- Resource usage reporting
-- Automatic connection recovery and retry logic
-- Lock timeout and deadlock handling
-- **NEW**: Real-time connection pool health monitoring
-- **NEW**: Automatic recovery from connection pool corruption
-- **NEW**: Detailed sync performance reporting with validation metrics
+- Connection pool monitoring and alerts with real-time status
+- Sync performance metrics and comprehensive logs
+- Error tracking and notification with detailed error classification
+- Resource usage reporting with memory and CPU monitoring
+- Automatic connection recovery and retry logic with exponential backoff
+- Lock timeout and deadlock handling with configurable parameters
+- **ACHIEVED**: Real-time connection pool health monitoring
+- **ACHIEVED**: Automatic recovery from connection pool corruption
+- **ACHIEVED**: Detailed sync performance reporting with validation metrics
+- **ACHIEVED**: MariaDB-optimized connection pool settings
 ```
 
 ### 5.4 Site Reliability Engineer
@@ -145,10 +155,12 @@ Acceptance Criteria:
 - **Full Refresh**: Complete table replacement for reference data
 - **Real-time Sync**: Configurable intervals from seconds to hours
 - **Batch Processing**: Handle large datasets efficiently with configurable batch sizes
+- **File-Based Staging**: Alternative processing mode for large tables (15GB+) to avoid timeouts
+- **Hybrid Processing**: Combines DLT's extraction strengths with custom loading optimization
 - **Composite Primary Keys**: Support for multiple column primary keys
-- **Data Sanitization**: Automatic handling of problematic data types and values
-- **NEW**: **Data Validation**: Pre and post-sync row count verification
-- **NEW**: **Sync Verification**: Automatic detection of sync failures and data discrepancies
+- **Data Sanitization**: Automatic handling of problematic data types and values (Decimal, NULL bytes, dates)
+- **ACHIEVED**: **Data Validation**: Pre and post-sync row count verification
+- **ACHIEVED**: **Sync Verification**: Automatic detection of sync failures and data discrepancies
 
 #### F2: Schema Management
 - **Auto Schema Sync**: Detect and apply schema changes
